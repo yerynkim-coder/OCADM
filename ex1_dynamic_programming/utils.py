@@ -8,20 +8,23 @@ from matplotlib.patches import Rectangle
 from matplotlib.animation import FuncAnimation
 from IPython.display import display, HTML
 
+# Add a tutorial to show how to install acados and set interface to python
+from acados_template import AcadosOcp, AcadosOcpSolver, AcadosModel
+
 
 
 
 class Env:
-    def __init__(self, case, init_pos, init_vel, target_pos, target_vel, symbolic_h, symbolic_theta):
+    def __init__(self, case, init_state, target_state, symbolic_h, symbolic_theta):
 
         self.case = case  # 1, 2, 3, 4
 
-        self.initial_position = init_pos
-        self.initial_velocity = init_vel
+        self.initial_position = init_state[0]
+        self.initial_velocity = init_state[1]
         self.init_state = np.array([self.initial_position, self.initial_velocity])
 
-        self.target_position = target_pos
-        self.target_velocity = target_vel
+        self.target_position = target_state[0]
+        self.target_velocity = target_state[1]
         self.target_state = np.array([self.target_position, self.target_velocity])
 
 
@@ -57,7 +60,7 @@ class Env:
         ax[1].legend()
         plt.show()
 
-    
+
 
 
 class Dynamics:
@@ -76,7 +79,7 @@ class Dynamics:
         # Generate symbolic function of linearized Matrix A_lin and B_lin
         lhs = self.dynamics_function(self.states, self.inputs)
         A_sym = ca.jacobian(lhs, self.states)  # Partial derivatives of dynamics w.r.t. states
-        B_sym = ca.jacobian(lhs, self.inputs)  # Partial derivatives of dynamics w.r.t. inpu
+        B_sym = ca.jacobian(lhs, self.inputs)  # Partial derivatives of dynamics w.r.t. input
         self.A_func = ca.Function("A_func", [self.states, self.inputs], [A_sym])
         self.B_func = ca.Function("B_func", [self.states, self.inputs], [B_sym])
 
@@ -100,7 +103,7 @@ class Dynamics:
         a = ca.SX.sym("a")
         state_sym = ca.vertcat(ca.SX.sym("p"), ca.SX.sym("v"))
         
-        # Defien equilibrium_condition: dv/dt = 0
+        # Define equilibrium_condition: dv/dt = 0
         dynamics_output = self.dynamics_function(state_sym, ca.vertcat(a))
         dvdt = dynamics_output[1] # extract v_dot
 
@@ -117,7 +120,15 @@ class Dynamics:
         
         t_span = [0, dt]
         sim_dynamics = lambda t, state: self.dynamics_function(state, [current_input]).full().flatten()
-        solution = solve_ivp(sim_dynamics, t_span, current_state, t_eval=[dt])
+
+        solution = solve_ivp(
+            sim_dynamics,
+            t_span,
+            current_state,
+            method='RK45',
+            t_eval=[dt]
+        )
+        
         next_state = np.array(solution.y)[:, -1]
         #print(next_state)
 
@@ -127,13 +138,12 @@ class Dynamics:
 
 
 class BaseController(ABC):
-    def __init__(self, env, dynamics, Q, R, freq, verbose=False):
+    def __init__(self, name, env, dynamics, freq, verbose=False):
+
+        self.name = name
 
         self.env = env
         self.dynamics = dynamics
-
-        self.Q = Q
-        self.R = R
 
         self.freq = freq
         self.dt = 1 / self.freq
@@ -141,6 +151,7 @@ class BaseController(ABC):
         self.verbose = verbose
 
         self.dim_states = self.dynamics.dim_states
+        self.dim_inputs = self.dynamics.dim_inputs
 
         self.init_state = self.env.init_state
         self.target_state = self.env.target_state
@@ -163,13 +174,17 @@ class BaseController(ABC):
 class LQRController(BaseController):
     def __init__(self, env, dynamics, Q, R, freq, verbose=False):
 
-        super().__init__(env, dynamics, Q, R, freq, verbose)
+        super().__init__('LQR', env, dynamics, freq, verbose)
 
-        self.name = 'LQR'
+        self.Q = Q
+        self.R = R
 
         self.A = None  # State transfer matrix
         self.B = None  # Input matrix
         self.K = None  # LQR gain matrix
+        
+        # need no external objects for setup, can directly call the setup function here
+        self.setup()
 
     def setup(self):
         # Linearize dynamics at equilibrium
@@ -199,16 +214,16 @@ class LQRController(BaseController):
 
 # Derived class for iLQR Controller
 class iLQRController(BaseController):
-    def __init__(self, env, dynamics, Q, R, Qf, freq, verbose=False):
+    def __init__(self, env, dynamics, Q, R, Qf, freq, max_iter=30, tol=2e-2, verbose=False):
 
-        super().__init__(env, dynamics, Q, R, freq, verbose)
+        super().__init__('iLQR', env, dynamics, freq, verbose)
 
-        self.name = 'iLQR'
-
+        self.Q = Q
+        self.R = R
         self.Qf = Qf  # Terminal cost matrix
 
-        self.max_iter = 30
-        self.tol = 2e-2
+        self.max_iter = max_iter
+        self.tol = tol
 
         self.K_k_arr = None
         self.u_kff_arr = None
@@ -335,6 +350,141 @@ class iLQRController(BaseController):
         u = self.u_kff_arr[current_time] + self.K_k_arr[:, current_time].T @ current_state
         return u
 
+# Derived class for MPC Controller
+class MPCController(BaseController):
+    def __init__(self, env, dynamics, Q, R, Qf, freq, N, verbose=False):
+        """
+        Initialize the MPC Controller with Acados.
+
+        Args:
+        - env: The environment providing initial and target states.
+        - dynamics: The system dynamics.
+        - Q: State cost matrix.
+        - R: Control cost matrix.
+        - Qf: Terminal state cost matrix.
+        - freq: Control frequency.
+        - N: Prediction horizon.
+        - verbose: Print debug information if True.
+        """
+
+        super().__init__('MPC', env, dynamics, freq, verbose)
+
+        self.Q = Q
+        self.R = R
+        self.Qf = Qf
+
+        self.N = N  # Prediction horizon
+
+        self.freq = freq
+        self.dt = 1 / self.freq  # Time step
+
+        self.ocp = None
+        self.solver = None
+
+        self.setup()
+
+    def setup(self):
+        """
+        Define the MPC optimization problem using Acados.
+        """
+        # Initialize Acados model
+        model = AcadosModel()
+        model.name = "mpc_controller"
+
+        # Define model: dx/dt = f(x, u)
+        model.x = self.dynamics.states
+        model.u = self.dynamics.inputs
+        model.f_expl_expr = ca.vertcat(self.dynamics.dynamics_function(self.dynamics.states, self.dynamics.inputs))
+        model.f_impl_expr = None
+
+        # Set up Acados OCP
+        ocp = AcadosOcp()
+        ocp.model = model
+        ocp.dims.N = self.N  # Prediction horizon
+        ocp.solver_options.tf = self.N * self.dt  # Total prediction time
+        ocp.solver_options.qp_solver = "PARTIAL_CONDENSING_HPIPM"
+        ocp.solver_options.integrator_type = "ERK"
+        ocp.solver_options.nlp_solver_type = "SQP"
+
+        # Set up cost function
+        ocp.cost.cost_type = "LINEAR_LS"
+        ocp.cost.cost_type_e = "LINEAR_LS"
+        ocp.cost.W = np.block([
+            [self.Q, np.zeros((self.dim_states, self.dim_inputs))],
+            [np.zeros((self.dim_inputs, self.dim_states)), self.R],
+        ])
+        ocp.cost.W_e = self.Qf
+
+        # Set up mapping from QP to OCP
+        # Define output matrix for non-terminal state
+        ocp.cost.Vx = np.block([
+            [np.eye(self.dim_states)],
+            [np.zeros((self.dim_inputs, self.dim_states))]
+        ])
+        # Define breakthrough matrix for non-terminal state
+        ocp.cost.Vu = np.block([
+            [np.zeros((self.dim_states, self.dim_inputs))],
+            [np.eye(self.dim_inputs)]
+        ])
+        # Define output matrix for terminal state
+        ocp.cost.Vx_e = np.eye(self.dim_states)
+
+        # Initialize reference of task (stabilization)
+        ocp.cost.yref = np.zeros(self.dim_states + self.dim_inputs) 
+        ocp.cost.yref_e = np.zeros(self.dim_states) 
+
+        # Constraints # TODO: specify from env/dynamics
+        ocp.constraints.x0 = self.init_state  # Initial state
+        ocp.constraints.lbx = np.array([-1e6, -1e6])
+        ocp.constraints.ubx = np.array([1e6, 1e6])
+        ocp.constraints.idxbx = np.arange(self.dim_states)
+        ocp.constraints.lbu = np.array([-1e6]) * self.dim_inputs  # Lower bound on input
+        ocp.constraints.ubu = np.array([1e6]) * self.dim_inputs  # Upper bound on input
+        ocp.constraints.idxbu = np.array(self.dim_inputs)  # Input index for constraints
+
+        # Set up Acados solver
+        self.ocp = ocp
+        self.solver = AcadosOcpSolver(ocp, json_file=f"{model.name}.json")
+
+        if self.verbose:
+            print("MPC setup with Acados completed.")
+
+    def compute_action(self, current_state, current_time):
+        """
+        Solve the MPC problem and compute the optimal control action.
+
+        Args:
+        - current_state: The current state of the system.
+        - current_time: The current time (not directly used).
+
+        Returns:
+        - Optimal control action.
+        """
+        # Update initial state in the solver
+        self.solver.set(0, "lbx", current_state)
+        self.solver.set(0, "ubx", current_state)
+
+        # Update reference trajectory for all prediction steps
+        state_ref = self.target_state
+        input_ref = np.zeros(self.dim_inputs)
+        for i in range(self.N):
+            self.solver.set(i, "yref", np.concatenate((state_ref, input_ref)))
+        self.solver.set(self.N, "yref", state_ref) # set reference valur for y_N seperately (different shape)
+
+        # Solve the MPC problem
+        status = self.solver.solve()
+        if status != 0:
+            raise ValueError(f"Acados solver failed with status {status}")
+
+        # Extract the first control action
+        u_optimal = self.solver.get(0, "u")
+
+        if self.verbose:
+            print(f"Optimal control action: {u_optimal}")
+
+        return u_optimal
+
+
 
 
 class Simulator:
@@ -352,7 +502,10 @@ class Simulator:
         self.dt = dt
         self.t_eval = np.linspace(self.t_0, self.t_terminal, int((self.t_terminal - self.t_0) / self.dt))
         
-        # Initialize recording list for p / v / a
+        # Initialize recording list for state and input sequence
+        self.state_traj = [] # list -> ndarray(2,)
+        self.input_traj = [] # list -> scalar
+
         self.positions = []
         self.velocities = []
         self.accelerations = []
@@ -361,11 +514,6 @@ class Simulator:
         self.counter = 0
 
         self.verbose = verbose
-        
-        # Define setting of animation
-        self.car_length= 0.2
-        self.figsize = (8, 4)
-        self.refresh_rate = 30
 
     def reset_counter(self):
         self.counter = 0
@@ -385,50 +533,68 @@ class Simulator:
             #print(f"sim_state:{current_state}")
 
             # Log the results
-            self.positions.append(current_state[0])
-            self.velocities.append(current_state[1])
-            self.accelerations.append(current_input)
+            self.state_traj.append(current_state)
+            self.input_traj.append(current_input)
 
             # Update timer
             self.counter += 1
         
-        print("Simulation finished, start plotting")
+        print("Simulation finished, will start plotting")
         self.reset_counter()
 
     def get_trajectories(self):
         '''Get state and input trajectories, return in ndarray form '''
 
-        # Convert lists to ndarray format
-        positions = np.array(self.positions)
-        velocities = np.array(self.velocities)
-        accelerations = np.array(self.accelerations)
+        # Transform state and input traj from list to ndarray
+        state_traj = np.array(self.state_traj)
+        input_traj = np.array(self.input_traj)
 
-        # Combine positions and velocities into a state vector
-        state_vector = np.vstack((positions, velocities))
+        return state_traj, input_traj
 
-        # Input is the accelerations
-        input_vector = accelerations
 
-        return state_vector, input_vector
+
+
+class Visualizer:
+
+    def __init__(self, simulator):
+
+        self.simulator = simulator
+        self.dynamics = simulator.dynamics
+        self.controller = simulator.controller
+        self.env = simulator.env
+
+        self.state_traj, self.input_traj = self.simulator.get_trajectories()
+
+        self.position = self.state_traj[:, 0]
+        self.velocity = self.state_traj[:, 1]
+        self.acceleration = self.input_traj
+        
+        self.dt = simulator.dt
+        self.t_eval = simulator.t_eval
+
+        # Define setting of animation
+        self.car_length= 0.2
+        self.figsize = (8, 4)
+        self.refresh_rate = 30
 
     def display_final_results(self):
 
         fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(20, 4))
 
         # Plot p / v / a over time t
-        ax1.plot(self.t_eval, self.positions, label="Position p(t)", color="blue")
+        ax1.plot(self.t_eval, self.position, label="Position p(t)", color="blue")
         ax1.set_xlabel("Time (s)")
         ax1.set_ylabel("Position (m)")
         ax1.legend()
 
         # Plot p / v / a over time t
-        ax2.plot(self.t_eval, self.velocities, label="Velocity v(t)", color="green")
+        ax2.plot(self.t_eval, self.velocity, label="Velocity v(t)", color="green")
         ax2.set_xlabel("Time (s)")
         ax2.set_ylabel("Velocity (m/s)")
         ax2.legend()
 
         # Plot p / v / a over time t
-        ax3.plot(self.t_eval, self.accelerations, label="Acceleration a(t)", color="red")
+        ax3.plot(self.t_eval, self.acceleration, label="Acceleration a(t)", color="red")
         ax3.set_xlabel("Time (s)")
         ax3.set_ylabel("Acceleration (m/s^2)")
         ax3.legend()
@@ -437,33 +603,34 @@ class Simulator:
         plt.show()
 
     def display_contrast(self, simulator_ref):
-
-        x_traj, u_traj = self.get_trajectories()
-        x_traj_ref, u_traj_ref = simulator_ref.get_trajectories()
-
-        time_array_length = x_traj.shape[1]
-        time_array = np.linspace(0, (time_array_length - 2) * self.dt, time_array_length)
-
+        
+        # Get reference trajectories from simulator_ref
+        state_traj_ref, input_traj_ref = simulator_ref.get_trajectories()
+        
+        # Extract reference position velocity and acceleration
+        position_ref = state_traj_ref[:, 0]
+        velocity_ref = state_traj_ref[:, 1]
+        acceleration_ref = input_traj_ref
 
         fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(20, 4))
 
         # Plot p / v / a over time t
-        ax1.plot(time_array, x_traj[0, :], label=self.controller.name, color="blue")
-        ax1.plot(time_array, x_traj_ref[0, :], linestyle="--", label=simulator_ref.controller.name, color="blue")
+        ax1.plot(self.t_eval, self.position, label=self.controller.name, color="blue")
+        ax1.plot(self.t_eval, position_ref, linestyle="--", label=simulator_ref.controller.name, color="blue")
         ax1.set_xlabel("Time (s)")
         ax1.set_ylabel("Position (m)")
         ax1.legend()
 
         # Plot p / v / a over time t
-        ax2.plot(time_array, x_traj[1, :], label=self.controller.name, color="green")
-        ax2.plot(time_array, x_traj_ref[1, :], linestyle="--", label=simulator_ref.controller.name, color="green")
+        ax2.plot(self.t_eval, self.velocity, label=self.controller.name, color="green")
+        ax2.plot(self.t_eval, velocity_ref, linestyle="--", label=simulator_ref.controller.name, color="green")
         ax2.set_xlabel("Time (s)")
         ax2.set_ylabel("Velocity (m/s)")
         ax2.legend()
 
         # Plot p / v / a over time t
-        ax3.plot(time_array, u_traj, label=self.controller.name, color="red")
-        ax3.plot(time_array, u_traj_ref, linestyle="--", label=simulator_ref.controller.name, color="red")
+        ax3.plot(self.t_eval, self.acceleration, label=self.controller.name, color="red")
+        ax3.plot(self.t_eval, acceleration_ref, linestyle="--", label=simulator_ref.controller.name, color="red")
         ax3.set_xlabel("Time (s)")
         ax3.set_ylabel("Acceleration (m/s^2)")
         ax3.legend()
@@ -477,8 +644,8 @@ class Simulator:
         fig, ax1 = plt.subplots(1, 1, figsize=self.figsize)
         
         # Define size of plotting
-        p_max = max(self.positions)
-        p_min = min(self.positions)
+        p_max = max(self.position)
+        p_min = min(self.position)
         start_extension = p_min - 0.3
         end_extension = p_max + 0.3
 
@@ -513,7 +680,7 @@ class Simulator:
 
         def update(frame):
             # Get current position and attitude of car
-            current_position = self.positions[frame]
+            current_position = self.position[frame]
             current_theta = float(self.env.theta(current_position).full().flatten()[0])
 
             # Update position and attitude of car
