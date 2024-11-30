@@ -691,3 +691,18 @@ class Visualizer:
         anim = FuncAnimation(fig, update, frames=len(self.t_eval), interval=1000 / self.refresh_rate, repeat=False)
 
         return HTML(anim.to_jshtml())
+
+
+
+# Actions:
+# derive iLQR form LQR
+# split up teh controlelr and simulator
+# update the implementation of discritization with matrix exponential (scipy)
+# add typing for each function argument and output (https://docs.python.org/3/library/typing.html)
+# add property decorator to limti the charactor of argument like pdf (https://stackoverflow.com/questions/17330160/how-does-the-property-decorator-work-in-python)
+# add a dataclass to set up all internal & public variable in class (https://docs.python.org/3/library/dataclasses.html)
+
+
+# Next steps:
+# finish PID
+# implement ADP (without constraint)
