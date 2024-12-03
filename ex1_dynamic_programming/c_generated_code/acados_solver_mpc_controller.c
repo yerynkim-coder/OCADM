@@ -533,7 +533,7 @@ void mpc_controller_acados_setup_nlp_in(mpc_controller_solver_capsule* capsule, 
     double* ubu = lubu + NBU;
     
     lbu[0] = -1000000;
-    ubu[0] = 1000000;
+    ubu[0] = 1.5;
 
     for (int i = 0; i < N; i++)
     {
@@ -652,7 +652,7 @@ int with_solution_sens_wrt_params = false;
     ocp_nlp_solver_opts_set(nlp_config, nlp_opts, "levenberg_marquardt", &levenberg_marquardt);
 
     /* options QP solver */
-    int qp_solver_cond_N;const int qp_solver_cond_N_ori = 60;
+    int qp_solver_cond_N;const int qp_solver_cond_N_ori = 20;
     qp_solver_cond_N = N < qp_solver_cond_N_ori ? N : qp_solver_cond_N_ori; // use the minimum value here
     ocp_nlp_solver_opts_set(nlp_config, nlp_opts, "qp_cond_N", &qp_solver_cond_N);
 

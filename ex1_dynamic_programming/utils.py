@@ -4,6 +4,8 @@ import scipy.linalg
 from scipy.integrate import solve_ivp
 import matplotlib.pyplot as plt
 from abc import ABC, abstractmethod
+from typing import List, Callable, Union, Optional, Tuple, Any
+from functools import wraps
 from matplotlib.patches import Rectangle
 from matplotlib.animation import FuncAnimation
 from IPython.display import display, HTML
@@ -15,7 +17,18 @@ from acados_template import AcadosOcp, AcadosOcpSolver, AcadosModel
 
 
 class Env:
-    def __init__(self, case, init_state, target_state, symbolic_h, symbolic_theta):
+    def __init__(
+            self, 
+            case: int, 
+            init_state: np.ndarray, 
+            target_state: np.ndarray,
+            symbolic_h: Callable[[ca.SX, int], ca.SX], 
+            symbolic_theta: Callable[[ca.Function], ca.Function],
+            state_lbs: np.ndarray = None, 
+            state_ubs: np.ndarray = None, 
+            input_lbs: float = None, 
+            input_ubs: float = None
+        ) -> None:
 
         self.case = case  # 1, 2, 3, 4
 
@@ -27,6 +40,10 @@ class Env:
         self.target_velocity = target_state[1]
         self.target_state = np.array([self.target_position, self.target_velocity])
 
+        self.state_lbs = state_lbs
+        self.state_ubs = state_ubs
+        self.input_lbs = input_lbs
+        self.input_ubs = input_ubs
 
         # Define argument p as CasADi symbolic parameters
         p = ca.SX.sym("p")
@@ -35,7 +52,7 @@ class Env:
         self.h = ca.Function("h", [p], [symbolic_h(p, case)])
         self.theta = symbolic_theta(self.h)
 
-    def test_env(self, p_vals):
+    def test_env(self, p_vals: np.ndarray) -> None:
         
         # Calculate values of h and theta on grid mesh
         h_vals = [float(self.h(p)) for p in p_vals]
@@ -64,7 +81,13 @@ class Env:
 
 
 class Dynamics:
-    def __init__(self, state_names, input_names, dynamics_eq, env):
+    def __init__(
+            self, 
+            state_names: List[str],
+            input_names: List[str],
+            dynamics_eq: Callable[[ca.Function], Callable[[ca.SX, ca.SX], ca.SX]],
+            env: Env
+        ) -> None:
 
         # Define state and input as CasADi symbolic parameters
         self.states = ca.vertcat(*[ca.SX.sym(name) for name in state_names])
@@ -83,20 +106,46 @@ class Dynamics:
         self.A_func = ca.Function("A_func", [self.states, self.inputs], [A_sym])
         self.B_func = ca.Function("B_func", [self.states, self.inputs], [B_sym])
 
-    def get_linearized_AB_discrete(self, current_state, current_input, dt):
+    def get_linearized_AB_discrete(
+            self, 
+            current_state: np.ndarray, 
+            current_input: np.ndarray, 
+            dt: float
+        ) -> Tuple[np.ndarray, np.ndarray]:
         '''use current state, and current input to calculate the linearized state transfer matrix A_lin and input matrix B_lin'''
-
+        
         # Evaluate linearized A and B around set point
-        A_lin = np.array(self.A_func(current_state, current_input))
-        B_lin = np.array(self.B_func(current_state, current_input))
+        A_c = np.array(self.A_func(current_state, current_input))
+        B_c = np.array(self.B_func(current_state, current_input))
 
-        # Transform into discrete dynamics
-        A_lin = A_lin * dt + np.eye(self.dim_states)
-        B_lin = B_lin * dt
- 
-        return A_lin, B_lin
+        '''
+        # Method 1: approximation using forward euler method
+        A_d = A_c * dt + np.eye(self.dim_states)
+        B_d = B_c * dt
+        '''
+
+        # Method 2: using matrix exponential
+        # Construct augmented matrix for continious dynamics
+        aug_matrix = np.zeros((self.dim_states + self.dim_inputs, self.dim_states + self.dim_inputs))
+        aug_matrix[:self.dim_states, :self.dim_states] = A_c
+        aug_matrix[:self.dim_states, self.dim_states:] = B_c
+
+        # Calculate matrix exponential
+        exp_matrix = scipy.linalg.expm(aug_matrix * dt)
+
+        # Extract discrete A and B
+        A_d = exp_matrix[:self.dim_states, :self.dim_states]
+        B_d = exp_matrix[:self.dim_states, self.dim_states:]
+        
+        # Check controllability of the discretized system
+        controllability_matrix = np.hstack([np.linalg.matrix_power(A_d, i) @ B_d for i in range(self.dim_states)])
+        rank = np.linalg.matrix_rank(controllability_matrix)
+        if rank < self.dim_states:
+            raise ValueError(f"System (A, B) is not controllable，rank of controllability matrix is {rank}, while the dimension of state space is {self.dim_states}.")
+        
+        return A_d, B_d
     
-    def compute_equilibrium_input(self, state):
+    def compute_equilibrium_input(self, state: np.ndarray) -> float:
 
         p, v = state
 
@@ -115,7 +164,8 @@ class Dynamics:
 
         return float(a_eq)
     
-    def one_step_forward(self, current_state, current_input, dt):
+    def one_step_forward(self, current_state: np.ndarray, current_input: np.ndarray, dt: float) -> np.ndarray:
+
         '''use current state, current input, and time difference to calculate next state'''
         
         t_span = [0, dt]
@@ -137,8 +187,42 @@ class Dynamics:
 
 
 
+def check_input_constraints(compute_action):
+    """
+    Decorator, for checking whether input is compatible with given constraints
+    input constraint get from self.env
+    """
+    @wraps(compute_action)
+    def wrapper(self, current_state, current_time):
+
+        # Get upper and lower bound of input from env
+        input_lbs = self.env.input_lbs
+        input_ubs = self.env.input_ubs
+
+        # Call original method 'compute_action'
+        u = compute_action(self, current_state, current_time)
+
+        # Check whether input is compatible with given constraints
+        if input_lbs is not None:
+            if not np.all(input_lbs<= u):
+                raise ValueError(f"Warning: control input {u} is beyond the lower limit {input_lbs}!")
+        if input_ubs is not None:
+            if not np.all(u <= input_ubs):
+                raise ValueError(f"Warning: control input {u} is beyond the upper limit {input_ubs}")
+
+        return u
+    return wrapper
+
+
 class BaseController(ABC):
-    def __init__(self, name, env, dynamics, freq, verbose=False):
+    def __init__(
+            self, 
+            env: Env, 
+            dynamics: Dynamics, 
+            freq: float, 
+            name: str, 
+            verbose: bool = False
+        ) -> None:
 
         self.name = name
 
@@ -157,36 +241,97 @@ class BaseController(ABC):
         self.target_state = self.env.target_state
 
     @abstractmethod
-    def setup(self):
+    def setup(self) -> None:
         """
         Initialize necessary matrices or parameters for the controller.
         """
         pass
 
     @abstractmethod
-    def compute_action(self, current_state, current_time):
+    def compute_action(self, current_state: np.ndarray, current_time) -> np.ndarray:
         """
         Compute control action based on the current state and time.
         """
         pass
 
+
 # Derived class for LQR Controller
 class LQRController(BaseController):
-    def __init__(self, env, dynamics, Q, R, freq, verbose=False):
+    def __init__(
+            self, 
+            env: Env, 
+            dynamics: Dynamics, 
+            Q: np.ndarray, 
+            R: np.ndarray, 
+            freq: float, 
+            name: str = 'LQR', 
+            verbose: bool = False
+        ) -> None:
 
-        super().__init__('LQR', env, dynamics, freq, verbose)
-
+        super().__init__(env, dynamics, freq, name, verbose)
+        
+        # Initialize as private property
+        self._Q = None
+        self._R = None
+        self._K = None  # LQR gain matrix
+        
+        # Call setter for the check and update the value of private property
         self.Q = Q
         self.R = R
 
         self.A = None  # State transfer matrix
         self.B = None  # Input matrix
-        self.K = None  # LQR gain matrix
         
         # need no external objects for setup, can directly call the setup function here
-        self.setup()
+        if name in ['LQR', 'MPC']:
+            self.setup()
 
-    def setup(self):
+    @property
+    def Q(self) -> np.ndarray:
+        return self._Q
+
+    @Q.setter
+    def Q(self, value: np.ndarray) -> None:
+        if value.shape[0] != value.shape[1]:
+            raise ValueError("Warning: Q must be a square matrix!")
+        if not np.allclose(value, value.T):
+            raise ValueError("Warning: Q must be a symmetric matrix!")
+        if not np.all(np.linalg.eigvals(value) >= 0):
+            raise ValueError("Warning: Q must be a positive semi-definite matrix!")
+        elif self.verbose:
+            print("Check passed, Q is a symmetric, positive semi-definite matrix.")
+        self._Q = value
+
+    @property
+    def R(self) -> np.ndarray:
+        return self._R
+
+    @R.setter
+    def R(self, value: np.ndarray) -> None:
+        if value.shape[0] != value.shape[1]:
+            raise ValueError("Warning: R must be a square matrix!")
+        if not np.allclose(value, value.T):
+            raise ValueError("Warning: R must be a symmetric matrix!")
+        if not np.all(np.linalg.eigvals(value) > 0):
+            raise ValueError("Warning: R must be a positive definite matrix!")
+        elif self.verbose:
+            print("Check passed, R is a symmetric, positive definite matrix.")
+        self._R = value
+    
+    @property
+    def K(self) -> np.ndarray:
+        return self._K
+
+    @K.setter
+    def K(self, value: np.ndarray) -> None:
+        eigvals = np.linalg.eigvals(self.A - self.B @ value)
+        if np.any(np.abs(eigvals) > 1):
+            raise ValueError("Warning: not all eigenvalue of A_cl inside unit circle, close-loop system is unstable!")
+        elif self.verbose:
+            print(f"Check passed, current gain K={value}, close-loop system is stable.")
+        self._K = value
+
+    def setup(self) -> None:
         # Linearize dynamics at equilibrium
         state_eq = np.zeros(self.dim_states)
         input_eq = np.zeros((1,))
@@ -196,12 +341,13 @@ class LQRController(BaseController):
 
         # Solve DARE to compute gain matrix
         P = scipy.linalg.solve_discrete_are(self.A, self.B, self.Q, self.R)
-        self.K = np.linalg.inv(self.R) @ (self.B.T @ P)
+        self.K = np.linalg.inv(self.R + self.B.T @ P @ self.B) @ (self.B.T @ P @ self.A)
 
         if self.verbose:
             print(f"LQR Gain Matrix K: {self.K}")
 
-    def compute_action(self, current_state, current_time):
+    @check_input_constraints
+    def compute_action(self, current_state: np.ndarray, current_time) -> np.ndarray:
         if self.K is None:
             raise ValueError("LQR gain matrix K is not computed. Call setup() first.")
 
@@ -212,14 +358,23 @@ class LQRController(BaseController):
         u = -self.K @ det_x
         return u
 
+
 # Derived class for iLQR Controller
-class iLQRController(BaseController):
-    def __init__(self, env, dynamics, Q, R, Qf, freq, max_iter=30, tol=2e-2, verbose=False):
+class iLQRController(LQRController):
+    def __init__(
+            self, 
+            env: Env, 
+            dynamics: Dynamics, 
+            Q: np.ndarray, 
+            R: np.ndarray, 
+            Qf: np.ndarray, 
+            freq: float, 
+            name: str = 'iLQR', 
+            max_iter: int = 30, 
+            tol: float = 2e-2, 
+            verbose: bool = False
+        ) -> None:
 
-        super().__init__('iLQR', env, dynamics, freq, verbose)
-
-        self.Q = Q
-        self.R = R
         self.Qf = Qf  # Terminal cost matrix
 
         self.max_iter = max_iter
@@ -228,7 +383,9 @@ class iLQRController(BaseController):
         self.K_k_arr = None
         self.u_kff_arr = None
 
-    def setup(self, input_traj):
+        super().__init__(env, dynamics, Q, R, freq, name, verbose)
+
+    def setup(self, input_traj: np.ndarray) -> None:
         """
         Perform iLQR to compute the optimal control sequence.
         """
@@ -343,16 +500,30 @@ class iLQRController(BaseController):
             u_traj = new_u_traj
             x_traj = new_x_traj
 
-    def compute_action(self, current_state, current_time):
+    @check_input_constraints
+    def compute_action(self, current_state: np.ndarray, current_time) -> np.ndarray:
         if self.K_k_arr is None or self.u_kff_arr is None:
             raise ValueError("iLQR parameters are not computed. Call setup() first.")
 
         u = self.u_kff_arr[current_time] + self.K_k_arr[:, current_time].T @ current_state
         return u
 
+
 # Derived class for MPC Controller
-class MPCController(BaseController):
-    def __init__(self, env, dynamics, Q, R, Qf, freq, N, verbose=False):
+class MPCController(LQRController):
+    def __init__(
+            self, 
+            env: Env, 
+            dynamics: Dynamics, 
+            Q: np.ndarray, 
+            R: np.ndarray, 
+            Qf: np.ndarray, 
+            freq: float, 
+            N: int, 
+            name: str = 'MPC', 
+            verbose: bool = True
+        ) -> None:
+
         """
         Initialize the MPC Controller with Acados.
 
@@ -367,23 +538,16 @@ class MPCController(BaseController):
         - verbose: Print debug information if True.
         """
 
-        super().__init__('MPC', env, dynamics, freq, verbose)
-
-        self.Q = Q
-        self.R = R
         self.Qf = Qf
 
         self.N = N  # Prediction horizon
 
-        self.freq = freq
-        self.dt = 1 / self.freq  # Time step
-
         self.ocp = None
         self.solver = None
 
-        self.setup()
+        super().__init__(env, dynamics, Q, R, freq, name, verbose)
 
-    def setup(self):
+    def setup(self) -> None:
         """
         Define the MPC optimization problem using Acados.
         """
@@ -433,14 +597,36 @@ class MPCController(BaseController):
         ocp.cost.yref = np.zeros(self.dim_states + self.dim_inputs) 
         ocp.cost.yref_e = np.zeros(self.dim_states) 
 
-        # Constraints # TODO: specify from env/dynamics
+        # Define constraints
         ocp.constraints.x0 = self.init_state  # Initial state
-        ocp.constraints.lbx = np.array([-1e6, -1e6])
-        ocp.constraints.ubx = np.array([1e6, 1e6])
+        
         ocp.constraints.idxbx = np.arange(self.dim_states)
-        ocp.constraints.lbu = np.array([-1e6]) * self.dim_inputs  # Lower bound on input
-        ocp.constraints.ubu = np.array([1e6]) * self.dim_inputs  # Upper bound on input
-        ocp.constraints.idxbu = np.array(self.dim_inputs)  # Input index for constraints
+        if self.env.state_lbs is None and self.env.state_ubs is None:
+            ocp.constraints.lbx = np.full(self.dim_states, -1e6)
+            ocp.constraints.ubx = np.full(self.dim_states, 1e6)
+        elif self.env.state_lbs is not None and self.env.state_ubs is None:
+            ocp.constraints.lbx = np.array(self.env.state_lbs)
+            ocp.constraints.ubx = np.full(self.dim_states, 1e6)
+        elif self.env.state_lbs is None and self.env.state_ubs is not None:
+            ocp.constraints.lbx = np.full(self.dim_states, -1e6)
+            ocp.constraints.ubx = np.array(self.env.state_ubs)
+        else:
+            ocp.constraints.lbx = np.array(self.env.state_lbs)
+            ocp.constraints.ubx = np.array(self.env.state_ubs)
+        
+        ocp.constraints.idxbu = np.array(self.dim_inputs)
+        if self.env.input_lbs is None and self.env.input_ubs is None:
+            ocp.constraints.lbu = np.full(self.dim_inputs, -1e6)
+            ocp.constraints.ubu = np.full(self.dim_inputs, 1e6)
+        elif self.env.input_lbs is not None and self.env.input_ubs is None:
+            ocp.constraints.lbu = np.array(self.env.input_lbs)
+            ocp.constraints.ubu = np.full(self.dim_inputs, 1e6)
+        elif self.env.input_lbs is None and self.env.input_ubs is not None:
+            ocp.constraints.lbu = np.full(self.dim_inputs, -1e6)
+            ocp.constraints.ubu = np.array(self.env.input_ubs)
+        else:
+            ocp.constraints.lbu = np.array(self.env.input_lbs)
+            ocp.constraints.ubu = np.array(self.env.input_ubs)
 
         # Set up Acados solver
         self.ocp = ocp
@@ -449,7 +635,8 @@ class MPCController(BaseController):
         if self.verbose:
             print("MPC setup with Acados completed.")
 
-    def compute_action(self, current_state, current_time):
+    @check_input_constraints
+    def compute_action(self, current_state: np.ndarray, current_time) -> np.ndarray:
         """
         Solve the MPC problem and compute the optimal control action.
 
@@ -488,7 +675,15 @@ class MPCController(BaseController):
 
 
 class Simulator:
-    def __init__(self, dynamics, controller, env, dt, t_terminal, verbose=False):
+    def __init__(
+            self, 
+            dynamics: Dynamics, 
+            controller: BaseController, 
+            env: Env, 
+            dt: float, 
+            t_terminal: float, 
+            verbose: bool = False
+        ) -> None:
 
         self.dynamics = dynamics
         self.controller = controller
@@ -515,10 +710,10 @@ class Simulator:
 
         self.verbose = verbose
 
-    def reset_counter(self):
+    def reset_counter(self) -> None:
         self.counter = 0
     
-    def run_simulation(self):
+    def run_simulation(self) -> None:
         
         # Initialize state vector
         current_state = self.init_state
@@ -542,7 +737,7 @@ class Simulator:
         print("Simulation finished, will start plotting")
         self.reset_counter()
 
-    def get_trajectories(self):
+    def get_trajectories(self) -> Tuple[np.ndarray, np.ndarray]:
         '''Get state and input trajectories, return in ndarray form '''
 
         # Transform state and input traj from list to ndarray
@@ -556,7 +751,7 @@ class Simulator:
 
 class Visualizer:
 
-    def __init__(self, simulator):
+    def __init__(self, simulator: Simulator) -> None:
 
         self.simulator = simulator
         self.dynamics = simulator.dynamics
@@ -577,7 +772,7 @@ class Visualizer:
         self.figsize = (8, 4)
         self.refresh_rate = 30
 
-    def display_final_results(self):
+    def display_final_results(self) -> None:
 
         fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(20, 4))
 
@@ -602,7 +797,7 @@ class Visualizer:
         plt.tight_layout()
         plt.show()
 
-    def display_contrast(self, simulator_ref):
+    def display_contrast(self, simulator_ref: Simulator) -> None:
         
         # Get reference trajectories from simulator_ref
         state_traj_ref, input_traj_ref = simulator_ref.get_trajectories()
@@ -638,7 +833,7 @@ class Visualizer:
         plt.tight_layout()
         plt.show()
 
-    def display_animation(self):
+    def display_animation(self) -> HTML:
         
         # Instantiate the plotting
         fig, ax1 = plt.subplots(1, 1, figsize=self.figsize)
@@ -695,11 +890,12 @@ class Visualizer:
 
 
 # Actions:
-# derive iLQR form LQR
-# split up teh controlelr and simulator
-# update the implementation of discritization with matrix exponential (scipy)
-# add typing for each function argument and output (https://docs.python.org/3/library/typing.html)
-# add property decorator to limti the charactor of argument like pdf (https://stackoverflow.com/questions/17330160/how-does-the-property-decorator-work-in-python)
+# split up the controller and simulator
+# add property decorator to limit the charactor of arguments (https://stackoverflow.com/questions/17330160/how-does-the-property-decorator-work-in-python)
+# - conrtollability for A_d and B_d
+# - symmetric for Q and R, psdf for Q, pdf for R
+# - stability for close-loop gain
+# - whether compatible with constraint for state / input
 # add a dataclass to set up all internal & public variable in class (https://docs.python.org/3/library/dataclasses.html)
 
 

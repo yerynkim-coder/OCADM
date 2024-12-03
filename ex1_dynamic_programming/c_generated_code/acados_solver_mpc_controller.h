@@ -63,7 +63,7 @@
 #define MPC_CONTROLLER_NY0    3
 #define MPC_CONTROLLER_NY     3
 #define MPC_CONTROLLER_NYN    2
-#define MPC_CONTROLLER_N      60
+#define MPC_CONTROLLER_N      20
 #define MPC_CONTROLLER_NH     0
 #define MPC_CONTROLLER_NHN    0
 #define MPC_CONTROLLER_NH0    0
