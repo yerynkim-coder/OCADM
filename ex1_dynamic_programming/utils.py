@@ -2,6 +2,7 @@ import numpy as np
 import casadi as ca
 import scipy.linalg
 from scipy.integrate import solve_ivp
+from scipy.optimize import minimize
 import matplotlib.pyplot as plt
 from abc import ABC, abstractmethod
 from typing import List, Callable, Union, Optional, Tuple, Any
@@ -46,35 +47,45 @@ class Env:
         self.input_ubs = input_ubs
 
         # Define argument p as CasADi symbolic parameters
-        p = ca.SX.sym("p")
+        p = ca.SX.sym("p") # p: horizontal displacement
 
         # Set functions h(p) and theta(p) based on symbolic parameters
-        self.h = ca.Function("h", [p], [symbolic_h(p, case)])
-        self.theta = symbolic_theta(self.h)
+        self.h = ca.Function("h", [p], [symbolic_h(p, case)]) # function of height h w.r.t. p
+        self.theta = symbolic_theta(self.h) # function of inclination angle theta w.r.t. p
+        
+        # Generate grid mesh along p to visualize the curve of slope and inclination angle
+        self.p_vals_disp = np.linspace(self.initial_position-0.2, self.target_position+0.2, 50)
 
-    def test_env(self, p_vals: np.ndarray) -> None:
+    def test_env(self) -> None:
         
         # Calculate values of h and theta on grid mesh
-        h_vals = [float(self.h(p)) for p in p_vals]
-        theta_vals = [float(self.theta(p)) for p in p_vals]
+        h_vals = [float(self.h(p)) for p in self.p_vals_disp]
+        theta_vals = [float(self.theta(p)) for p in self.p_vals_disp]
+        
+        # Calculate teh value of h for initial state and terminal state
+        initial_h = float(self.h(self.initial_position).full().flatten()[0])
+        target_h = float(self.h(self.target_position).full().flatten()[0])
         
         # Display curve theta(p) (left), h(p) (right)
         _, ax = plt.subplots(1, 2, figsize=(12, 3))
-    
-        # theta(p)
-        ax[0].plot(p_vals, theta_vals, label=r"$\theta(p)$", color='blue')
-        ax[0].set_xlabel("p")
-        ax[0].set_ylabel(r"$\theta$")
-        ax[0].set_ylim(-1.5, 1.5)  
-        ax[0].set_title(r"$\theta$($p$)")
-        ax[0].legend()
 
         # h(p)
-        ax[1].plot(p_vals, h_vals, label="h(p)", color='green')
+        ax[0].plot(self.p_vals_disp, h_vals, label="h(p)", color='green')
+        ax[0].scatter([self.initial_position], [initial_h], color="blue", label="Initial position")
+        ax[0].scatter([self.target_position], [target_h], color="orange", label="Target position")
+        ax[0].set_xlabel("p")
+        ax[0].set_ylabel("h")
+        ax[0].set_title("h(p)")
+        ax[0].legend()
+
+        # theta(p)
+        ax[1].plot(self.p_vals_disp, theta_vals, label=r"$\theta(p)$", color='blue')
         ax[1].set_xlabel("p")
-        ax[1].set_ylabel("h")
-        ax[1].set_title("h(p)")
+        ax[1].set_ylabel(r"$\theta$")
+        ax[1].set_ylim(-1.5, 1.5)  
+        ax[1].set_title(r"$\theta$($p$)")
         ax[1].legend()
+
         plt.show()
 
 
@@ -187,6 +198,28 @@ class Dynamics:
 
 
 
+def is_square(matrix: np.ndarray) -> bool:
+    if matrix.shape[0] != matrix.shape[1]:
+        raise ValueError("Warning: must be a square matrix!")
+    return True
+
+def is_symmetric(matrix: np.ndarray) -> bool:
+    if not np.allclose(matrix, matrix.T):
+        raise ValueError("Warning: must be a symmetric matrix!")
+    return True
+
+def is_positive_semi_definite(matrix: np.ndarray) -> bool:
+    eigvals = np.linalg.eigvals(matrix)
+    if not np.all(np.greater_equal(eigvals, 0)):
+        raise ValueError("Warning: must be a positive semi-definite matrix!")
+    return True
+
+def is_positive_definite(matrix: np.ndarray) -> bool:
+    eigvals = np.linalg.eigvals(matrix)
+    if not np.all(np.greater(eigvals, 0)):
+        raise ValueError("Warning: must be a positive definite matrix!")
+    return True
+
 def check_input_constraints(compute_action):
     """
     Decorator, for checking whether input is compatible with given constraints
@@ -255,6 +288,163 @@ class BaseController(ABC):
         pass
 
 
+# Derived class for DP Controller
+class DPController(BaseController):
+    def __init__(
+            self,
+            env: Env,
+            dynamics: Dynamics,
+            Q: np.ndarray,
+            R: np.ndarray,
+            Qf: np.ndarray, 
+            freq: float,
+            name: str = 'DP',
+            Horizon: int = 500,
+            verbose: bool = False
+        ) -> None:
+
+        super().__init__(env, dynamics, freq, name, verbose)
+
+        self.Q = Q
+        self.R = R
+        self.Qf = Qf
+
+        self.N = Horizon
+        
+        # Different from LQR or iLQR, there we directly use self.policy to store inputs
+        self.policy = [None] * self.N
+
+        self.setup()
+
+    def setup(self) -> None:
+
+        # Initialize Acados model
+        model = AcadosModel()
+        model.name = "dp_controller"
+        model.x = self.dynamics.states
+        model.u = self.dynamics.inputs
+        model.f_expl_expr = ca.vertcat(self.dynamics.dynamics_function(self.dynamics.states, self.dynamics.inputs))
+        model.f_impl_expr = None
+
+        # Set up Acados OCP
+        ocp = AcadosOcp()
+        ocp.model = model
+        ocp.dims.N = self.N  # Prediction horizon
+        ocp.solver_options.tf = self.N * self.dt  # Total prediction time
+        ocp.solver_options.qp_solver = "PARTIAL_CONDENSING_HPIPM"
+        ocp.solver_options.globalization = 'FUNNEL_L1PEN_LINESEARCH'
+        ocp.solver_options.integrator_type = "ERK"
+        ocp.solver_options.nlp_solver_type = "SQP"
+        ocp.solver_options.print_level = 1
+        ocp.solver_options.nlp_solver_tol_stat = 1e-5
+
+        # Set up cost function
+        ocp.cost.cost_type = "LINEAR_LS"
+        ocp.cost.cost_type_e = "LINEAR_LS"
+        ocp.cost.W = np.block([
+            [self.Q, np.zeros((self.dim_states, self.dim_inputs))],
+            [np.zeros((self.dim_inputs, self.dim_states)), self.R],
+        ])
+        ocp.cost.W_e = self.Qf # will be updated in each step
+
+        # Set up mapping from QP to OCP
+        # Define output matrix for non-terminal state
+        ocp.cost.Vx = np.block([
+            [np.eye(self.dim_states)],
+            [np.zeros((self.dim_inputs, self.dim_states))]
+        ])
+        # Define breakthrough matrix for non-terminal state
+        ocp.cost.Vu = np.block([
+            [np.zeros((self.dim_states, self.dim_inputs))],
+            [np.eye(self.dim_inputs)]
+        ])
+        # Define output matrix for terminal state
+        ocp.cost.Vx_e = np.eye(self.dim_states)
+
+        # Initialize reference of task (stabilization)
+        ocp.cost.yref = np.hstack((self.target_state, np.zeros(self.dim_inputs)))
+        ocp.cost.yref_e = np.array(self.target_state)
+
+        # Define constraints
+        ocp.constraints.x0 = self.init_state  # Initial state
+        
+        ocp.constraints.idxbx = np.arange(self.dim_states)
+        ocp.constraints.idxbx_e = np.arange(self.dim_states)
+        if self.env.state_lbs is None and self.env.state_ubs is None:
+            ocp.constraints.lbx = np.full(self.dim_states, -1e6)
+            ocp.constraints.ubx = np.full(self.dim_states, 1e6)
+            ocp.constraints.lbx_e = np.full(self.dim_states, -1e6)
+            ocp.constraints.ubx_e = np.full(self.dim_states, 1e6)
+        elif self.env.state_lbs is not None and self.env.state_ubs is None:
+            ocp.constraints.lbx = np.array(self.env.state_lbs)
+            ocp.constraints.ubx = np.full(self.dim_states, 1e6)
+            ocp.constraints.lbx_e = np.array(self.env.state_lbs)
+            ocp.constraints.ubx_e = np.full(self.dim_states, 1e6)
+        elif self.env.state_lbs is None and self.env.state_ubs is not None:
+            ocp.constraints.lbx = np.full(self.dim_states, -1e6)
+            ocp.constraints.ubx = np.array(self.env.state_ubs)
+            ocp.constraints.lbx_e = np.full(self.dim_states, -1e6)
+            ocp.constraints.ubx_e = np.array(self.env.state_ubs)
+        else:
+            ocp.constraints.lbx = np.array(self.env.state_lbs)
+            ocp.constraints.ubx = np.array(self.env.state_ubs)
+            ocp.constraints.lbx_e = np.array(self.env.state_lbs)
+            ocp.constraints.ubx_e = np.array(self.env.state_ubs)
+        
+        ocp.constraints.idxbu = np.arange(self.dim_inputs)
+        if self.env.input_lbs is None and self.env.input_ubs is None:
+            ocp.constraints.lbu = np.full(self.dim_inputs, -1e6)
+            ocp.constraints.ubu = np.full(self.dim_inputs, 1e6)
+        elif self.env.input_lbs is not None and self.env.input_ubs is None:
+            ocp.constraints.lbu = np.array(self.env.input_lbs)
+            ocp.constraints.ubu = np.full(self.dim_inputs, 1e6)
+        elif self.env.input_lbs is None and self.env.input_ubs is not None:
+            ocp.constraints.lbu = np.full(self.dim_inputs, -1e6)
+            ocp.constraints.ubu = np.array(self.env.input_ubs)
+        else:
+            ocp.constraints.lbu = np.array(self.env.input_lbs)
+            ocp.constraints.ubu = np.array(self.env.input_ubs)
+
+        # Set up Acados solver
+        self.ocp = ocp
+        self.solver = AcadosOcpSolver(ocp, json_file=f"{model.name}.json")
+
+        if self.verbose:
+            print("DP setup with Acados completed.")
+
+        # Update initial state in the solver
+        self.solver.set(0, "lbx", self.init_state)
+        self.solver.set(0, "ubx", self.init_state)
+
+        # Solve the MPC problem
+        status = self.solver.solve()
+        if status != 0:
+            raise ValueError(f"Acados solver failed with status {status}")
+
+        # Extract each input 
+        for k in range(self.N):
+
+            self.policy[k] = self.solver.get(k, "u")
+
+            print(f"Current input: {self.policy[k]}")
+
+        if self.verbose:
+            print(f"Dynamic Programming policy with input constraints computed.")
+
+    @check_input_constraints
+    def compute_action(self, current_state: np.ndarray, current_time: int) -> np.ndarray:
+
+        if self.policy is None:
+            raise ValueError("DP Policy is not computed. Call setup() first.")
+
+        # Discretize the current time to find the policy index
+        time_index = int(np.floor(current_time * self.freq))
+        if time_index >= self.N:
+            time_index = self.N - 1  # Use the last policy (zero policy) for any time after the horizon
+
+        return self.policy[current_time]
+
+
 # Derived class for LQR Controller
 class LQRController(BaseController):
     def __init__(
@@ -292,14 +482,14 @@ class LQRController(BaseController):
 
     @Q.setter
     def Q(self, value: np.ndarray) -> None:
-        if value.shape[0] != value.shape[1]:
-            raise ValueError("Warning: Q must be a square matrix!")
-        if not np.allclose(value, value.T):
-            raise ValueError("Warning: Q must be a symmetric matrix!")
-        if not np.all(np.linalg.eigvals(value) >= 0):
-            raise ValueError("Warning: Q must be a positive semi-definite matrix!")
-        elif self.verbose:
+
+        is_square(value)
+        is_symmetric(value)
+        is_positive_semi_definite(value)
+
+        if self.verbose:
             print("Check passed, Q is a symmetric, positive semi-definite matrix.")
+
         self._Q = value
 
     @property
@@ -308,14 +498,14 @@ class LQRController(BaseController):
 
     @R.setter
     def R(self, value: np.ndarray) -> None:
-        if value.shape[0] != value.shape[1]:
-            raise ValueError("Warning: R must be a square matrix!")
-        if not np.allclose(value, value.T):
-            raise ValueError("Warning: R must be a symmetric matrix!")
-        if not np.all(np.linalg.eigvals(value) > 0):
-            raise ValueError("Warning: R must be a positive definite matrix!")
-        elif self.verbose:
+
+        is_square(value)
+        is_symmetric(value)
+        is_positive_definite(value)
+
+        if self.verbose:
             print("Check passed, R is a symmetric, positive definite matrix.")
+        
         self._R = value
     
     @property
@@ -501,7 +691,7 @@ class iLQRController(LQRController):
             x_traj = new_x_traj
 
     @check_input_constraints
-    def compute_action(self, current_state: np.ndarray, current_time) -> np.ndarray:
+    def compute_action(self, current_state: np.ndarray, current_time: int) -> np.ndarray:
         if self.K_k_arr is None or self.u_kff_arr is None:
             raise ValueError("iLQR parameters are not computed. Call setup() first.")
 
@@ -601,20 +791,29 @@ class MPCController(LQRController):
         ocp.constraints.x0 = self.init_state  # Initial state
         
         ocp.constraints.idxbx = np.arange(self.dim_states)
+        ocp.constraints.idxbx_e = np.arange(self.dim_states)
         if self.env.state_lbs is None and self.env.state_ubs is None:
             ocp.constraints.lbx = np.full(self.dim_states, -1e6)
             ocp.constraints.ubx = np.full(self.dim_states, 1e6)
+            ocp.constraints.lbx_e = np.full(self.dim_states, -1e6)
+            ocp.constraints.ubx_e = np.full(self.dim_states, 1e6)
         elif self.env.state_lbs is not None and self.env.state_ubs is None:
             ocp.constraints.lbx = np.array(self.env.state_lbs)
             ocp.constraints.ubx = np.full(self.dim_states, 1e6)
+            ocp.constraints.lbx_e = np.array(self.env.state_lbs)
+            ocp.constraints.ubx_e = np.full(self.dim_states, 1e6)
         elif self.env.state_lbs is None and self.env.state_ubs is not None:
             ocp.constraints.lbx = np.full(self.dim_states, -1e6)
             ocp.constraints.ubx = np.array(self.env.state_ubs)
+            ocp.constraints.lbx_e = np.full(self.dim_states, -1e6)
+            ocp.constraints.ubx_e = np.array(self.env.state_ubs)
         else:
             ocp.constraints.lbx = np.array(self.env.state_lbs)
             ocp.constraints.ubx = np.array(self.env.state_ubs)
+            ocp.constraints.lbx_e = np.array(self.env.state_lbs)
+            ocp.constraints.ubx_e = np.array(self.env.state_ubs)
         
-        ocp.constraints.idxbu = np.array(self.dim_inputs)
+        ocp.constraints.idxbu = np.arange(self.dim_inputs)
         if self.env.input_lbs is None and self.env.input_ubs is None:
             ocp.constraints.lbu = np.full(self.dim_inputs, -1e6)
             ocp.constraints.ubu = np.full(self.dim_inputs, 1e6)
