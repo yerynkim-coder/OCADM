@@ -1,9 +1,9 @@
 # ignore all file
 *
 
-# except for utils.py and dynamic_programming.ipynb
-!utils.py
+# exceptions
 !dynamic_programming.ipynb
+!rest
 
 
 # Byte-compiled / optimized / DLL files
