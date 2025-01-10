@@ -42,7 +42,11 @@ class Env:
         self.target_state = np.array([self.target_position, self.target_velocity])
 
         self.state_lbs = state_lbs
+        self.pos_lbs = state_lbs[0]
+        self.vel_lbs = state_lbs[1]
         self.state_ubs = state_ubs
+        self.pos_ubs = state_ubs[0]
+        self.vel_ubs = state_ubs[1]
         self.input_lbs = input_lbs
         self.input_ubs = input_ubs
 
@@ -119,7 +123,6 @@ class Env:
         ax[1].legend()
 
         plt.show()
-
 
 
 
@@ -254,6 +257,151 @@ class Dynamics:
 
         return next_state
 
+
+
+class Env_rl(Env):
+    def __init__(
+            self, 
+            case: int, 
+            init_state: np.ndarray, 
+            target_state: np.ndarray,
+            symbolic_h: Callable[[ca.SX, int], ca.SX] = None, 
+            symbolic_theta: Callable[[ca.Function], ca.Function] = None,
+            dynmaics: Dynamics = None,
+            state_lbs: np.ndarray = None, 
+            state_ubs: np.ndarray = None, 
+            input_lbs: float = None, 
+            input_ubs: float = None,
+            gamma: float = 0.95,
+            dt: float = 0.1
+        ) -> None:
+
+        super().__init__(case, init_state, target_state, symbolic_h, symbolic_theta, state_lbs, state_ubs, input_lbs, input_ubs)
+
+        self.num_pos = 20
+        self.num_vel = 20
+        self.num_acc = 5
+
+        if state_lbs is None or state_ubs is None or input_lbs is None or input_ubs is None:
+            raise ValueError("Constraints on states and input must been fully specified!")
+
+        # Partitions over state space and input space
+        self.pos_partitions = np.linspace(self.pos_lbs, self.pos_ubs, self.num_pos)
+        self.vel_partitions = np.linspace(self.vel_lbs, self.vel_ubs, self.num_vel)
+        self.acc_partitions = np.linspace(self.input_lbs, self.input_ubs, self.num_acc)
+
+        # Generate state space (position, velocity combinations)
+        POS, VEL = np.meshgrid(self.pos_partitions, self.vel_partitions)
+        self.state_space = np.vstack((POS.ravel(), VEL.ravel()))  # Shape: (2, num_states)
+        self.num_states = self.state_space.shape[1]
+
+        # Define action space (acceleration)
+        self.input_space = self.acc_partitions  # Shape: (1, num_actions)
+        self.num_actions = len(self.input_space)
+        
+        # State propagation
+        self.dynamcis = dynmaics
+        self.dt = dt
+
+        # Define transition probability matrix and reward matrix
+        self.T = [None] * self.num_actions  # Shape: list (1, num_actions) -> array (num_states, num_states)
+        self.R = [None] * self.num_actions  # Shape: list (1, num_actions) -> array (num_states, num_states)
+        
+        # Descount rate
+        self.gamma = gamma
+        
+        # Build MDP 
+        self.build_stochastic_mdp()
+
+    def one_step_forward(self, cur_state, cur_input):
+        
+        # Check whether current state and input is within the state space and input space
+        cur_pos = max(min(cur_state[0], self.pos_ubs), self.pos_lbs)
+        cur_vel = max(min(cur_state[1], self.vel_ubs), self.vel_lbs)
+        cur_state = np.array([cur_pos, cur_vel])
+        cur_input = max(min(cur_input, self.input_ubs), self.input_lbs)
+        
+        # Propagate the state
+        next_state = self.dynamcis.one_step_forward(cur_state, cur_input, self.dt)  
+
+        # Check whether next state is within the state space
+        next_pos = max(min(next_state[0], self.pos_ubs), self.pos_lbs)
+        next_vel = max(min(next_state[1], self.vel_ubs), self.vel_lbs)
+        next_state = np.array([next_pos, next_vel])
+        
+        # Get reward
+        if next_state[0] == self.target_position:
+            reward = 10
+        else:
+            reward = -1
+        
+        return next_state, reward
+    
+    def nearest_state_index_lookup(self, state):
+        """
+        Find the nearest state index in the discrete state space for a given state.
+        """
+        distances = np.linalg.norm(self.state_space.T - np.array(state), axis=1)
+        return np.argmin(distances)
+    
+    def build_stochastic_mdp(self):
+        """
+        Construct transition probability (T) and reward (R) matrices for the MDP.
+        """
+        # Unique values for position and velocity
+        unique_pos = self.pos_partitions
+        unique_vel = self.vel_partitions
+
+        # Iterate over all states
+        for state_index in range(self.num_states):
+            cur_state = self.state_space[:, state_index]
+            print(f"Building model... state {state_index + 1}/{self.num_states}")
+
+            # Apply each possible action
+            for action_index in range(self.num_actions):
+                action = self.input_space[action_index]
+
+                # Propagate forward to get next state and reward
+                next_state, reward = self.one_step_forward(cur_state, action)
+
+                # Find the two closest discretized values for position and velocity
+                pos_indices = np.argsort(np.abs(unique_pos - next_state[0]))[:2]
+                vel_indices = np.argsort(np.abs(unique_vel - next_state[1]))[:2]
+
+                pos_bounds = [unique_pos[pos_indices[0]], unique_pos[pos_indices[1]]]
+                vel_bounds = [unique_vel[vel_indices[0]], unique_vel[vel_indices[1]]]
+
+                # Normalize next state within bounds
+                x_norm = (next_state[0] - min(pos_bounds)) / (max(pos_bounds) - min(pos_bounds))
+                y_norm = (next_state[1] - min(vel_bounds)) / (max(vel_bounds) - min(vel_bounds))
+
+                # Calculate bilinear interpolation probabilities
+                probs = [
+                    (1 - x_norm) * (1 - y_norm),  # bottom-left
+                    x_norm * (1 - y_norm),        # bottom-right
+                    x_norm * y_norm,              # top-right
+                    (1 - x_norm) * y_norm         # top-left
+                ]
+
+                # Four vertices of the enclosing box
+                nodes = [
+                    [min(pos_bounds), min(vel_bounds)],  # bottom-left
+                    [max(pos_bounds), min(vel_bounds)],  # bottom-right
+                    [max(pos_bounds), max(vel_bounds)],  # top-right
+                    [min(pos_bounds), max(vel_bounds)]   # top-left
+                ]
+
+                # Initialize T and R matrices if not already done
+                if self.T[action_index] is None:
+                    self.T[action_index] = np.zeros((self.num_states, self.num_states))
+                if self.R[action_index] is None:
+                    self.R[action_index] = np.zeros((self.num_states, self.num_states))
+
+                # Update transition and reward matrices
+                for i, node in enumerate(nodes):
+                    node_index = self.nearest_state_index_lookup(node)
+                    self.T[action_index][state_index, node_index] += probs[i]
+                    self.R[action_index][state_index, node_index] += reward
 
 
 
@@ -946,6 +1094,41 @@ class MPCController(LQRController):
 
         return u_optimal
 
+
+class GPIController(BaseController):
+    def __init__(self, 
+                 mdp: Env_rl, 
+                 freq: float, 
+                 precision_pi: float = 1e-6,
+                 precision_pe: float = 1e-6,
+                 max_ite_pi: int = 1000,
+                 max_ite_pe: int = 1000,
+                 name: str = 'GPI', 
+                 type: str = 'GPI', 
+                 verbose: bool = False
+                 ) -> None:
+        
+        super().__init__(mdp, mdp.dynamics, freq, name, type, verbose)
+
+        self.precision_pi = precision_pi,
+        self.precision_pe = precision_pe,
+        self.max_ite_pi = max_ite_pi,
+        self.max_ite_pe = max_ite_pe,
+
+        self.dim_states = self.mdp.num_states
+        self.dim_inputs = self.mdp.num_actions
+
+        self.init_state = self.env.init_state
+        self.target_state = self.env.target_state
+
+        self.policy = None
+    
+    def setup(self) -> None:
+        pass
+
+    @check_input_constraints
+    def compute_action(self, current_state: np.ndarray, current_time) -> np.ndarray:
+        pass
 
 
 
