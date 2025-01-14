@@ -10,6 +10,7 @@ from functools import wraps
 from matplotlib.patches import Rectangle
 from matplotlib.animation import FuncAnimation
 from IPython.display import display, HTML
+from scipy.interpolate import interp2d
 
 # Add a tutorial to show how to install acados and set interface to python
 from acados_template import AcadosOcp, AcadosOcpSolver, AcadosModel
@@ -42,11 +43,13 @@ class Env:
         self.target_state = np.array([self.target_position, self.target_velocity])
 
         self.state_lbs = state_lbs
-        self.pos_lbs = state_lbs[0]
-        self.vel_lbs = state_lbs[1]
+        if state_lbs is not None:
+            self.pos_lbs = state_lbs[0]
+            self.vel_lbs = state_lbs[1]
         self.state_ubs = state_ubs
-        self.pos_ubs = state_ubs[0]
-        self.vel_ubs = state_ubs[1]
+        if state_ubs is not None:
+            self.pos_ubs = state_ubs[0]
+            self.vel_ubs = state_ubs[1]
         self.input_lbs = input_lbs
         self.input_ubs = input_ubs
 
@@ -267,7 +270,7 @@ class Env_rl(Env):
             target_state: np.ndarray,
             symbolic_h: Callable[[ca.SX, int], ca.SX] = None, 
             symbolic_theta: Callable[[ca.Function], ca.Function] = None,
-            dynmaics: Dynamics = None,
+            dynamics: Dynamics = None,
             state_lbs: np.ndarray = None, 
             state_ubs: np.ndarray = None, 
             input_lbs: float = None, 
@@ -275,8 +278,11 @@ class Env_rl(Env):
             gamma: float = 0.95,
             dt: float = 0.1
         ) -> None:
-
-        super().__init__(case, init_state, target_state, symbolic_h, symbolic_theta, state_lbs, state_ubs, input_lbs, input_ubs)
+        
+        if symbolic_h != None and symbolic_theta != None:
+            super().__init__(case, init_state, target_state, symbolic_h, symbolic_theta, state_lbs, state_ubs, input_lbs, input_ubs)
+        else:
+            super().__init__(case, init_state, target_state, state_lbs=state_lbs, state_ubs=state_ubs, input_lbs=input_lbs, input_ubs=input_ubs)
 
         self.num_pos = 20
         self.num_vel = 20
@@ -300,7 +306,7 @@ class Env_rl(Env):
         self.num_actions = len(self.input_space)
         
         # State propagation
-        self.dynamcis = dynmaics
+        self.dynamics = dynamics
         self.dt = dt
 
         # Define transition probability matrix and reward matrix
@@ -322,7 +328,7 @@ class Env_rl(Env):
         cur_input = max(min(cur_input, self.input_ubs), self.input_lbs)
         
         # Propagate the state
-        next_state = self.dynamcis.one_step_forward(cur_state, cur_input, self.dt)  
+        next_state = self.dynamics.one_step_forward(cur_state, cur_input, self.dt)  
 
         # Check whether next state is within the state space
         next_pos = max(min(next_state[0], self.pos_ubs), self.pos_lbs)
@@ -403,6 +409,16 @@ class Env_rl(Env):
                     self.T[action_index][state_index, node_index] += probs[i]
                     self.R[action_index][state_index, node_index] += reward
 
+    # plot t for all states
+    def plot_t(self):
+        fig, ax = plt.subplots(1, self.num_actions, figsize=(15, 5))
+        for i in range(self.num_actions):
+            ax[i].imshow(self.T[i], cmap='hot', interpolation='nearest')
+            ax[i].set_title(f"Action {i}")
+            ax[i].set_xlabel("Next State")
+            ax[i].set_ylabel("Current State")
+        plt.tight_layout()
+        plt.show()
 
 
 def is_square(matrix: np.ndarray) -> bool:
@@ -507,6 +523,7 @@ class BaseController(ABC):
         pass
 
 
+'''
 # Derived class for DP Controller
 class DPController(BaseController):
     def __init__(
@@ -663,6 +680,166 @@ class DPController(BaseController):
             time_index = self.N - 1  # Use the last policy (zero policy) for any time after the horizon
 
         return self.policy[current_time]
+'''
+
+
+class DPController(BaseController):
+    def __init__(
+            self,
+            env: Env,
+            dynamics: Dynamics,
+            Q: np.ndarray,
+            R: np.ndarray,
+            Qf: np.ndarray, 
+            freq: float,
+            Horizon: int,
+            name: str = 'DP',
+            type: str = 'DP', 
+            verbose: bool = False
+        ) -> None:
+
+        super().__init__(env, dynamics, freq, name, verbose)
+
+        self.Q = Q
+        self.R = R
+        self.Qf = Qf
+
+        self.N = Horizon
+
+        self.Ad, self.Bd = self.dynamics.get_linearized_AB_discrete(self.init_state, 0, self.dt)
+
+        if self.env.state_lbs is None or self.env.state_ubs is None:
+            raise ValueError("Constraints on states must been fully specified for Approximate Dynamic Programming!")
+        
+        # Number of grid points for discretization
+        self.num_x1 = 60
+        self.num_x2 = 40
+        
+        # Initialize state and input space
+        self.X1 = None
+        self.X2 = None
+        
+        # Initialize policy and cost-to-go
+        self.U = None
+        self.J = None
+    
+        self.setup()
+
+    def terminal_cost(self, x):
+
+        return x.T @ self.Qf @ x
+
+    def stage_cost(self, x, u):
+
+        return x.T @ self.Q @ x + self.R * u**2
+
+    def recursion_cost(self, u, x):
+
+        x_next = self.Ad @ x + self.Bd.flatten() * u
+
+        # Use linear interpolation to find the value of J at the next state
+        J_next = self.J_func(x_next[0], x_next[1])
+
+        return self.stage_cost(x, u) + J_next
+
+    def setup(self) -> None:
+        
+        # Generate grid mesh for state space
+        self.X1 = np.linspace(self.env.state_lbs[0]-self.target_state[0], self.env.state_ubs[0]-self.target_state[0], self.num_x1)
+        self.X2 = np.linspace(self.env.state_lbs[1]-self.target_state[1], self.env.state_ubs[1]-self.target_state[1], self.num_x2)
+        
+        # Initialize policy and cost-to-go function, and generate interpolation over grid mesh
+        self.U = np.zeros((self.num_x1, self.num_x2))
+        self.U_func = interp2d(self.X1, self.X2, self.U.T, kind='linear')
+        self.J = np.zeros((self.num_x1, self.num_x2))
+        for i in range(self.num_x1): # Initialize cost matirx with terminal cost
+            for j in range(self.num_x2):
+                self.J[i, j] = self.terminal_cost(np.array([self.X1[i], self.X2[j]]))
+        self.J_func = interp2d(self.X1, self.X2, self.J.T, kind='linear')
+        
+        # Iterate over time steps from backward to forward
+        for n in range(self.N, 0, -1):
+            J_temp = np.zeros((self.num_x1, self.num_x2))
+
+            for i in range(self.num_x1):
+                for j in range(self.num_x2):
+
+                    # Extract current state
+                    x_current = np.array([self.X1[i], self.X2[j]])
+
+                    # Solve for optimal control input
+                    res = minimize(
+                        self.recursion_cost,
+                        x0=0,
+                        args=(x_current, ),
+                        bounds=[(self.env.input_lbs, self.env.input_ubs)],
+                        method='SLSQP'
+                    )
+                    
+                    # Extract optimal policy and cost-to-go 
+                    self.U[i, j] = res.x
+                    J_temp[i, j] = res.fun
+                    
+                    if self.verbose:
+                        print(f"Current state: {x_current}, Current time step: {n}")
+                        print(f"Optimal control input: {self.U[i, j]}")
+                        print(f"Optimal cost-to-go function: {J_temp[i, j]}")
+
+            self.J = J_temp
+
+            # Re-interpolation over grid mesh
+            self.J_func = interp2d(self.X1, self.X2, self.J.T, kind='linear')
+            self.U_func = interp2d(self.X1, self.X2, self.U.T, kind='linear')
+        
+        if self.verbose:
+            print(f"Dynamic Programming policy with input constraints computed.")
+            print(f"Optimal control input: {self.U}")
+            print(f"Optimal cost-to-go function: {self.J}")
+
+    @check_input_constraints
+    def compute_action(self, current_state: np.ndarray, current_time: int) -> np.ndarray:
+
+        if np.all(self.U == 0):
+            raise ValueError("DP Policy is not computed. Call setup() first.")
+        
+        det_x = current_state - self.target_state
+        
+        # Use linear interpolation to find the value of U at the current state
+        miu = self.U_func(det_x[0], det_x[1])
+
+        return miu
+
+    def plot_policy_and_cost(self):
+        """
+        Generates a plot with two subplots showing the policy (U) and cost-to-go (J)
+        defined on a given grid space.
+        """
+        fig, axs = plt.subplots(1, 2, figsize=(12, 4))
+
+        # Plot policy (U)
+        im1 = axs[0].imshow(self.U, extent=[self.X1[0], self.X1[-1], self.X2[0], self.X2[-1]], origin='lower', aspect='auto', cmap='viridis')
+        axs[0].set_title('Policy (U)')
+        axs[0].set_xlabel('Car Position')
+        axs[0].set_ylabel('Car Velocity')
+        fig.colorbar(im1, ax=axs[0], orientation='vertical')
+
+        #axs[0].set_xticks(self.X1[::grid_interval], minor=False)
+        #axs[0].set_yticks(self.X2[::grid_interval], minor=False)
+        #axs[0].grid(color='black', linestyle='--', linewidth=0.5, alpha=0.7)
+
+        # Plot cost-to-go (J)
+        im2 = axs[1].imshow(self.J, extent=[self.X1[0], self.X1[-1], self.X2[0], self.X2[-1]], origin='lower', aspect='auto', cmap='viridis')
+        axs[1].set_title('Cost-to-Go (J)')
+        axs[1].set_xlabel('Car Position')
+        axs[1].set_ylabel('Car Velocity')
+        fig.colorbar(im2, ax=axs[1], orientation='vertical')
+
+        #axs[1].set_xticks(self.X1[::grid_interval], minor=False)
+        #axs[1].set_yticks(self.X2[::grid_interval], minor=False)
+        #axs[1].grid(color='black', linestyle='--', linewidth=0.5, alpha=0.7)
+
+        plt.tight_layout()
+        plt.show()
 
 
 # Derived class for LQR Controller
@@ -1110,10 +1287,12 @@ class GPIController(BaseController):
         
         super().__init__(mdp, mdp.dynamics, freq, name, type, verbose)
 
-        self.precision_pi = precision_pi,
-        self.precision_pe = precision_pe,
-        self.max_ite_pi = max_ite_pi,
-        self.max_ite_pe = max_ite_pe,
+        self.precision_pi = precision_pi
+        self.precision_pe = precision_pe
+        self.max_ite_pi = max_ite_pi
+        self.max_ite_pe = max_ite_pe
+
+        self.mdp = mdp
 
         self.dim_states = self.mdp.num_states
         self.dim_inputs = self.mdp.num_actions
@@ -1121,14 +1300,126 @@ class GPIController(BaseController):
         self.init_state = self.env.init_state
         self.target_state = self.env.target_state
 
-        self.policy = None
+        # Initialize policy and value function
+        self.policy = np.zeros(self.dim_states, dtype=int)  # Initial policy: choose action 0 for all states
+        self.value_function = np.zeros(self.dim_states)  # Initial value function
     
     def setup(self) -> None:
-        pass
+        """Perform GPI to compute the optimal policy."""
+        for pi_iteration in range(self.max_ite_pi):
+            # Policy Evaluation
+            for pe_iteration in range(self.max_ite_pe):
+
+                new_value_function = np.zeros_like(self.value_function)
+                
+                for state_index in range(self.dim_states):
+                    for action_index in range(self.dim_inputs):
+
+                        if self.policy[state_index] == action_index:
+                            for next_state_index in range(self.dim_states):
+
+                                new_value_function[state_index] += self.mdp.T[action_index][state_index, next_state_index] * (
+                                    self.mdp.R[action_index][state_index, next_state_index] + self.mdp.gamma * self.value_function[next_state_index]
+                                )
+
+                # Check for convergence in policy evaluation
+                if np.max(np.abs(new_value_function - self.value_function)) < self.precision_pe:
+                    break
+
+                self.value_function = new_value_function
+
+            # Policy Improvement
+            policy_stable = True
+            for state_index in range(self.dim_states):
+                
+                old_action = self.policy[state_index]
+                q_values = np.zeros(self.dim_inputs)
+
+                # Compute Q-values for all actions
+                for action_index in range(self.dim_inputs):
+                    for next_state_index in range(self.dim_states):
+
+                        q_values[action_index] += self.mdp.T[action_index][state_index, next_state_index] * (
+                            self.mdp.R[action_index][state_index, next_state_index] + self.mdp.gamma * self.value_function[next_state_index]
+                        )
+
+                # Update policy greedily
+                self.policy[state_index] = np.argmax(q_values)
+
+                # Check for convergence in policy improvement
+                if old_action != self.policy[state_index]:
+                    policy_stable = False
+
+            # Check for convergence in policy improvement
+            if policy_stable:
+                if self.verbose:
+                    print(f"Policy converged after {pi_iteration + 1} iterations.")
+                break
 
     @check_input_constraints
     def compute_action(self, current_state: np.ndarray, current_time) -> np.ndarray:
-        pass
+        """
+        Use the optimal policy to compute the action for the given state.
+        """
+        # Find the nearest discrete state index
+        state_index = self.mdp.nearest_state_index_lookup(current_state)
+        
+        # Get the optimal action from the policy
+        action_index = self.policy[state_index]
+        action = self.mdp.input_space[action_index]
+
+        return np.array([action])
+
+    def plot_policy_map(self):
+        """
+        Visualize the policy as a 2D state-value map.
+        """
+        state_space = self.mdp.state_space  # Assumed to be a 2D grid of states
+        value_map = self.value_function.reshape(state_space.shape[0], state_space.shape[1])
+
+        plt.figure(figsize=(8, 6))
+        plt.imshow(value_map, cmap="viridis", origin="lower", extent=[
+            self.mdp.state_space_bounds[0][0], self.mdp.state_space_bounds[0][1],
+            self.mdp.state_space_bounds[1][0], self.mdp.state_space_bounds[1][1]
+        ])
+        plt.colorbar(label="State Value")
+        plt.xlabel("Car Position")
+        plt.ylabel("Car Velocity")
+        plt.title("State Value: Generalized Policy Iteration")
+        plt.show()
+
+    def plot_policy_and_cost(self):
+        """
+        Generates a plot with two subplots showing the policy (U) and cost-to-go (J)
+        defined on a given grid space.
+        """
+        fig, axs = plt.subplots(1, 2, figsize=(12, 4))
+
+        # Plot policy (U)
+        im1 = axs[0].imshow(self.U, extent=[self.X1[0], self.X1[-1], self.X2[0], self.X2[-1]], origin='lower', aspect='auto', cmap='viridis')
+        axs[0].set_title('Policy (U)')
+        axs[0].set_xlabel('Car Position')
+        axs[0].set_ylabel('Car Velocity')
+        fig.colorbar(im1, ax=axs[0], orientation='vertical')
+
+        #axs[0].set_xticks(self.X1[::grid_interval], minor=False)
+        #axs[0].set_yticks(self.X2[::grid_interval], minor=False)
+        #axs[0].grid(color='black', linestyle='--', linewidth=0.5, alpha=0.7)
+
+        # Plot cost-to-go (J)
+        im2 = axs[1].imshow(self.J, extent=[self.X1[0], self.X1[-1], self.X2[0], self.X2[-1]], origin='lower', aspect='auto', cmap='viridis')
+        axs[1].set_title('Cost-to-Go (J)')
+        axs[1].set_xlabel('Car Position')
+        axs[1].set_ylabel('Car Velocity')
+        fig.colorbar(im2, ax=axs[1], orientation='vertical')
+
+        #axs[1].set_xticks(self.X1[::grid_interval], minor=False)
+        #axs[1].set_yticks(self.X2[::grid_interval], minor=False)
+        #axs[1].grid(color='black', linestyle='--', linewidth=0.5, alpha=0.7)
+
+        plt.tight_layout()
+        plt.show()
+
 
 
 
