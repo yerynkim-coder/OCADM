@@ -1,6 +1,7 @@
 import numpy as np
 import casadi as ca
 import scipy.linalg
+import copy
 from scipy.integrate import solve_ivp
 from scipy.optimize import minimize
 import matplotlib.pyplot as plt
@@ -265,30 +266,24 @@ class Dynamics:
 class Env_rl(Env):
     def __init__(
             self, 
-            case: int, 
-            init_state: np.ndarray, 
-            target_state: np.ndarray,
-            symbolic_h: Callable[[ca.SX, int], ca.SX] = None, 
-            symbolic_theta: Callable[[ca.Function], ca.Function] = None,
+            env: Env, 
             dynamics: Dynamics = None,
-            state_lbs: np.ndarray = None, 
-            state_ubs: np.ndarray = None, 
-            input_lbs: float = None, 
-            input_ubs: float = None,
-            gamma: float = 0.95,
+            num_states: np.array = np.array([20, 20]),
+            num_actions: int = 10,
             dt: float = 0.1
         ) -> None:
+
+        self.env = env
         
-        if symbolic_h != None and symbolic_theta != None:
-            super().__init__(case, init_state, target_state, symbolic_h, symbolic_theta, state_lbs, state_ubs, input_lbs, input_ubs)
-        else:
-            super().__init__(case, init_state, target_state, state_lbs=state_lbs, state_ubs=state_ubs, input_lbs=input_lbs, input_ubs=input_ubs)
+        super().__init__(self.env.case, self.env.init_state, self.env.target_state, 
+                         state_lbs=self.env.state_lbs, state_ubs=self.env.state_ubs, 
+                         input_lbs=self.env.input_lbs, input_ubs=self.env.input_ubs)
 
-        self.num_pos = 20
-        self.num_vel = 20
-        self.num_acc = 5
+        self.num_pos = num_states[0]
+        self.num_vel = num_states[1]
+        self.num_acc = num_actions
 
-        if state_lbs is None or state_ubs is None or input_lbs is None or input_ubs is None:
+        if self.state_lbs is None or self.state_ubs is None or self.input_lbs is None or self.input_ubs is None:
             raise ValueError("Constraints on states and input must been fully specified!")
 
         # Partitions over state space and input space
@@ -313,9 +308,6 @@ class Env_rl(Env):
         self.T = [None] * self.num_actions  # Shape: list (1, num_actions) -> array (num_states, num_states)
         self.R = [None] * self.num_actions  # Shape: list (1, num_actions) -> array (num_states, num_states)
         
-        # Descount rate
-        self.gamma = gamma
-        
         # Build MDP 
         self.build_stochastic_mdp()
 
@@ -329,6 +321,7 @@ class Env_rl(Env):
         
         # Propagate the state
         next_state = self.dynamics.one_step_forward(cur_state, cur_input, self.dt)  
+        next_state_raw = next_state
 
         # Check whether next state is within the state space
         next_pos = max(min(next_state[0], self.pos_ubs), self.pos_lbs)
@@ -336,8 +329,11 @@ class Env_rl(Env):
         next_state = np.array([next_pos, next_vel])
         
         # Get reward
-        if next_state[0] == self.target_position:
+        next_state_index = self.nearest_state_index_lookup(next_state)
+        if np.all(self.state_space[:, next_state_index] == self.env.target_state):
             reward = 10
+        elif np.any(next_state_raw != next_state):
+            reward = -10
         else:
             reward = -1
         
@@ -367,8 +363,13 @@ class Env_rl(Env):
             for action_index in range(self.num_actions):
                 action = self.input_space[action_index]
 
+                print(f"cur_state: {cur_state}")
+                print(f"action: {action}")
+
                 # Propagate forward to get next state and reward
                 next_state, reward = self.one_step_forward(cur_state, action)
+
+                print(f"next_state: {next_state}")
 
                 # Find the two closest discretized values for position and velocity
                 pos_indices = np.argsort(np.abs(unique_pos - next_state[0]))[:2]
@@ -377,9 +378,15 @@ class Env_rl(Env):
                 pos_bounds = [unique_pos[pos_indices[0]], unique_pos[pos_indices[1]]]
                 vel_bounds = [unique_vel[vel_indices[0]], unique_vel[vel_indices[1]]]
 
+                print(f"pos_bounds: {pos_bounds}")
+                print(f"vel_bounds: {vel_bounds}")
+
                 # Normalize next state within bounds
                 x_norm = (next_state[0] - min(pos_bounds)) / (max(pos_bounds) - min(pos_bounds))
                 y_norm = (next_state[1] - min(vel_bounds)) / (max(vel_bounds) - min(vel_bounds))
+
+                print(f"x_norm: {x_norm}")
+                print(f"y_norm: {y_norm}")
 
                 # Calculate bilinear interpolation probabilities
                 probs = [
@@ -411,15 +418,23 @@ class Env_rl(Env):
 
     # plot t for all states
     def plot_t(self):
-        fig, ax = plt.subplots(1, self.num_actions, figsize=(15, 5))
+
+        fig, ax = plt.subplots(2, self.num_actions, figsize=(15, 5))
+
         for i in range(self.num_actions):
-            ax[i].imshow(self.T[i], cmap='hot', interpolation='nearest')
-            ax[i].set_title(f"Action {i}")
-            ax[i].set_xlabel("Next State")
-            ax[i].set_ylabel("Current State")
+            ax[0, i].imshow(self.T[i], cmap='hot', interpolation='nearest')
+            ax[0, i].set_title(f"Action {i}")
+            ax[0, i].set_xlabel("Next State")
+            ax[0, i].set_ylabel("Current State")
+        
+        for i in range(self.num_actions):
+            ax[1, i].imshow(self.R[i], cmap='hot', interpolation='nearest')
+            ax[1, i].set_title(f"Action {i}")
+            ax[1, i].set_xlabel("Next State")
+            ax[1, i].set_ylabel("Current State")
+
         plt.tight_layout()
         plt.show()
-
 
 def is_square(matrix: np.ndarray) -> bool:
     if matrix.shape[0] != matrix.shape[1]:
@@ -742,6 +757,27 @@ class DPController(BaseController):
 
         return self.stage_cost(x, u) + J_next
 
+    def state_constraints(self, u, x):
+
+        # Calculate the next state
+        x_next = self.Ad @ x + self.Bd.flatten() * u
+
+        # Extract the position and velocity from current and next state
+        p_curr, v_curr = x[0], x[1]
+        p_next, v_next = x_next[0], x_next[1]
+
+        # Define constraints on current and next state
+        return [
+            p_curr - self.env.state_lbs[0],  # p_curr >= state_lbs[0]
+            self.env.state_ubs[0] - p_curr,  # p_curr <= state_ubs[0]
+            v_curr - self.env.state_lbs[1],  # v_curr >= state_lbs[1]
+            self.env.state_ubs[1] - v_curr,   # v_curr <= state_ubs[1]
+            p_next - self.env.state_lbs[0],  # p_next >= state_lbs[0]
+            self.env.state_ubs[0] - p_next,  # p_next <= state_ubs[0]
+            v_next - self.env.state_lbs[1],  # v_next >= state_lbs[1]
+            self.env.state_ubs[1] - v_next   # v_next <= state_ubs[1]
+        ]
+
     def setup(self) -> None:
         
         # Generate grid mesh for state space
@@ -773,7 +809,12 @@ class DPController(BaseController):
                         x0=0,
                         args=(x_current, ),
                         bounds=[(self.env.input_lbs, self.env.input_ubs)],
-                        method='SLSQP'
+                        method='SLSQP',
+                        constraints={
+                            'type': 'ineq',
+                            'fun': self.state_constraints,
+                            'args': (x_current,)
+                        }
                     )
                     
                     # Extract optimal policy and cost-to-go 
@@ -1272,27 +1313,32 @@ class MPCController(LQRController):
         return u_optimal
 
 
+# Derived class for RL Controller, solved by General Policy Iteration
 class GPIController(BaseController):
     def __init__(self, 
                  mdp: Env_rl, 
                  freq: float, 
-                 precision_pi: float = 1e-6,
+                 gamma: float = 0.95,
                  precision_pe: float = 1e-6,
-                 max_ite_pi: int = 1000,
-                 max_ite_pe: int = 1000,
+                 precision_pi: float = 1e-6,
+                 max_ite_pe: int = 50,
+                 max_ite_pi: int = 100,
                  name: str = 'GPI', 
                  type: str = 'GPI', 
-                 verbose: bool = False
+                 verbose: bool = True
                  ) -> None:
         
         super().__init__(mdp, mdp.dynamics, freq, name, type, verbose)
-
-        self.precision_pi = precision_pi
+        
+        # VI: max_ite_pi = 1, max_ite_pe > 500, precision_pi not needed, reasonable precision_pe (1e-6)
+        # PI: max_ite_pi > 50, max_ite_pe > 100, reasonable precision_pi (1e-6), precision_pe not needed
         self.precision_pe = precision_pe
-        self.max_ite_pi = max_ite_pi
+        self.precision_pi = precision_pi
         self.max_ite_pe = max_ite_pe
+        self.max_ite_pi = max_ite_pi
 
         self.mdp = mdp
+        self.gamma = gamma
 
         self.dim_states = self.mdp.num_states
         self.dim_inputs = self.mdp.num_actions
@@ -1306,33 +1352,46 @@ class GPIController(BaseController):
     
     def setup(self) -> None:
         """Perform GPI to compute the optimal policy."""
+
+        new_value_function = np.zeros_like(self.value_function)
+
         for pi_iteration in range(self.max_ite_pi):
+
             # Policy Evaluation
             for pe_iteration in range(self.max_ite_pe):
+
+                self.value_function = copy.copy(new_value_function)
 
                 new_value_function = np.zeros_like(self.value_function)
                 
                 for state_index in range(self.dim_states):
-                    for action_index in range(self.dim_inputs):
 
-                        if self.policy[state_index] == action_index:
-                            for next_state_index in range(self.dim_states):
+                    action_index = self.policy[state_index]
 
-                                new_value_function[state_index] += self.mdp.T[action_index][state_index, next_state_index] * (
-                                    self.mdp.R[action_index][state_index, next_state_index] + self.mdp.gamma * self.value_function[next_state_index]
-                                )
+                    for next_state_index in range(self.dim_states):
+
+                        new_value_function[state_index] += self.mdp.T[action_index][state_index, next_state_index] * (
+                            self.mdp.R[action_index][state_index, next_state_index] + self.gamma * self.value_function[next_state_index]
+                        )
+
+                print(f"self.value_function: {self.value_function}")
+                print(f"new_value_function: {new_value_function}")
 
                 # Check for convergence in policy evaluation
                 if np.max(np.abs(new_value_function - self.value_function)) < self.precision_pe:
+                    if self.verbose:
+                        print(f"Policy evaluation converged after {pe_iteration + 1} iterations, max error: {np.max(np.abs(new_value_function - self.value_function))}.")
                     break
-
-                self.value_function = new_value_function
-
+                elif self.verbose:
+                    print(f"Policy evaluation iteration {pe_iteration + 1}, max error: {np.max(np.abs(new_value_function - self.value_function))}")
+            
+            self.value_function = copy.copy(new_value_function)
+            
             # Policy Improvement
             policy_stable = True
+            old_policy = copy.copy(self.policy)
             for state_index in range(self.dim_states):
                 
-                old_action = self.policy[state_index]
                 q_values = np.zeros(self.dim_inputs)
 
                 # Compute Q-values for all actions
@@ -1340,21 +1399,26 @@ class GPIController(BaseController):
                     for next_state_index in range(self.dim_states):
 
                         q_values[action_index] += self.mdp.T[action_index][state_index, next_state_index] * (
-                            self.mdp.R[action_index][state_index, next_state_index] + self.mdp.gamma * self.value_function[next_state_index]
+                            self.mdp.R[action_index][state_index, next_state_index] + self.gamma * self.value_function[next_state_index]
                         )
 
                 # Update policy greedily
                 self.policy[state_index] = np.argmax(q_values)
 
                 # Check for convergence in policy improvement
-                if old_action != self.policy[state_index]:
+                if old_policy[state_index] != self.policy[state_index]:
                     policy_stable = False
 
             # Check for convergence in policy improvement
-            if policy_stable:
+            if policy_stable and np.max(np.abs(new_value_function - self.value_function)) < self.precision_pi:
                 if self.verbose:
                     print(f"Policy converged after {pi_iteration + 1} iterations.")
+                    print(f"Optimal Policy: {self.policy}")
                 break
+            elif self.verbose:
+                print(f"Policy improvement iteration {pi_iteration + 1}, still not converged, keep running.")
+                print(f"Last Policy: {old_policy}")
+                print(f"Current Policy: {self.policy}")
 
     @check_input_constraints
     def compute_action(self, current_state: np.ndarray, current_time) -> np.ndarray:
@@ -1370,55 +1434,520 @@ class GPIController(BaseController):
 
         return np.array([action])
 
-    def plot_policy_map(self):
+    def plot_heatmaps(self):
         """
-        Visualize the policy as a 2D state-value map.
+        Visualize the policy and cost as a 2D state-value map.
         """
-        state_space = self.mdp.state_space  # Assumed to be a 2D grid of states
-        value_map = self.value_function.reshape(state_space.shape[0], state_space.shape[1])
+        value_map = self.value_function.reshape(self.mdp.num_pos, self.mdp.num_vel)
+        policy_map = self.policy.reshape(self.mdp.num_pos, self.mdp.num_vel)
 
-        plt.figure(figsize=(8, 6))
-        plt.imshow(value_map, cmap="viridis", origin="lower", extent=[
-            self.mdp.state_space_bounds[0][0], self.mdp.state_space_bounds[0][1],
-            self.mdp.state_space_bounds[1][0], self.mdp.state_space_bounds[1][1]
-        ])
-        plt.colorbar(label="State Value")
-        plt.xlabel("Car Position")
-        plt.ylabel("Car Velocity")
-        plt.title("State Value: Generalized Policy Iteration")
-        plt.show()
-
-    def plot_policy_and_cost(self):
-        """
-        Generates a plot with two subplots showing the policy (U) and cost-to-go (J)
-        defined on a given grid space.
-        """
         fig, axs = plt.subplots(1, 2, figsize=(12, 4))
 
         # Plot policy (U)
-        im1 = axs[0].imshow(self.U, extent=[self.X1[0], self.X1[-1], self.X2[0], self.X2[-1]], origin='lower', aspect='auto', cmap='viridis')
-        axs[0].set_title('Policy (U)')
+        im1 = axs[0].imshow(policy_map, extent=[
+            self.mdp.pos_partitions[0], self.mdp.pos_partitions[-1],
+            self.mdp.vel_partitions[0], self.mdp.vel_partitions[-1]
+        ], origin='lower', aspect='auto', cmap='viridis')
+        axs[0].set_title('Optimal Policy')
         axs[0].set_xlabel('Car Position')
         axs[0].set_ylabel('Car Velocity')
         fig.colorbar(im1, ax=axs[0], orientation='vertical')
 
-        #axs[0].set_xticks(self.X1[::grid_interval], minor=False)
-        #axs[0].set_yticks(self.X2[::grid_interval], minor=False)
-        #axs[0].grid(color='black', linestyle='--', linewidth=0.5, alpha=0.7)
-
         # Plot cost-to-go (J)
-        im2 = axs[1].imshow(self.J, extent=[self.X1[0], self.X1[-1], self.X2[0], self.X2[-1]], origin='lower', aspect='auto', cmap='viridis')
-        axs[1].set_title('Cost-to-Go (J)')
+        im2 = axs[1].imshow(value_map, extent=[
+            self.mdp.pos_partitions[0], self.mdp.pos_partitions[-1],
+            self.mdp.vel_partitions[0], self.mdp.vel_partitions[-1]
+        ], origin='lower', aspect='auto', cmap='viridis')
+        axs[1].set_title('Optimal Cost')
         axs[1].set_xlabel('Car Position')
         axs[1].set_ylabel('Car Velocity')
         fig.colorbar(im2, ax=axs[1], orientation='vertical')
 
-        #axs[1].set_xticks(self.X1[::grid_interval], minor=False)
-        #axs[1].set_yticks(self.X2[::grid_interval], minor=False)
-        #axs[1].grid(color='black', linestyle='--', linewidth=0.5, alpha=0.7)
+        plt.tight_layout()
+        plt.show()
+
+
+
+# Derived class for RL Controller, solved by Q-Learning
+class QLearningController(BaseController):
+    def __init__(self, 
+                 mdp: Env_rl, 
+                 freq: float, 
+                 epsilon: float = 0.3, 
+                 k_epsilon: float = 0.99, 
+                 epsilon_min: float = 0.01,
+                 learning_rate: float = 0.2, 
+                 gamma: float = 0.95,
+                 max_iterations: int = 1000, 
+                 max_steps_per_episode: int = 100, 
+                 name: str = 'Q-Learning', 
+                 type: str = 'Q-Learning', 
+                 verbose: bool = True
+                 ) -> None:
+        
+        super().__init__(mdp, mdp.dynamics, freq, name, type, verbose)
+
+        self.epsilon = epsilon  # exploration rate
+        self.k_epsilon = k_epsilon  # decay factor for exploration rate
+        self.epsilon_min = epsilon_min
+        self.learning_rate = learning_rate
+        self.gamma = gamma
+        self.max_iterations = max_iterations
+        self.max_steps_per_episode = max_steps_per_episode
+
+        self.mdp = mdp
+
+        self.dim_states = self.mdp.num_states
+        self.dim_inputs = self.mdp.num_actions
+
+        self.init_state = self.env.init_state
+        self.target_state = self.env.target_state
+
+        # Initialize Q table with all 0s
+        self.Q = np.zeros((self.dim_states, self.dim_inputs)) 
+        
+        # Initialize policy as None
+        self.policy = np.zeros((self.dim_states)) 
+        self.value_function = np.zeros((self.dim_states)) 
+
+        # For training curve plotting
+        self.residual_rewards = []
+        self.epsilon_list = []
+        self.SR_100epoch = [] # Successful rounds
+        self.F_100epoch = [] # Failure rounds
+        self.TO_100epoch = [] # Time out rounds
+
+    def _get_action_probabilities(self, state_index: int) -> np.ndarray:
+        """Calculate the action probabilities using epsilon-soft policy."""
+
+        probabilities = np.ones(self.dim_inputs) * (self.epsilon / self.dim_inputs)
+        best_action = np.argmax(self.Q[state_index])
+        probabilities[best_action] += (1.0 - self.epsilon)
+
+        return probabilities
+
+    def setup(self) -> None:
+
+        for iteration in range(self.max_iterations):
+
+            total_reward = 0  # To accumulate rewards for this episode
+
+            if iteration % 100 == 0:
+
+                if iteration != 0:
+                    # Record the SR_100epoch, F_100epoch, TO_100epoch
+                    self.SR_100epoch.append(SR_100epoch)
+                    self.F_100epoch.append(F_100epoch)
+                    self.TO_100epoch.append(TO_100epoch)
+                
+                SR_100epoch = 0
+                F_100epoch = 0
+                TO_100epoch = 0
+
+            # Ramdomly choose a state to start
+            current_state_index = np.random.choice(self.dim_states)
+            current_state = self.mdp.state_space[:, current_state_index]
+
+            for step in range(self.max_steps_per_episode):
+
+                # Choose action based on epsilon-soft policy
+                action_probabilities = self._get_action_probabilities(current_state_index)
+                action_index = np.random.choice(np.arange(self.dim_inputs), p=action_probabilities)
+                current_input = self.mdp.input_space[action_index]
+
+                # Take action and observe the next state and reward
+                next_state, reward = self.mdp.one_step_forward(current_state, current_input)
+                next_state_index = self.mdp.nearest_state_index_lookup(next_state)
+                total_reward += reward  # Accumulate total reward
+                
+                if self.verbose:
+                    print(f"reward: {reward}")
+                    print(f"total_reward: {total_reward}")
+                    print(f"current_state: {current_state}, current_input: {current_input}, next_state: {next_state}, next_state_render: {self.mdp.state_space[:, next_state_index]}, reward: {reward}")
+
+                # Check if the episode is finished
+                terminate_condition_1 = False#next_state[0]==self.mdp.pos_partitions[-1]
+                terminate_condition_2 = False#next_state[0]==self.mdp.pos_partitions[0]
+                terminate_condition_3 = np.all(self.mdp.state_space[:, next_state_index]==self.target_state)
+
+                if terminate_condition_1 or terminate_condition_2 or terminate_condition_3:
+
+                    if terminate_condition_3:
+                        SR_100epoch += 1
+                    else:
+                        F_100epoch += 1
+
+                    if self.verbose:
+                        print(f"Iteration {iteration + 1}/{self.max_iterations}: finished successfully! epsilon: {self.epsilon:.4f}, residual reward: {total_reward:.2f}")
+                    
+                    break
+
+                else:
+                    # Update Q table
+                    q_update = reward + self.gamma * np.max(self.Q[next_state_index, :])
+                    self.Q[current_state_index, action_index] += self.learning_rate * (
+                        q_update - self.Q[current_state_index, action_index]
+                    )
+                    
+                    # Move to the next state
+                    current_state_index = next_state_index
+                    current_state = self.mdp.state_space[:, current_state_index]
+                
+                if step == self.max_steps_per_episode-1:
+                    TO_100epoch +=1
+                    if self.verbose:
+                        print(f"Iteration {iteration + 1}/{self.max_iterations}: time out! epsilon: {self.epsilon:.4f}, residual reward: {total_reward:.2f}")
+                    
+
+            # Decrease epsilon
+            self.epsilon *= self.k_epsilon
+            self.epsilon = max(self.epsilon, self.epsilon_min)
+            self.epsilon_list.append(self.epsilon)
+
+            # Record the residual reward
+            self.residual_rewards.append(total_reward)
+        
+        # Return the deterministic policy and value function
+        self.policy = np.argmax(self.Q, axis=1)
+        self.value_function = np.max(self.Q, axis=1)
+        
+        if self.verbose:
+            print("Training finished！")
+
+    @check_input_constraints
+    def compute_action(self, current_state: np.ndarray, current_time) -> np.ndarray:
+        """
+        Use the optimal policy to compute the action for the given state.
+        """
+        # Find the nearest discrete state index
+        state_index = self.mdp.nearest_state_index_lookup(current_state)
+        
+        # Get the optimal action from the policy
+        action_index = self.policy[state_index]
+        action = self.mdp.input_space[action_index]
+
+        return np.array([action])
+
+    def plot_heatmaps(self):
+        """
+        Visualize the policy and cost as a 2D state-value map.
+        """
+        value_map = self.value_function.reshape(self.mdp.num_pos, self.mdp.num_vel)
+        policy_map = self.policy.reshape(self.mdp.num_pos, self.mdp.num_vel)
+
+        fig, axs = plt.subplots(1, 2, figsize=(12, 4))
+
+        # Plot policy (U)
+        im1 = axs[0].imshow(policy_map, extent=[
+            self.mdp.pos_partitions[0], self.mdp.pos_partitions[-1],
+            self.mdp.vel_partitions[0], self.mdp.vel_partitions[-1]
+        ], origin='lower', aspect='auto', cmap='viridis')
+        axs[0].set_title('Optimal Policy')
+        axs[0].set_xlabel('Car Position')
+        axs[0].set_ylabel('Car Velocity')
+        fig.colorbar(im1, ax=axs[0], orientation='vertical')
+
+        # Plot cost-to-go (J)
+        im2 = axs[1].imshow(value_map, extent=[
+            self.mdp.pos_partitions[0], self.mdp.pos_partitions[-1],
+            self.mdp.vel_partitions[0], self.mdp.vel_partitions[-1]
+        ], origin='lower', aspect='auto', cmap='viridis')
+        axs[1].set_title('Optimal Cost')
+        axs[1].set_xlabel('Car Position')
+        axs[1].set_ylabel('Car Velocity')
+        fig.colorbar(im2, ax=axs[1], orientation='vertical')
 
         plt.tight_layout()
         plt.show()
+
+    def plot_training_curve(self):
+        """
+        Visualize the training curve of residual rewards and holdsignal for sr_100epoch in 2 figure.
+        """
+
+        self.SR_100epoch = np.repeat(self.SR_100epoch, 100)
+        self.F_100epoch = np.repeat(self.F_100epoch, 100)
+        self.TO_100epoch = np.repeat(self.TO_100epoch, 100)
+        
+        fig, axs = plt.subplots(1, 3, figsize=(12, 3))
+
+        # Plot residual rewards
+        axs[0].plot(self.residual_rewards)
+        axs[0].set_title('Total Rewards')
+        axs[0].set_xlabel('Iteration')
+        axs[0].set_ylabel('Total Reward')
+
+        # Plot epsilon
+        axs[1].plot(self.epsilon_list)
+        axs[1].set_title('Epsilon')
+        axs[1].set_xlabel('Iteration')
+        axs[1].set_ylabel('Epsilon')
+        axs[1].set_ylim(0, 1)
+
+        # Plot SR_100epoch, F_100epoch, TO_100epoch
+        axs[2].plot(self.SR_100epoch, label='Success rounds / 100Epoch')
+        axs[2].plot(self.F_100epoch, label='Fail rounds / 100Epoch')
+        axs[2].plot(self.TO_100epoch, label='Time out / 100Epoch')
+        axs[2].set_title('Statictics / 100 Epoch')
+        axs[2].set_xlabel('Iteration')
+        axs[2].set_ylabel('Number of rounds')
+        axs[2].set_ylim(0, 100)
+        axs[2].legend()
+
+
+        plt.tight_layout()
+        plt.show()
+
+
+# Derived class for RL Controller, solved by MCRL
+class MCRLController(BaseController):
+    def __init__(self, 
+                 mdp: Env_rl, 
+                 freq: float, 
+                 epsilon: float = 0.3, 
+                 k_epsilon: float = 0.99, 
+                 epsilon_min: float = 0.01,
+                 learning_rate: float = 0.2, 
+                 gamma: float = 0.95,
+                 max_iterations: int = 1000, 
+                 max_steps_per_episode: int = 100, 
+                 name: str = 'MCRL', 
+                 type: str = 'MCRL', 
+                 verbose: bool = True
+                 ) -> None:
+        
+        super().__init__(mdp, mdp.dynamics, freq, name, type, verbose)
+
+        self.epsilon = epsilon  # exploration rate
+        self.k_epsilon = k_epsilon  # decay factor for exploration rate
+        self.epsilon_min = epsilon_min
+        self.learning_rate = learning_rate
+        self.gamma = gamma
+        self.max_iterations = max_iterations
+        self.max_steps_per_episode = max_steps_per_episode
+
+        self.mode = "every_visit"  # "first_visit" or "every_visit"
+
+        self.mdp = mdp
+
+        self.dim_states = self.mdp.num_states
+        self.dim_inputs = self.mdp.num_actions
+
+        self.init_state = self.env.init_state
+        self.target_state = self.env.target_state
+
+        # Initialize Q table with all 0s
+        self.Q = np.zeros((self.dim_states, self.dim_inputs)) 
+        self.state_action_counts = np.zeros((self.dim_states, self.dim_inputs))
+        
+        # Initialize policy as None
+        self.policy = np.zeros((self.dim_states)) 
+        self.value_function = np.zeros((self.dim_states)) 
+
+        # For training curve plotting
+        self.residual_rewards = []
+        self.epsilon_list = []
+        self.SR_100epoch = [] # Successful rounds
+        self.F_100epoch = [] # Failure rounds
+        self.TO_100epoch = [] # Time out rounds
+
+    def _get_action_probabilities(self, state_index: int) -> np.ndarray:
+        """Calculate the action probabilities using epsilon-soft policy."""
+
+        probabilities = np.ones(self.dim_inputs) * (self.epsilon / self.dim_inputs)
+        best_action = np.argmax(self.Q[state_index])
+        probabilities[best_action] += (1.0 - self.epsilon)
+
+        return probabilities
+
+    def setup(self) -> None:
+
+        for iteration in range(self.max_iterations):
+
+            episode = []  # storage state, action and reward for current episode
+            total_reward = 0  # total reward for current episode
+
+            if iteration % 100 == 0:
+
+                if iteration != 0:
+                    # Record the SR_100epoch, F_100epoch, TO_100epoch
+                    self.SR_100epoch.append(SR_100epoch)
+                    self.F_100epoch.append(F_100epoch)
+                    self.TO_100epoch.append(TO_100epoch)
+                
+                SR_100epoch = 0
+                F_100epoch = 0
+                TO_100epoch = 0
+
+            # Randomly choose a state to start
+            current_state_index = np.random.choice(self.dim_states)
+            current_state = self.mdp.state_space[:, current_state_index]
+            
+            # Generate an episode
+            for step in range(self.max_steps_per_episode):
+                # Choose action based on epsilon-soft policy
+                action_probabilities = self._get_action_probabilities(current_state_index)
+                action_index = np.random.choice(np.arange(self.dim_inputs), p=action_probabilities)
+                current_input = self.mdp.input_space[action_index]
+
+                # Take action and observe the next state and reward
+                next_state, reward = self.mdp.one_step_forward(current_state, current_input)
+                next_state_index = self.mdp.nearest_state_index_lookup(next_state)
+                total_reward += reward
+
+                # Store the state, action and reward for this step
+                episode.append((current_state_index, action_index, reward))
+
+                # Check if the episode is finished
+                terminate_condition_1 = False#next_state[0]==self.mdp.pos_partitions[-1]
+                terminate_condition_2 = False#next_state[0]==self.mdp.pos_partitions[0]
+                terminate_condition_3 = np.all(self.mdp.state_space[:, next_state_index]==self.target_state)
+
+                if terminate_condition_1 or terminate_condition_2 or terminate_condition_3:
+
+                    if terminate_condition_3:
+                        SR_100epoch += 1
+                    else:
+                        F_100epoch += 1
+
+                    if self.verbose:
+                        print(f"Iteration {iteration + 1}/{self.max_iterations}: finished successfully! epsilon: {self.epsilon:.4f}, residual reward: {total_reward:.2f}")
+                    
+                    break
+
+                if step == self.max_steps_per_episode-1:
+                    TO_100epoch +=1
+                    if self.verbose:
+                        print(f"Iteration {iteration + 1}/{self.max_iterations}: time out! epsilon: {self.epsilon:.4f}, residual reward: {total_reward:.2f}")
+                    
+                # Move to the next state
+                current_state_index = next_state_index
+                current_state = self.mdp.state_space[:, current_state_index]
+
+            # Update Q table using Monte Carlo method
+            G = 0  # Return
+            if self.mode == "first_visit":
+                visited = set()
+
+            for state_index, action_index, reward in reversed(episode):
+                G = reward + self.gamma * G
+                
+                 # update Q table
+                if self.mode == "first_visit" and (state_index, action_index) not in visited:
+                    visited.add((state_index, action_index))
+                    self.state_action_counts[state_index, action_index] += 1
+                    alpha = 1.0 / self.state_action_counts[state_index, action_index]
+                    self.Q[state_index, action_index] += alpha * (G - self.Q[state_index, action_index])
+
+                elif self.mode == "every_visit":
+                    self.state_action_counts[state_index, action_index] += 1
+                    alpha = 1.0 / self.state_action_counts[state_index, action_index]
+                    self.Q[state_index, action_index] += alpha * (G - self.Q[state_index, action_index])
+
+            # Decrease epsilon
+            self.epsilon *= self.k_epsilon
+            self.epsilon = max(self.epsilon, self.epsilon_min)
+            self.epsilon_list.append(self.epsilon)
+
+            # Record the residual reward
+            self.residual_rewards.append(total_reward)
+
+        # Return the deterministic policy and value function
+        self.policy = np.argmax(self.Q, axis=1)
+        self.value_function = np.max(self.Q, axis=1)
+
+        if self.verbose:
+            print("Training finished！")
+
+    @check_input_constraints
+    def compute_action(self, current_state: np.ndarray, current_time) -> np.ndarray:
+        """
+        Use the optimal policy to compute the action for the given state.
+        """
+        # Find the nearest discrete state index
+        state_index = self.mdp.nearest_state_index_lookup(current_state)
+        
+        # Get the optimal action from the policy
+        action_index = self.policy[state_index]
+        action = self.mdp.input_space[action_index]
+
+        return np.array([action])
+
+    def plot_heatmaps(self):
+        """
+        Visualize the policy and cost as a 2D state-value map.
+        """
+        value_map = self.value_function.reshape(self.mdp.num_pos, self.mdp.num_vel)
+        policy_map = self.policy.reshape(self.mdp.num_pos, self.mdp.num_vel)
+
+        fig, axs = plt.subplots(1, 2, figsize=(12, 4))
+
+        # Plot policy (U)
+        im1 = axs[0].imshow(policy_map, extent=[
+            self.mdp.pos_partitions[0], self.mdp.pos_partitions[-1],
+            self.mdp.vel_partitions[0], self.mdp.vel_partitions[-1]
+        ], origin='lower', aspect='auto', cmap='viridis')
+        axs[0].set_title('Optimal Policy')
+        axs[0].set_xlabel('Car Position')
+        axs[0].set_ylabel('Car Velocity')
+        fig.colorbar(im1, ax=axs[0], orientation='vertical')
+
+        # Plot cost-to-go (J)
+        im2 = axs[1].imshow(value_map, extent=[
+            self.mdp.pos_partitions[0], self.mdp.pos_partitions[-1],
+            self.mdp.vel_partitions[0], self.mdp.vel_partitions[-1]
+        ], origin='lower', aspect='auto', cmap='viridis')
+        axs[1].set_title('Optimal Cost')
+        axs[1].set_xlabel('Car Position')
+        axs[1].set_ylabel('Car Velocity')
+        fig.colorbar(im2, ax=axs[1], orientation='vertical')
+
+        plt.tight_layout()
+        plt.show()
+
+    def plot_training_curve(self):
+        """
+        Visualize the training curve of residual rewards and holdsignal for sr_100epoch in 2 figure.
+        """
+
+        self.SR_100epoch = np.repeat(self.SR_100epoch, 100)
+        self.F_100epoch = np.repeat(self.F_100epoch, 100)
+        self.TO_100epoch = np.repeat(self.TO_100epoch, 100)
+        
+        fig, axs = plt.subplots(1, 3, figsize=(12, 3))
+
+        # Plot residual rewards
+        axs[0].plot(self.residual_rewards)
+        axs[0].set_title('Total Rewards')
+        axs[0].set_xlabel('Iteration')
+        axs[0].set_ylabel('Total Reward')
+
+        # Plot epsilon
+        axs[1].plot(self.epsilon_list)
+        axs[1].set_title('Epsilon')
+        axs[1].set_xlabel('Iteration')
+        axs[1].set_ylabel('Epsilon')
+        axs[1].set_ylim(0, 1)
+
+        # Plot SR_100epoch, F_100epoch, TO_100epoch
+        axs[2].plot(self.SR_100epoch, label='Success rounds / 100Epoch')
+        axs[2].plot(self.F_100epoch, label='Fail rounds / 100Epoch')
+        axs[2].plot(self.TO_100epoch, label='Time out / 100Epoch')
+        axs[2].set_title('Statictics / 100 Epoch')
+        axs[2].set_xlabel('Iteration')
+        axs[2].set_ylabel('Number of rounds')
+        axs[2].set_ylim(0, 100)
+        axs[2].legend()
+
+
+        plt.tight_layout()
+        plt.show()
+
+
+
+
+
+
 
 
 
