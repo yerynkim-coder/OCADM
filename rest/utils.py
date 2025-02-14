@@ -263,7 +263,7 @@ class Dynamics:
 
 
 
-class Env_rl(Env):
+class Env_rl_d(Env):
     def __init__(
             self, 
             env: Env, 
@@ -333,7 +333,7 @@ class Env_rl(Env):
         if np.all(self.state_space[:, next_state_index] == self.env.target_state):
             reward = 10
         elif np.any(next_state_raw != next_state):
-            reward = -10
+            reward = -1
         else:
             reward = -1
         
@@ -435,6 +435,63 @@ class Env_rl(Env):
 
         plt.tight_layout()
         plt.show()
+    
+
+
+class Env_rl_c(Env):
+    def __init__(
+            self, 
+            env: Env, 
+            dynamics: Dynamics = None,
+            dt: float = 0.1
+        ) -> None:
+
+        self.env = env
+        
+        super().__init__(self.env.case, self.env.init_state, self.env.target_state, 
+                         state_lbs=self.env.state_lbs, state_ubs=self.env.state_ubs, 
+                         input_lbs=self.env.input_lbs, input_ubs=self.env.input_ubs)
+
+        if self.state_lbs is None or self.state_ubs is None or self.input_lbs is None or self.input_ubs is None:
+            raise ValueError("Constraints on states and input must been fully specified!")
+        
+        # self.pos_lbs, self.pos_ubs
+        # self.vel_lbs, self.vel_ubs
+        # self.input_lbs, self.input_ubs
+        
+        # State propagation
+        self.dynamics = dynamics
+        self.dt = dt
+
+    def one_step_forward(self, cur_state, cur_input):
+        
+        # Propagate the state
+        next_state = self.dynamics.one_step_forward(cur_state, cur_input, self.dt)  
+        next_state_raw = next_state
+
+        # Check whether next state is within the state space
+        next_pos = max(min(next_state[0], self.pos_ubs), self.pos_lbs)
+        next_vel = max(min(next_state[1], self.vel_ubs), self.vel_lbs)
+        next_state = np.array([next_pos, next_vel])
+        
+        # Get reward
+        if np.linalg.norm(next_state[0]-self.env.target_state[0])<5e-2:
+            done = True
+            reward = 10.0
+        elif np.any(next_state_raw != next_state):
+            done = True
+            reward = -5.0
+        else:
+            done = False
+            reward = np.exp( - 1.0 * np.linalg.norm(next_pos-self.env.target_state[0]))
+
+
+        
+        
+        return done, next_state, reward
+
+
+
 
 def is_square(matrix: np.ndarray) -> bool:
     if matrix.shape[0] != matrix.shape[1]:
@@ -1316,7 +1373,7 @@ class MPCController(LQRController):
 # Derived class for RL Controller, solved by General Policy Iteration
 class GPIController(BaseController):
     def __init__(self, 
-                 mdp: Env_rl, 
+                 mdp: Env_rl_d, 
                  freq: float, 
                  gamma: float = 0.95,
                  precision_pe: float = 1e-6,
@@ -1471,7 +1528,7 @@ class GPIController(BaseController):
 # Derived class for RL Controller, solved by Q-Learning
 class QLearningController(BaseController):
     def __init__(self, 
-                 mdp: Env_rl, 
+                 mdp: Env_rl_d, 
                  freq: float, 
                  epsilon: float = 0.3, 
                  k_epsilon: float = 0.99, 
@@ -1702,7 +1759,7 @@ class QLearningController(BaseController):
 # Derived class for RL Controller, solved by MCRL
 class MCRLController(BaseController):
     def __init__(self, 
-                 mdp: Env_rl, 
+                 mdp: Env_rl_d, 
                  freq: float, 
                  epsilon: float = 0.3, 
                  k_epsilon: float = 0.99, 
