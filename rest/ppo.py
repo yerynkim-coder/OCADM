@@ -92,9 +92,9 @@ class PPOController(BaseController):
         )
 
         self.parameters = [
-            {"params": self.policy_net.parameters(), "lr": self.learning_rate_p},  # Policy 网络
-            {"params": [self.log_std], "lr": self.learning_rate_p},  # log_std 也使用 policy 的学习率
-            {"params": self.value_net.parameters(), "lr": self.learning_rate_v}  # Value 网络（学习率降低）
+            {"params": self.policy_net.parameters(), "lr": self.learning_rate_p},  
+            {"params": [self.log_std], "lr": self.learning_rate_p},
+            {"params": self.value_net.parameters(), "lr": self.learning_rate_v}  
         ]
 
         # Optimizer
@@ -143,8 +143,7 @@ class PPOController(BaseController):
     
     def evaluate_actions(self, states, actions_unsquashed):
         """
-        更新阶段用：给定 旧的(s, a_unscaled)，计算 新策略 下的 log_prob, entropy, value
-        注意: states, unscaled_actions 可以是batch
+        Evaluate actions in current policy
         """
         # (batch_size, obs_dim)
         # (batch_size, act_dim)
@@ -152,10 +151,10 @@ class PPOController(BaseController):
         action_std = torch.exp(self.log_std).clamp(1e-3, 0.5)
         dist = torch.distributions.Normal(action_mean, action_std)
 
-        # 对旧的未压缩动作做 log_prob
+        # do log_prob for unsquashed actions
         log_prob = dist.log_prob(actions_unsquashed).sum(dim=-1)
 
-        # 还需要计算 tanh 后的动作
+        # apply squashing
         action_squashed = torch.tanh(actions_unsquashed)
         log_prob_squashed = log_prob - torch.sum(torch.log(1 - action_squashed.pow(2) + 1e-7), dim=-1)
 
@@ -388,14 +387,14 @@ class PPOController(BaseController):
         steps = np.linspace(0, self.max_iterations, len(rewards))
         window_size = 50
 
-        fig, axes = plt.subplots(1, 3, figsize=(15, 4))  # 创建1行3列的子图
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4))  
 
-        # 1. 绘制 Reward 曲线
-        if rewards.ndim == 1:  # 仅有单次训练记录
+        # Step 1: Reward curve
+        if rewards.ndim == 1:  
             axes[0].plot(steps, rewards, color='blue', label='max', linewidth=2)
             smoothed_rewards = np.convolve(rewards, np.ones(window_size)/window_size, mode='valid')
             axes[0].plot(steps[:len(smoothed_rewards)], smoothed_rewards, color='cyan', label='smoothed', linewidth=2)
-        else:  # 多次训练记录，绘制 mean/max/min
+        else: 
             mean_reward = np.mean(rewards, axis=0)
             max_reward = np.max(rewards, axis=0)
             min_reward = np.min(rewards, axis=0)
@@ -412,7 +411,7 @@ class PPOController(BaseController):
         axes[0].legend()
         axes[0].grid(True)
         
-        # 2. 绘制 Value Loss 曲线
+        # Step 2: Value loss curve
         smoothed_value_loss = np.convolve(value_loss, np.ones(window_size)/window_size, mode='valid')
         axes[1].plot(steps, value_loss, color='green', label='Value Loss', linewidth=2)
         axes[1].plot(steps[:len(smoothed_value_loss)], smoothed_value_loss, color='lime', label='smoothed', linewidth=2)
@@ -422,7 +421,7 @@ class PPOController(BaseController):
         axes[1].legend()
         axes[1].grid(True)
         
-        # 3. 绘制 Policy Loss 曲线
+        # Step 3: Policy loss curve
         smoothed_policy_loss = np.convolve(policy_loss, np.ones(window_size)/window_size, mode='valid')
         axes[2].plot(steps, policy_loss, color='orange', label='Policy Loss', linewidth=2)
         axes[2].plot(steps[:len(smoothed_policy_loss)], smoothed_policy_loss, color='gold', label='smoothed', linewidth=2)
@@ -432,6 +431,6 @@ class PPOController(BaseController):
         axes[2].legend()
         axes[2].grid(True)
         
-        plt.tight_layout()  # 调整布局，避免重叠
+        plt.tight_layout()  
         plt.show()
 
