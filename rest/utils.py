@@ -1058,8 +1058,8 @@ class iLQRController(LQRController):
             freq: float, 
             name: str = 'iLQR', 
             type: str = 'iLQR', 
-            max_iter: int = 30, 
-            tol: float = 2e-2, 
+            max_iter: int = 20, 
+            tol: float = 1e-1, 
             verbose: bool = True
         ) -> None:
 
@@ -2036,6 +2036,8 @@ class Simulator:
         self.state_traj = [] # list -> ndarray(2,)
         self.input_traj = [] # list -> scalar
 
+        self.cost2go_arr = None
+
         self.positions = []
         self.velocities = []
         self.accelerations = []
@@ -2080,6 +2082,43 @@ class Simulator:
         input_traj = np.array(self.input_traj)
 
         return state_traj, input_traj
+
+    def compute_cost2go(
+        self,
+        Q: np.ndarray,
+        R: np.ndarray,
+        Qf: np.ndarray,
+        target_state: np.ndarray
+    ) -> float:
+        
+        """can only be used for quadratic cost function"""
+
+        # Transform state and input traj from list to ndarray
+        state_traj = np.array(self.state_traj)
+        input_traj = np.array(self.input_traj)
+
+        total_cost_arr = np.zeros(len(input_traj))
+        
+        # Terminal cost
+        x_final = state_traj[-1]
+        x_err_final = x_final - target_state
+        cost_terminal = 0.5 * (x_err_final.T @ Qf @ x_err_final)
+        total_cost_arr[-1] = cost_terminal
+
+        # Stage cost, backpropagation
+        for k in range(len(input_traj)-2, -1, -1):
+            x_err = state_traj[k] - target_state
+            u = input_traj[k]
+
+            u_cost = R * (u**2)
+
+            cost_stage = 0.5 * (x_err.T @ Q @ x_err + u_cost)
+            total_cost_arr[k] = total_cost_arr[k+1] +  cost_stage
+        
+        # Update the cost2go_arr
+        self.cost2go_arr = total_cost_arr
+
+        return total_cost_arr
 
 
 
@@ -2220,6 +2259,63 @@ class Visualizer:
 
         plt.tight_layout()
         plt.show()
+
+    def display_contrast_cost2go(self, *simulators: Simulator) -> None:
+
+        color_index = 0
+
+        if not simulators:
+            raise ValueError("No simulator references provided.")
+
+        fig, ax = plt.subplots(1, 1, figsize=(10, 4))
+
+        # Plot the reference and evaluated trajectories for each simulator
+        for simulator_ref in simulators:
+            if not np.all(simulator_ref.cost2go_arr):
+                raise ValueError(f"Failed to get trajectory from simulator {simulator_ref.controller.name}. State trajectory list is void; please run 'run_simulation' first.")
+
+            # Plot cost over time
+            ax.plot(self.t_eval, simulator_ref.cost2go_arr, linestyle="--", label=f"{simulator_ref.controller.name} Cost-to-go", color=self.color_list[color_index])
+
+            color_index += 1
+        
+            # Annotate total cost at initial time step
+            initial_cost = simulator_ref.cost2go_arr[0]
+            plt.annotate(
+                f"Total cost: {initial_cost:.2f}",
+                xy=(0, initial_cost),
+                xytext=(10, initial_cost + 0.05 * initial_cost),
+                arrowprops=dict(arrowstyle="->", lw=1.5),
+                fontsize=10,
+                bbox=dict(boxstyle="round,pad=0.3", fc="yellow", alpha=0.3)
+            )
+
+        # Plot cost over time
+        ax.plot(self.t_eval, self.simulator.cost2go_arr, label=f"{self.simulator.controller.name} Cost-to-go", color=self.color_list[color_index])
+
+        color_index += 1
+    
+        # Annotate total cost at initial time step
+        initial_cost = self.simulator.cost2go_arr[0]
+        plt.annotate(
+            f"Total cost: {initial_cost:.2f}",
+            xy=(0, initial_cost),
+            xytext=(10, initial_cost + 0.05 * initial_cost),
+            arrowprops=dict(arrowstyle="->", lw=1.5),
+            fontsize=10,
+            bbox=dict(boxstyle="round,pad=0.3", fc="yellow", alpha=0.3)
+        )
+
+        # Set labels and legends
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Cost-to-go")
+        ax.legend()
+
+        plt.tight_layout()
+        plt.show()
+        
+
+
 
     def display_animation(self) -> HTML:
         
