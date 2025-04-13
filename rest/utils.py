@@ -1,4 +1,6 @@
 import numpy as np
+import sympy as sp
+import pickle
 import casadi as ca
 import scipy.linalg
 import copy
@@ -61,14 +63,33 @@ class Env:
         if symbolic_h == None:
 
             def symbolic_h(p, case):
+
                 if case == 1:  # zero slope
                     h = 0
+
                 elif case == 2: # constant slope
                     h = (ca.pi * p) / 18
+
                 elif case == 3: # varying slope
-                    h = ca.cos(3 * p)
-                elif case == 4: # varying slope for underactuated case
-                    h = ca.sin(3 * p)
+                    h_center = ca.cos(3 * (p - ca.pi/2))
+                    h_flat_left = 1
+                    h_flat_right = -1
+
+                    condition_left = p <= -ca.pi/6
+                    condition_right = p >= ca.pi/6
+
+                    h = ca.if_else(condition_left, h_flat_left, ca.if_else(condition_right, h_flat_right, h_center))
+
+                elif case == 4: # varying slope (underactated case)
+
+                    condition_left = p <= -ca.pi/2
+                    condition_right = p >= ca.pi/6
+                    
+                    h_center = ca.sin(3 * p)
+                    h_flat = 1
+
+                    h = ca.if_else(condition_left, h_flat, ca.if_else(condition_right, h_flat, h_center))
+                    
                 return h
         
         if symbolic_theta == None:
@@ -151,6 +172,8 @@ class Dynamics:
         self.dim_states = self.states.shape[0]
         self.dim_inputs = self.inputs.shape[0]
 
+        self.env = env
+
         # Initialize system dynmaics if not given
         if setup_dynamics is None:
 
@@ -162,10 +185,10 @@ class Dynamics:
                 Gravity = 9.81
 
                 theta = theta_function(p)
-
+        
                 # Expression of dynamics
                 dpdt = v
-                dvdt = a * ca.cos(theta) # - Gravity * ca.sin(theta) * ca.cos(theta)
+                dvdt = a * ca.cos(theta) - Gravity * ca.sin(theta) * ca.cos(theta)
                 
                 state = ca.vertcat(p, v)
                 input = ca.vertcat(a)
@@ -174,14 +197,60 @@ class Dynamics:
                 return ca.Function("dynamics_function", [state, input], [rhs])
         
         # Define system dynamics
-        self.dynamics_function = setup_dynamics(env.theta)
+        self.dynamics_function = setup_dynamics(self.env.theta)
 
-        # Generate symbolic function of linearized Matrix A_lin and B_lin
-        lhs = self.dynamics_function(self.states, self.inputs)
-        A_sym = ca.jacobian(lhs, self.states)  # Partial derivatives of dynamics w.r.t. states
-        B_sym = ca.jacobian(lhs, self.inputs)  # Partial derivatives of dynamics w.r.t. input
+        # Initialize Jacobians
+        self.A_func = None
+        self.B_func = None
+
+    def linearization(
+        self,
+        current_state: np.ndarray, 
+        current_input: np.ndarray, 
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Compute symbolic Jacobians A(x,u) & B(x,u) and state / input matrix A & B of the system dynamics.
+        """
+
+        f = self.dynamics_function(self.states, self.inputs)
+        A_sym = ca.jacobian(f, self.states)
+        B_sym = ca.jacobian(f, self.inputs)
+
         self.A_func = ca.Function("A_func", [self.states, self.inputs], [A_sym])
         self.B_func = ca.Function("B_func", [self.states, self.inputs], [B_sym])
+
+        A_c = np.array(self.A_func(current_state, current_input))
+        B_c = np.array(self.B_func(current_state, current_input))
+
+        return A_c, B_c
+    
+    def discretization(
+        self,
+        A_c: np.ndarray,
+        B_c: np.ndarray,
+        dt: float
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Discretize continuous-time linear system x_dot = A_c x + B_c u
+        using matrix exponential method (Zero-Order Hold).
+
+        Returns:
+            A_d, B_d: Discrete-time system matrices
+        """
+
+        # Construct augmented matrix
+        aug_matrix = np.zeros((self.dim_states + self.dim_inputs, self.dim_states + self.dim_inputs))
+        aug_matrix[:self.dim_states, :self.dim_states] = A_c
+        aug_matrix[:self.dim_states, self.dim_states:] = B_c
+
+        # Compute matrix exponential
+        exp_matrix = scipy.linalg.expm(aug_matrix * dt)
+
+        # Extract A_d and B_d
+        A_d = exp_matrix[:self.dim_states, :self.dim_states]
+        B_d = exp_matrix[:self.dim_states, self.dim_states:]
+
+        return A_d, B_d
 
     def get_linearized_AB_discrete(
             self, 
@@ -191,41 +260,26 @@ class Dynamics:
         ) -> Tuple[np.ndarray, np.ndarray]:
         '''use current state, and current input to calculate the linearized state transfer matrix A_lin and input matrix B_lin'''
         
-        # Evaluate linearized A and B around set point
-        A_c = np.array(self.A_func(current_state, current_input))
-        B_c = np.array(self.B_func(current_state, current_input))
+        # Linearize the system dynamics
+        A_c, B_c = self.linearization(current_state, current_input)
 
-        '''
-        # Method 1: approximation using forward euler method
-        A_d = A_c * dt + np.eye(self.dim_states)
-        B_d = B_c * dt
-        '''
-
-        # Method 2: using matrix exponential
-        # Construct augmented matrix for continious dynamics
-        aug_matrix = np.zeros((self.dim_states + self.dim_inputs, self.dim_states + self.dim_inputs))
-        aug_matrix[:self.dim_states, :self.dim_states] = A_c
-        aug_matrix[:self.dim_states, self.dim_states:] = B_c
-
-        # Calculate matrix exponential
-        exp_matrix = scipy.linalg.expm(aug_matrix * dt)
-
-        # Extract discrete A and B
-        A_d = exp_matrix[:self.dim_states, :self.dim_states]
-        B_d = exp_matrix[:self.dim_states, self.dim_states:]
+        # Discretize the system dynamics
+        A_d, B_d = self.discretization(A_c, B_c, dt)
         
         # Check controllability of the discretized system
         controllability_matrix = np.hstack([np.linalg.matrix_power(A_d, i) @ B_d for i in range(self.dim_states)])
         rank = np.linalg.matrix_rank(controllability_matrix)
+
         if rank < self.dim_states:
             raise ValueError(f"System (A, B) is not controllable，rank of controllability matrix is {rank}, while the dimension of state space is {self.dim_states}.")
         
         return A_d, B_d
     
-    def compute_equilibrium_input(self, state: np.ndarray) -> float:
+    def get_equilibrium_input(self, state: np.ndarray) -> float:
 
         p, v = state
-
+        
+        '''
         a = ca.SX.sym("a")
         state_sym = ca.vertcat(ca.SX.sym("p"), ca.SX.sym("v"))
         
@@ -238,6 +292,13 @@ class Dynamics:
 
         # Solve equilibrium equation to get a_eq
         a_eq = ca.solve(equilibrium_condition, a)
+        '''
+
+        theta = self.env.theta(p)
+
+        a_eq = 9.81 * np.sin(theta)
+
+        print("a_eq:", a_eq)
 
         return float(a_eq)
     
@@ -754,8 +815,10 @@ class DPController(BaseController):
         return self.policy[current_time]
 '''
 
-
-class DPController(BaseController):
+# Implementation of approximate dynamic programming (ADP) controller
+# Can only be used for linear system
+# Implementation based on state discretization and interpolation
+class ADPController(BaseController):
     def __init__(
             self,
             env: Env,
@@ -784,7 +847,7 @@ class DPController(BaseController):
             raise ValueError("Constraints on states must been fully specified for Approximate Dynamic Programming!")
         
         # Number of grid points for discretization
-        self.num_x1 = 60
+        self.num_x1 = 40
         self.num_x2 = 40
         
         # Initialize state and input space
@@ -799,11 +862,11 @@ class DPController(BaseController):
 
     def terminal_cost(self, x):
 
-        return x.T @ self.Qf @ x
+        return (x-self.target_state).T @ self.Qf @ (x-self.target_state)
 
     def stage_cost(self, x, u):
 
-        return x.T @ self.Q @ x + self.R * u**2
+        return (x-self.target_state).T @ self.Q @ (x-self.target_state) + self.R * u**2
 
     def recursion_cost(self, u, x):
 
@@ -838,17 +901,17 @@ class DPController(BaseController):
     def setup(self) -> None:
         
         # Generate grid mesh for state space
-        self.X1 = np.linspace(self.env.state_lbs[0]-self.target_state[0], self.env.state_ubs[0]-self.target_state[0], self.num_x1)
-        self.X2 = np.linspace(self.env.state_lbs[1]-self.target_state[1], self.env.state_ubs[1]-self.target_state[1], self.num_x2)
+        self.X1 = np.linspace(self.env.state_lbs[0], self.env.state_ubs[0], self.num_x1)
+        self.X2 = np.linspace(self.env.state_lbs[1], self.env.state_ubs[1], self.num_x2)
         
         # Initialize policy and cost-to-go function, and generate interpolation over grid mesh
         self.U = np.zeros((self.num_x1, self.num_x2))
-        self.U_func = interp2d(self.X1, self.X2, self.U.T, kind='linear')
+        self.U_func = interp2d(self.X1, self.X2, self.U.T, kind='cubic')
         self.J = np.zeros((self.num_x1, self.num_x2))
         for i in range(self.num_x1): # Initialize cost matirx with terminal cost
             for j in range(self.num_x2):
                 self.J[i, j] = self.terminal_cost(np.array([self.X1[i], self.X2[j]]))
-        self.J_func = interp2d(self.X1, self.X2, self.J.T, kind='linear')
+        self.J_func = interp2d(self.X1, self.X2, self.J.T, kind='cubic')
         
         # Iterate over time steps from backward to forward
         for n in range(self.N, 0, -1):
@@ -886,8 +949,8 @@ class DPController(BaseController):
             self.J = J_temp
 
             # Re-interpolation over grid mesh
-            self.J_func = interp2d(self.X1, self.X2, self.J.T, kind='linear')
-            self.U_func = interp2d(self.X1, self.X2, self.U.T, kind='linear')
+            self.J_func = interp2d(self.X1, self.X2, self.J.T, kind='cubic')
+            self.U_func = interp2d(self.X1, self.X2, self.U.T, kind='cubic')
         
         if self.verbose:
             print(f"Dynamic Programming policy with input constraints computed.")
@@ -900,10 +963,16 @@ class DPController(BaseController):
         if np.all(self.U == 0):
             raise ValueError("DP Policy is not computed. Call setup() first.")
         
-        det_x = current_state - self.target_state
+        # Method 1: use linear interpolation to find the value of U at the current state
+        miu = self.U_func(current_state[0], current_state[1]) # interpolation error will degrade the performance
+
+        # Method 2: find the NN for state in grid, and use the related U as input
+        #nearest_x1_index = np.argmin(np.abs(self.X1 - current_state[0]))
+        #nearest_x2_index = np.argmin(np.abs(self.X2 - current_state[1]))
+        #miu = self.U[nearest_x1_index, nearest_x2_index]
         
-        # Use linear interpolation to find the value of U at the current state
-        miu = self.U_func(det_x[0], det_x[1])
+        #if self.verbose:
+        print(f"state: {current_state}, input: {miu}")
 
         return miu
 
@@ -939,6 +1008,336 @@ class DPController(BaseController):
         plt.tight_layout()
         plt.show()
 
+# Implementation of dynamic programming (DP) controller
+# Can only be used for linear system
+# Implementation based on sympy
+class DPController(BaseController):
+    def __init__(
+            self,
+            env: Env,
+            dynamics: Dynamics,
+            Q: np.ndarray,
+            R: np.ndarray,
+            Qf: np.ndarray, 
+            freq: float,
+            Horizon: int,
+            name: str = 'DP',
+            type: str = 'DP', 
+            verbose: bool = False,
+            bangbang: bool = False,
+            symbolic_weight: bool = False
+        ) -> None:
+
+        """
+        DP solver for linear system:
+            x_{k+1} = A x_k + B u_k
+            cost = sum u_k^T R u_k + terminal cost
+        """
+
+        super().__init__(env, dynamics, freq, name, verbose)
+
+        self.N = Horizon
+
+        self.Q = Q
+        self.R = R
+        self.Qf = Qf
+
+        # Get linearized & discretized A and B matrices
+        self.Ad, self.Bd = self.dynamics.get_linearized_AB_discrete(self.init_state, 0, self.dt)
+        # siqi's case:
+        #self.Ad = sp.Matrix([[1, 0], [0, 0]])
+        #self.Bd = sp.Matrix([[1], [0]])
+        # mountain car case:
+        #self.Ad = sp.Matrix([[1, 1], [0, 1]])
+        #self.Bd = sp.Matrix([[0], [1]])
+
+        self.bangbang = bangbang # True or False
+        self.symbolic_weight = symbolic_weight # True or False
+
+        # Define symbolic variables
+        self.x_sym = None
+        self.u_sym = None
+        self.Q_sym = None
+        self.R_sym = None
+        self.Qf_sym = None
+        self.x_ref_sym = None
+
+        # Store results
+        self.J_sym = [None] * (self.N + 1)
+        self.mu_sym = [None] * self.N
+    
+        self.setup()
+
+    def setup(self) -> None:
+
+        # Create symbolic states and inputs
+        self.x_sym = [sp.Matrix(sp.symbols(f'p_{k} v_{k}')) for k in range(self.N + 1)]
+        self.u_sym = [sp.Symbol(f'u_{k}') for k in range(self.N)]
+        # Create symbolic weight matrices
+        if self.symbolic_weight:
+            q1, q2 = sp.symbols('q_p q_v')
+            self.Q_sym = sp.diag(q1, q2)
+            self.R_sym = sp.Symbol('r')
+            self.Qf_sym = sp.diag(q1, q2)
+        else:
+            self.Q_sym = sp.Matrix(self.Q)
+            self.R_sym = sp.Float(self.R)
+            self.Qf_sym = sp.Matrix(self.Qf)
+        # Create symbolic reference state
+        p_ref, v_ref = sp.symbols('p_ref v_ref')
+        x_ref = [p_ref, v_ref]
+        self.x_ref_sym = sp.Matrix(x_ref) 
+
+        # Make a copy
+        J, mu = self.J_sym, self.mu_sym
+
+        # Terminal cost: J_N = (x_N - x_ref)^T Qf (x_N - x_ref)
+        err_N = self.x_sym[self.N] - self.x_ref_sym
+        J[self.N] = (err_N.T * self.Qf_sym * err_N)[0, 0]
+
+        for k in reversed(range(self.N)):
+
+            # x_{k+1} = A x_k + B u_k
+            x_next = self.Ad * self.x_sym[k] + self.Bd * self.u_sym[k]
+
+            # Cost at step k: u_k^T R u_k + J_{k+1}(x_{k+1})
+            stage_cost = self.R_sym * self.u_sym[k]**2
+            J_kplus1_sub = J[k + 1].subs({self.x_sym[k + 1][i]: x_next[i] for i in range(2)})
+
+            total_cost = stage_cost + J_kplus1_sub
+
+            # Compute the optimal control input and cost-to-go
+            if self.bangbang: # bangbang input (MIP)
+                mu_k, J_k = self.solve_bangbang(total_cost, k)
+            else: # continious input (NLP)
+                mu_k, J_k = self.solve_continuous(total_cost, k)
+            
+            # Store the symbolic expressions
+            mu[k] = mu_k
+            J[k] = J_k
+        
+        # Log the symbolic expressions back
+        self.J_sym = J
+        self.mu_sym = mu
+
+        if self.verbose:
+            print(f"Dynamic Programming policy with input constraints computed.")
+            self.print_solution()
+
+    def solve_continuous(self, total_cost, k):
+
+        # Derivative w.r.t u_k
+        dJ_du = sp.diff(total_cost, self.u_sym[k])
+        u_star = sp.solve(dJ_du, self.u_sym[k])[0]
+        mu_k = sp.simplify(u_star)
+
+        # Plug u_k* back into cost to get J_k
+        cost_k_opt = total_cost.subs(self.u_sym[k], u_star)
+        J_k = sp.simplify(cost_k_opt)
+
+        return mu_k, J_k
+    
+    def solve_bangbang(self, total_cost, k):
+
+        # Evaluate cost for u_k = -1 and u_k = 1
+        cost_minus1 = sp.simplify(total_cost.subs(self.u_sym[k], -1))
+        cost_plus1  = sp.simplify(total_cost.subs(self.u_sym[k], 1))
+
+        # Try subtracting to simplify the condition
+        delta_cost = sp.simplify(cost_plus1 - cost_minus1)
+
+        # Store optimal control policy as piecewise
+        mu_k = sp.Piecewise(
+            (-1, delta_cost > 0),
+            (1,  True)  # fallback
+        )
+        # OR mu_k = sp.simplify(mu_k)
+        # OR mu_k = sp.piecewise_fold(mu_k)
+
+        # Store cost-to-go as piecewise
+        J_k = sp.Piecewise(
+            (cost_minus1, delta_cost > 0),
+            (cost_plus1,  True)
+        )
+        # OR J_k = sp.simplify(J_k)
+        # OR J_k = sp.piecewise_fold(J_k)
+
+        return mu_k, J_k
+
+    def print_solution(self):
+        for k, uk in enumerate(self.mu_sym):
+            print(f"u_{k}*(x_{k}) =", uk)
+        #print("\nJ_0(x_0) =")
+        #sp.pprint(self.J_sym[0])
+
+    def save_policy(self, filename='dp_policy.pkl'):
+        with open(filename, 'wb') as f:
+            pickle.dump({
+                'mu_sym': self.mu_sym,
+                'J_sym': self.J_sym,
+            }, f)
+
+    def load_policy(self, filename='dp_policy.pkl'):
+        with open(filename, 'rb') as f:
+            data = pickle.load(f)
+            self.mu_sym = data['mu_sym']
+            self.J_sym = data['J_sym']
+
+    @check_input_constraints
+    def compute_action(self, current_state: np.ndarray, current_step: int) -> np.ndarray:
+
+        if any(mu is None for mu in self.mu_sym):
+            raise ValueError("DP Policy is not computed yet. Call setup() first.")
+        
+        if current_step >= self.N:
+            raise ValueError(f"current_step = {current_step} exceeds or equals horizon N = {self.N}")
+        
+        mu_expr = self.mu_sym[current_step]
+
+        # Substitute current state into the symbolic expression
+        if self.symbolic_weight:
+            subs_dict = {
+                sp.Symbol(f'p_{current_step}'): current_state[0],
+                sp.Symbol(f'v_{current_step}'): current_state[1],
+                sp.Symbol('q_p'): self.Q[0, 0],
+                sp.Symbol('q_v'): self.Q[1, 1],
+                sp.Symbol('r'): self.R[0, 0],
+                sp.Symbol('p_ref'): self.target_state[0], 
+                sp.Symbol('v_ref'): self.target_state[1]
+            }
+        else:
+            subs_dict = {
+                sp.Symbol(f'p_{current_step}'): current_state[0],
+                sp.Symbol(f'v_{current_step}'): current_state[1],
+                sp.Symbol('p_ref'): self.target_state[0], 
+                sp.Symbol('v_ref'): self.target_state[1]
+            }
+    
+        mu = float(mu_expr.subs(subs_dict).evalf())
+
+        if self.verbose:
+            print(f"state: {current_state}, optimal input: {mu}")
+
+        return mu
+    
+# Derived class for LQR Controller with finite horizon
+class FiniteLQRController(BaseController):
+    def __init__(
+            self, 
+            env: Env, 
+            dynamics: Dynamics, 
+            Q: np.ndarray, 
+            R: np.ndarray, 
+            freq: float, 
+            horizon: int,
+            name: str = 'LQR_finite', 
+            type: str = 'LQR_finite', 
+            verbose: bool = False
+        ) -> None:
+
+        super().__init__(env, dynamics, freq, name, type, verbose)
+        
+        # Initialize as private property
+        self._Q = None
+        self._R = None
+
+        self.N = horizon
+
+        self.K_list = [None] * self.N  # LQR gain matrix
+        
+        # Call setter for the check and update the value of private property
+        self.Q = Q
+        self.R = R
+
+        self.A = None  # State transfer matrix
+        self.B = None  # Input matrix
+
+        self.x_eq = None  # Equilibrium state
+        self.u_eq = None  # Equilibrium input
+        
+        self.setup()
+
+    @property
+    def Q(self) -> np.ndarray:
+        return self._Q
+
+    @Q.setter
+    def Q(self, value: np.ndarray) -> None:
+
+        is_square(value)
+        is_symmetric(value)
+        is_positive_semi_definite(value)
+
+        if self.verbose:
+            print("Check passed, Q is a symmetric, positive semi-definite matrix.")
+
+        self._Q = value
+
+    @property
+    def R(self) -> np.ndarray:
+        return self._R
+
+    @R.setter
+    def R(self, value: np.ndarray) -> None:
+
+        is_square(value)
+        is_symmetric(value)
+        is_positive_definite(value)
+
+        if self.verbose:
+            print("Check passed, R is a symmetric, positive definite matrix.")
+        
+        self._R = value
+    
+    def setup(self) -> None:
+        
+        # Set up equilibrium state
+        # Note that if target state is not on the slope, self.u_eq = 0 -> will not work for the nonlinear case
+        self.x_eq = self.target_state
+
+        # Solve input at equilibrium
+        self.u_eq = self.dynamics.get_equilibrium_input(self.x_eq)
+
+        # Linearize dynamics at equilibrium
+        self.A, self.B = self.dynamics.get_linearized_AB_discrete(
+            current_state=self.x_eq, current_input=self.u_eq, dt=self.dt
+        )
+
+        # Initialize terminal cost
+        P = self.Q.copy()
+
+        # Solve Bellman Recursion from backwardsto compute gain matrix
+        for k in reversed(range(self.N)):
+            K = np.linalg.inv(self.R + self.B.T @ P @ self.B) @ (self.B.T @ P @ self.A)
+            self.K_list[k] = K
+            P = self.Q + self.A.T @ P @ self.A - self.A.T @ P @ self.B @ K
+
+        if self.verbose:
+            print(f"LQR Gain Matrix K: {self.K}")
+
+    @check_input_constraints
+    def compute_action(self, current_state: np.ndarray, current_time: int) -> np.ndarray:
+        if any(k is None for k in self.K_list):
+            raise ValueError("LQR gain matrix K is not computed. Call setup() first.")
+        
+        k = current_time  # assume current_time in [0, N-1]
+
+        if k >= self.N:
+            k = self.N - 1  # use terminal gain if past horizon
+
+        # Compute state error
+        det_x = current_state - self.target_state
+
+        # Get the corresponding gain matrix for the current time step
+        K_k = self.K_list[k]
+
+        # Apply control law
+        u = self.u_eq- K_k @ det_x
+
+        return u
+
+
+
 
 # Derived class for LQR Controller
 class LQRController(BaseController):
@@ -951,7 +1350,7 @@ class LQRController(BaseController):
             freq: float, 
             name: str = 'LQR', 
             type: str = 'LQR', 
-            verbose: bool = True
+            verbose: bool = False
         ) -> None:
 
         super().__init__(env, dynamics, freq, name, type, verbose)
@@ -967,6 +1366,9 @@ class LQRController(BaseController):
 
         self.A = None  # State transfer matrix
         self.B = None  # Input matrix
+
+        self.x_eq = None  # Equilibrium state
+        self.u_eq = None  # Equilibrium input
         
         # need no external objects for setup, can directly call the setup function here
         if self.type in ['LQR', 'MPC']:
@@ -1012,18 +1414,27 @@ class LQRController(BaseController):
     def K(self, value: np.ndarray) -> None:
 
         eigvals = np.linalg.eigvals(self.A - self.B @ value)
+
         if np.any(np.abs(eigvals) > 1):
             raise ValueError("Warning: not all eigenvalue of A_cl inside unit circle, close-loop system is unstable!")
+        
         elif self.verbose:
             print(f"Check passed, current gain K={value}, close-loop system is stable.")
+
         self._K = value
 
     def setup(self) -> None:
+        
+        # Set up equilibrium state
+        # Note that if target state is not on the slope, self.u_eq = 0 -> will not work for the nonlinear case
+        self.x_eq = self.target_state
+
+        # Solve input at equilibrium
+        self.u_eq = self.dynamics.get_equilibrium_input(self.x_eq)
+
         # Linearize dynamics at equilibrium
-        state_eq = np.zeros(self.dim_states)
-        input_eq = np.zeros(self.dim_inputs)
         self.A, self.B = self.dynamics.get_linearized_AB_discrete(
-            current_state=state_eq, current_input=input_eq, dt=self.dt
+            current_state=self.x_eq, current_input=self.u_eq, dt=self.dt
         )
 
         # Solve DARE to compute gain matrix
@@ -1042,7 +1453,7 @@ class LQRController(BaseController):
         det_x = current_state - self.target_state
 
         # Apply control law
-        u = -self.K @ det_x
+        u = self.u_eq- self.K @ det_x
         return u
 
 
@@ -1058,7 +1469,7 @@ class iLQRController(LQRController):
             freq: float, 
             name: str = 'iLQR', 
             type: str = 'iLQR', 
-            max_iter: int = 20, 
+            max_iter: int = 100, 
             tol: float = 1e-1, 
             verbose: bool = True
         ) -> None:
@@ -1077,7 +1488,15 @@ class iLQRController(LQRController):
         """
         Perform iLQR to compute the optimal control sequence.
         """
+
+        # Set up equilibrium state
+        # Note that if target state is not on the slope, self.u_eq = 0 -> will not work for the nonlinear case
+        self.x_eq = self.target_state
+
+        # Solve input at equilibrium
+        self.u_eq = self.dynamics.get_equilibrium_input(self.x_eq)
         
+        # Start iLQR
         N = len(input_traj)
 
         # Initialize state and control trajectories
@@ -1189,11 +1608,12 @@ class iLQRController(LQRController):
             x_traj = new_x_traj
 
     @check_input_constraints
-    def compute_action(self, current_state: np.ndarray, current_time: int) -> np.ndarray:
+    def compute_action(self, current_state: np.ndarray, current_step: int) -> np.ndarray:
         if self.K_k_arr is None or self.u_kff_arr is None:
             raise ValueError("iLQR parameters are not computed. Call setup() first.")
 
-        u = self.u_kff_arr[current_time] + self.K_k_arr[:, current_time].T @ current_state
+        u = self.u_kff_arr[current_step] + self.K_k_arr[:, current_step].T @ current_state
+
         return u
 
 
@@ -1242,7 +1662,7 @@ class MPCController(LQRController):
         """
         # Initialize Acados model
         model = AcadosModel()
-        model.name = "mpc_controller"
+        model.name = self.name
 
         # Define model: dx/dt = f(x, u)
         model.x = self.dynamics.states
@@ -1258,6 +1678,13 @@ class MPCController(LQRController):
         ocp.solver_options.qp_solver = "PARTIAL_CONDENSING_HPIPM"
         ocp.solver_options.integrator_type = "ERK"
         ocp.solver_options.nlp_solver_type = "SQP"
+
+        # Set up other hyperparameters in SQP solving
+        ocp.solver_options.nlp_solver_max_iter = 100
+        ocp.solver_options.nlp_solver_tol_stat = 1E-6
+        ocp.solver_options.nlp_solver_tol_eq = 1E-6
+        ocp.solver_options.nlp_solver_tol_ineq = 1E-6
+        ocp.solver_options.nlp_solver_tol_comp = 1E-6
 
         # Set up cost function
         ocp.cost.cost_type = "LINEAR_LS"
@@ -1292,21 +1719,29 @@ class MPCController(LQRController):
         ocp.constraints.idxbx = np.arange(self.dim_states)
         ocp.constraints.idxbx_e = np.arange(self.dim_states)
         if self.env.state_lbs is None and self.env.state_ubs is None:
+            ocp.constraints.lbx_0 = np.full(self.dim_states, -1e6)
+            ocp.constraints.ubx_0 = np.full(self.dim_states, 1e6)
             ocp.constraints.lbx = np.full(self.dim_states, -1e6)
             ocp.constraints.ubx = np.full(self.dim_states, 1e6)
             ocp.constraints.lbx_e = np.full(self.dim_states, -1e6)
             ocp.constraints.ubx_e = np.full(self.dim_states, 1e6)
         elif self.env.state_lbs is not None and self.env.state_ubs is None:
+            ocp.constraints.lbx_0 = np.array(self.env.state_lbs)
+            ocp.constraints.ubx_0 = np.full(self.dim_states, 1e6)
             ocp.constraints.lbx = np.array(self.env.state_lbs)
             ocp.constraints.ubx = np.full(self.dim_states, 1e6)
             ocp.constraints.lbx_e = np.array(self.env.state_lbs)
             ocp.constraints.ubx_e = np.full(self.dim_states, 1e6)
         elif self.env.state_lbs is None and self.env.state_ubs is not None:
+            ocp.constraints.lbx_0 = np.full(self.dim_states, -1e6)
+            ocp.constraints.ubx_0 = np.array(self.env.state_ubs)
             ocp.constraints.lbx = np.full(self.dim_states, -1e6)
             ocp.constraints.ubx = np.array(self.env.state_ubs)
             ocp.constraints.lbx_e = np.full(self.dim_states, -1e6)
             ocp.constraints.ubx_e = np.array(self.env.state_ubs)
         else:
+            ocp.constraints.lbx_0 = np.array(self.env.state_lbs)
+            ocp.constraints.ubx_0 = np.array(self.env.state_ubs)
             ocp.constraints.lbx = np.array(self.env.state_lbs)
             ocp.constraints.ubx = np.array(self.env.state_ubs)
             ocp.constraints.lbx_e = np.array(self.env.state_lbs)
@@ -1334,17 +1769,22 @@ class MPCController(LQRController):
             print("MPC setup with Acados completed.")
 
     @check_input_constraints
-    def compute_action(self, current_state: np.ndarray, current_time) -> np.ndarray:
+    def compute_action_external(self, current_state: np.ndarray, current_time) -> np.ndarray:
         """
         Solve the MPC problem and compute the optimal control action.
 
         Args:
         - current_state: The current state of the system.
-        - current_time: The current time (not directly used).
+        - current_time: The current time (not used in this time-invariant case).
 
         Returns:
         - Optimal control action.
         """
+
+        print(f"Current state: {current_state}")
+        print(f"Target state: {self.target_state}")
+
+
         # Update initial state in the solver
         self.solver.set(0, "lbx", current_state)
         self.solver.set(0, "ubx", current_state)
@@ -1358,16 +1798,26 @@ class MPCController(LQRController):
 
         # Solve the MPC problem
         status = self.solver.solve()
-        if status != 0:
-            raise ValueError(f"Acados solver failed with status {status}")
+        #if status != 0:
+        #    raise ValueError(f"Acados solver failed with status {status}")
 
         # Extract the first control action
         u_optimal = self.solver.get(0, "u")
 
+        # Extract the predictions
+        x_pred = np.zeros((self.N + 1, self.dim_states))
+        u_pred = np.zeros((self.N, self.dim_inputs))
+        for i in range(self.N + 1):
+            x_pred[i, :] = self.solver.get(i, "x")
+            if i < self.N:
+                u_pred[i, :] = self.solver.get(i, "u")
+
         if self.verbose:
             print(f"Optimal control action: {u_optimal}")
+            print(f"x_pred: {x_pred}")
+            print(f"u_pred: {u_pred}")
 
-        return u_optimal
+        return u_optimal, x_pred, u_pred
 
 
 # Derived class for RL Controller, solved by General Policy Iteration
@@ -1522,7 +1972,6 @@ class GPIController(BaseController):
 
         plt.tight_layout()
         plt.show()
-
 
 
 # Derived class for RL Controller, solved by Q-Learning
@@ -2030,11 +2479,15 @@ class Simulator:
         self.t_0 = 0
         self.t_terminal = t_terminal
         self.dt = dt
-        self.t_eval = np.linspace(self.t_0, self.t_terminal, int((self.t_terminal - self.t_0) / self.dt))
+        self.t_eval = np.linspace(self.t_0, self.t_terminal, (int((self.t_terminal - self.t_0) / self.dt)+1))
         
         # Initialize recording list for state and input sequence
         self.state_traj = [] # list -> ndarray(2,)
         self.input_traj = [] # list -> scalar
+
+        # Initialize recording list for predicted state and input sequence
+        self.state_pred_traj = [] # list -> ndarray(2,N)
+        self.input_pred_traj = [] # list -> ndarray(N,)
 
         self.cost2go_arr = None
 
@@ -2054,11 +2507,18 @@ class Simulator:
         
         # Initialize state vector
         current_state = self.init_state
+        self.state_traj.append(current_state)
 
-        for current_time in self.t_eval:
+        for current_time in self.t_eval[:-1]:
 
             # Get current state, and call controller to calculate input
-            current_input = self.controller.compute_action(current_state, self.counter)
+            if self.controller.type == 'MPC':
+                current_input, state_pred, input_pred = self.controller.compute_action(current_state, self.counter)
+                # Log the predictions
+                self.state_pred_traj.append(state_pred)
+                self.input_pred_traj.append(input_pred)
+            else:
+                current_input = self.controller.compute_action(current_state, self.counter)
 
             # Do one-step simulation
             current_state = self.dynamics.one_step_forward(current_state, current_input, self.dt)
@@ -2141,9 +2601,14 @@ class Visualizer:
         self.dt = simulator.dt
         self.t_eval = simulator.t_eval
 
+        self.delta_index_pred_display = 2
+
         # Define setting of plots and animation
         self.color = "blue"
         self.color_list = ['red', 'green', 'yellow', 'orange']
+
+        self.shadow_space_wide = 0.2
+
         self.car_length= 0.2
         self.figsize = (8, 4)
         self.refresh_rate = 30
@@ -2152,42 +2617,79 @@ class Visualizer:
 
         fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(20, 4))
 
-        # Plot p over time t
+        # Plot predicted positions
+        if self.simulator.controller.type == 'MPC':
+            for i in range(len(self.simulator.state_pred_traj)):
+                if i%self.delta_index_pred_display == 0:
+                    state_pred_traj_curr = self.simulator.state_pred_traj[i]
+                    t_eval = np.linspace(self.t_eval[i], self.t_eval[i] + self.simulator.dt * (len(state_pred_traj_curr) - 1), len(state_pred_traj_curr))
+                    ax1.plot(t_eval, state_pred_traj_curr[:, 0], label="Predicted Position", linestyle="--", color="orange")
 
+        # Plot p over time t
         ax1.plot(self.t_eval, self.position, label="Position p(t)", color="blue")
 
+        # Plot shadowed zone for state bounds
         if self.env.state_lbs is not None:
-            ax1.fill_between(self.t_eval, ax1.get_ylim()[0], self.env.state_lbs[0], facecolor='gray', alpha=0.3, label=f'pos_lower_bound')
+            ax1.fill_between(self.t_eval, self.env.state_lbs[0]-self.shadow_space_wide, self.env.state_lbs[0], facecolor='gray', alpha=0.3, label=f'pos_lower_bound')
         if self.env.state_ubs is not None:
-            ax1.fill_between(self.t_eval, self.env.state_ubs[0], ax1.get_ylim()[1], facecolor='gray', alpha=0.3, label=f'pos_upper_bound')
-
+            ax1.fill_between(self.t_eval, self.env.state_ubs[0], self.env.state_ubs[0]+self.shadow_space_wide, facecolor='gray', alpha=0.3, label=f'pos_upper_bound')
+        
         ax1.set_xlabel("Time (s)")
         ax1.set_ylabel("Position (m)")
-        ax1.legend()
+        
+        handles, labels = ax1.get_legend_handles_labels()
+        by_label = dict(zip(labels, handles))
+        ax1.legend(by_label.values(), by_label.keys())
+
+
+        # Plot predicted velocities
+        if self.simulator.controller.type == 'MPC':
+            for i in range(len(self.simulator.state_pred_traj)):
+                if i%self.delta_index_pred_display == 0:
+                    state_pred_traj_curr = self.simulator.state_pred_traj[i]
+                    t_eval = np.linspace(self.t_eval[i], self.t_eval[i] + self.simulator.dt * (len(state_pred_traj_curr) - 1), len(state_pred_traj_curr))
+                    ax2.plot(t_eval, state_pred_traj_curr[:, 1], label="Predicted Velocity", linestyle="--", color="orange")
 
         # Plot v over time t
         ax2.plot(self.t_eval, self.velocity, label="Velocity v(t)", color="green")
 
+        # Plot shadowed zone for state bounds
         if self.env.state_lbs is not None:
-            ax2.fill_between(self.t_eval, ax2.get_ylim()[0], self.env.state_lbs[1], facecolor='gray', alpha=0.3, label=f'vel_lower_bound')
+            ax2.fill_between(self.t_eval, self.env.state_lbs[1]-self.shadow_space_wide, self.env.state_lbs[1], facecolor='gray', alpha=0.3, label=f'vel_lower_bound')
         if self.env.state_ubs is not None:
-            ax2.fill_between(self.t_eval, self.env.state_ubs[1], ax2.get_ylim()[1], facecolor='gray', alpha=0.3, label=f'vel_upper_bound')
-            
+            ax2.fill_between(self.t_eval, self.env.state_ubs[1], self.env.state_ubs[1]+self.shadow_space_wide, facecolor='gray', alpha=0.3, label=f'vel_upper_bound')
+    
         ax2.set_xlabel("Time (s)")
         ax2.set_ylabel("Velocity (m/s)")
-        ax2.legend()
+        
+        handles, labels = ax2.get_legend_handles_labels()
+        by_label = dict(zip(labels, handles))
+        ax2.legend(by_label.values(), by_label.keys())
+
+
+        # Plot predicted accelerations
+        if self.simulator.controller.type == 'MPC':
+            for i in range(len(self.simulator.state_pred_traj)):
+                if i%self.delta_index_pred_display == 0:
+                    input_pred_traj_curr = self.simulator.input_pred_traj[i]
+                    t_eval = np.linspace(self.t_eval[i], self.t_eval[i] + self.simulator.dt * (len(input_pred_traj_curr) - 1), len(input_pred_traj_curr))
+                    ax3.plot(t_eval, input_pred_traj_curr, label="Predicted Acceleration", linestyle="--", color="orange")
 
         # Plot a over time t
-        ax3.plot(self.t_eval, self.acceleration, label="Acceleration a(t)", color="red")
+        ax3.plot(self.t_eval[:-1], self.acceleration, label="Acceleration a(t)", color="red")
 
+        # Plot shadowed zone for state bounds
         if self.env.input_lbs is not None:
-            ax3.fill_between(self.t_eval, ax3.get_ylim()[0], self.env.input_lbs, facecolor='gray', alpha=0.3, label=f'acc_lower_bound')
+            ax3.fill_between(self.t_eval, self.env.input_lbs-self.shadow_space_wide, self.env.input_lbs, facecolor='gray', alpha=0.3, label=f'acc_lower_bound')
         if self.env.input_ubs is not None:
-            ax3.fill_between(self.t_eval, self.env.input_ubs, ax3.get_ylim()[1], facecolor='gray', alpha=0.3, label=f'acc_upper_bound')
-
+            ax3.fill_between(self.t_eval, self.env.input_ubs, self.env.input_ubs+self.shadow_space_wide, facecolor='gray', alpha=0.3, label=f'acc_upper_bound')
+        
         ax3.set_xlabel("Time (s)")
         ax3.set_ylabel("Acceleration (m/s^2)")
-        ax3.legend()
+
+        handles, labels = ax3.get_legend_handles_labels()
+        by_label = dict(zip(labels, handles))
+        ax3.legend(by_label.values(), by_label.keys())
 
         plt.tight_layout()
         plt.show()
@@ -2221,24 +2723,28 @@ class Visualizer:
             ax2.plot(self.t_eval, velocity_ref, linestyle="--", label=f"{simulator_ref.controller.name} Velocity", color=self.color_list[color_index])
 
             # Plot acceleration over time
-            ax3.plot(self.t_eval, acceleration_ref, linestyle="--", label=f"{simulator_ref.controller.name} Acceleration", color=self.color_list[color_index])
+            ax3.plot(self.t_eval[:-1], acceleration_ref, linestyle="--", label=f"{simulator_ref.controller.name} Acceleration", color=self.color_list[color_index])
             
             color_index += 1
 
         # Plot current object's trajectories
         ax1.plot(self.t_eval, self.position, label=f"{self.controller.name} Position", color=self.color)
+
+        ax2.plot(self.t_eval, self.velocity, label=f"{self.controller.name} Velocity", color=self.color)
+
+        ax3.plot(self.t_eval[:-1], self.acceleration, label=f"{self.controller.name} Acceleration", color=self.color)
+
+        # Plot shadowed zone for state bounds
         if self.env.state_lbs is not None:
             ax1.fill_between(self.t_eval, ax1.get_ylim()[0], self.env.state_lbs[0], facecolor='gray', alpha=0.3, label=f'pos_lower_bound')
         if self.env.state_ubs is not None:
             ax1.fill_between(self.t_eval, self.env.state_ubs[0], ax1.get_ylim()[1], facecolor='gray', alpha=0.3, label=f'pos_upper_bound')
 
-        ax2.plot(self.t_eval, self.velocity, label=f"{self.controller.name} Velocity", color=self.color)
         if self.env.state_lbs is not None:
             ax2.fill_between(self.t_eval, ax2.get_ylim()[0], self.env.state_lbs[1], facecolor='gray', alpha=0.3, label=f'vel_lower_bound')
         if self.env.state_ubs is not None:
             ax2.fill_between(self.t_eval, self.env.state_ubs[1], ax2.get_ylim()[1], facecolor='gray', alpha=0.3, label=f'vel_upper_bound')
-
-        ax3.plot(self.t_eval, self.acceleration, label=f"{self.controller.name} Acceleration", color=self.color)
+        
         if self.env.input_lbs is not None:
             ax3.fill_between(self.t_eval, ax3.get_ylim()[0], self.env.input_lbs, facecolor='gray', alpha=0.3, label=f'acc_lower_bound')
         if self.env.input_ubs is not None:
@@ -2461,6 +2967,3 @@ class Visualizer:
 # Actions:
 # add a dataclass to set up all internal & public variable in class (https://docs.python.org/3/library/dataclasses.html)
 
-
-# Next steps:
-# finish PID
