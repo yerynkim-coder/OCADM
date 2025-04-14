@@ -1008,6 +1008,7 @@ class ADPController(BaseController):
         plt.tight_layout()
         plt.show()
 
+
 # Implementation of dynamic programming (DP) controller
 # Can only be used for linear system
 # Implementation based on sympy
@@ -1041,6 +1042,9 @@ class DPController(BaseController):
         self.Q = Q
         self.R = R
         self.Qf = Qf
+
+        # Solve input at equilibrium
+        self.u_eq = self.dynamics.get_equilibrium_input(self.init_state)
 
         # Get linearized & discretized A and B matrices
         self.Ad, self.Bd = self.dynamics.get_linearized_AB_discrete(self.init_state, 0, self.dt)
@@ -1215,11 +1219,14 @@ class DPController(BaseController):
     
         mu = float(mu_expr.subs(subs_dict).evalf())
 
+        mu += self.u_eq  # Add equilibrium input
+
         if self.verbose:
             print(f"state: {current_state}, optimal input: {mu}")
 
         return mu
     
+
 # Derived class for LQR Controller with finite horizon
 class FiniteLQRController(BaseController):
     def __init__(
@@ -1335,8 +1342,6 @@ class FiniteLQRController(BaseController):
         u = self.u_eq- K_k @ det_x
 
         return u
-
-
 
 
 # Derived class for LQR Controller
