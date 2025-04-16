@@ -1,6 +1,9 @@
 import numpy as np
+import sympy as sp
+import pickle
 import casadi as ca
 import scipy.linalg
+import copy
 from scipy.integrate import solve_ivp
 from scipy.optimize import minimize
 import matplotlib.pyplot as plt
@@ -14,7 +17,6 @@ from scipy.interpolate import interp2d
 
 # Add a tutorial to show how to install acados and set interface to python
 from acados_template import AcadosOcp, AcadosOcpSolver, AcadosModel
-
 
 
 
@@ -60,14 +62,33 @@ class Env:
         if symbolic_h == None:
 
             def symbolic_h(p, case):
+
                 if case == 1:  # zero slope
                     h = 0
+
                 elif case == 2: # constant slope
                     h = (ca.pi * p) / 18
+
                 elif case == 3: # varying slope
-                    h = ca.cos(3 * p)
-                elif case == 4: # varying slope for underactuated case
-                    h = ca.sin(3 * p)
+                    h_center = ca.cos(3 * (p - ca.pi/2))
+                    h_flat_left = 1
+                    h_flat_right = -1
+
+                    condition_left = p <= -ca.pi/6
+                    condition_right = p >= ca.pi/6
+
+                    h = ca.if_else(condition_left, h_flat_left, ca.if_else(condition_right, h_flat_right, h_center))
+
+                elif case == 4: # varying slope (underactated case)
+
+                    condition_left = p <= -ca.pi/2
+                    condition_right = p >= ca.pi/6
+                    
+                    h_center = ca.sin(3 * p)
+                    h_flat = 1
+
+                    h = ca.if_else(condition_left, h_flat, ca.if_else(condition_right, h_flat, h_center))
+                    
                 return h
         
         if symbolic_theta == None:
@@ -93,7 +114,7 @@ class Env:
         else:
             ubs_position = self.target_position+0.2
 
-        self.p_vals_disp = np.linspace(lbs_position, ubs_position, 50)
+        self.p_vals_disp = np.linspace(lbs_position, ubs_position, 200)
 
     def test_env(self) -> None:
         
@@ -110,10 +131,12 @@ class Env:
 
         # h(p)
         ax[0].plot(self.p_vals_disp, h_vals, label="h(p)", color='green')
-        ax[0].scatter([self.initial_position], [initial_h], color="blue", label="Initial position")
-        ax[0].scatter([self.target_position], [target_h], color="orange", label="Target position")
+        ax[0].scatter([self.initial_position], [initial_h], color="blue", label="Start")
+        #ax[0].scatter([self.target_position], [target_h], color="orange", label="Target")
+        ax[0].plot(self.target_position, target_h, marker='x', color='red', markersize=10, markeredgewidth=3, label='Target')
         ax[0].set_xlabel("p")
         ax[0].set_ylabel("h")
+        ax[0].set_ylim(-1.4, 1.4)  
         ax[0].set_title("h(p)")
         ax[0].legend()
 
@@ -141,7 +164,7 @@ class Dynamics:
         # Initialize system dynmaics if not given
         if state_names is None and input_names is None:
             state_names = ["p", "v"]
-            input_names = ["a"]
+            input_names = ["u"]
 
         # Define state and input as CasADi symbolic parameters
         self.states = ca.vertcat(*[ca.SX.sym(name) for name in state_names])
@@ -150,6 +173,8 @@ class Dynamics:
         self.dim_states = self.states.shape[0]
         self.dim_inputs = self.inputs.shape[0]
 
+        self.env = env
+
         # Initialize system dynmaics if not given
         if setup_dynamics is None:
 
@@ -157,30 +182,76 @@ class Dynamics:
 
                 p = ca.SX.sym("p")
                 v = ca.SX.sym("v")
-                a = ca.SX.sym("a")
+                u = ca.SX.sym("u")
                 Gravity = 9.81
 
                 theta = theta_function(p)
-
+        
                 # Expression of dynamics
                 dpdt = v
-                dvdt = a * ca.cos(theta) # - Gravity * ca.sin(theta) * ca.cos(theta)
+                dvdt = u * ca.cos(theta) - Gravity * ca.sin(theta) * ca.cos(theta)
                 
                 state = ca.vertcat(p, v)
-                input = ca.vertcat(a)
+                input = ca.vertcat(u)
                 rhs = ca.vertcat(dpdt, dvdt)
 
                 return ca.Function("dynamics_function", [state, input], [rhs])
         
         # Define system dynamics
-        self.dynamics_function = setup_dynamics(env.theta)
+        self.dynamics_function = setup_dynamics(self.env.theta)
 
-        # Generate symbolic function of linearized Matrix A_lin and B_lin
-        lhs = self.dynamics_function(self.states, self.inputs)
-        A_sym = ca.jacobian(lhs, self.states)  # Partial derivatives of dynamics w.r.t. states
-        B_sym = ca.jacobian(lhs, self.inputs)  # Partial derivatives of dynamics w.r.t. input
-        self.A_func = ca.Function("A_func", [self.states, self.inputs], [A_sym])
-        self.B_func = ca.Function("B_func", [self.states, self.inputs], [B_sym])
+        # Initialize Jacobians
+        self.A_c_func = None
+        self.B_c_func = None
+
+    def linearization(
+        self,
+        current_state: np.ndarray, 
+        current_input: np.ndarray, 
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Compute symbolic Jacobians A(x,u) & B(x,u) and state / input matrix A & B of the system dynamics.
+        """
+
+        f = self.dynamics_function(self.states, self.inputs)
+        A_c_sym = ca.jacobian(f, self.states)
+        B_c_sym = ca.jacobian(f, self.inputs)
+
+        self.A_c_func = ca.Function("A_func", [self.states, self.inputs], [A_c_sym])
+        self.B_c_func = ca.Function("B_func", [self.states, self.inputs], [B_c_sym])
+
+        A_c = np.array(self.A_c_func(current_state, current_input))
+        B_c = np.array(self.B_c_func(current_state, current_input))
+
+        return A_c, B_c
+    
+    def discretization(
+        self,
+        A_c: np.ndarray,
+        B_c: np.ndarray,
+        dt: float
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Discretize continuous-time linear system x_dot = A_c x + B_c u
+        using matrix exponential method (Zero-Order Hold).
+
+        Returns:
+            A_d, B_d: Discrete-time system matrices
+        """
+
+        # Construct augmented matrix
+        aug_matrix = np.zeros((self.dim_states + self.dim_inputs, self.dim_states + self.dim_inputs))
+        aug_matrix[:self.dim_states, :self.dim_states] = A_c
+        aug_matrix[:self.dim_states, self.dim_states:] = B_c
+
+        # Compute matrix exponential
+        exp_matrix = scipy.linalg.expm(aug_matrix * dt)
+
+        # Extract A_d and B_d
+        A_d = exp_matrix[:self.dim_states, :self.dim_states]
+        B_d = exp_matrix[:self.dim_states, self.dim_states:]
+
+        return A_d, B_d
 
     def get_linearized_AB_discrete(
             self, 
@@ -190,55 +261,47 @@ class Dynamics:
         ) -> Tuple[np.ndarray, np.ndarray]:
         '''use current state, and current input to calculate the linearized state transfer matrix A_lin and input matrix B_lin'''
         
-        # Evaluate linearized A and B around set point
-        A_c = np.array(self.A_func(current_state, current_input))
-        B_c = np.array(self.B_func(current_state, current_input))
+        # Linearize the system dynamics
+        A_c, B_c = self.linearization(current_state, current_input)
 
-        '''
-        # Method 1: approximation using forward euler method
-        A_d = A_c * dt + np.eye(self.dim_states)
-        B_d = B_c * dt
-        '''
-
-        # Method 2: using matrix exponential
-        # Construct augmented matrix for continious dynamics
-        aug_matrix = np.zeros((self.dim_states + self.dim_inputs, self.dim_states + self.dim_inputs))
-        aug_matrix[:self.dim_states, :self.dim_states] = A_c
-        aug_matrix[:self.dim_states, self.dim_states:] = B_c
-
-        # Calculate matrix exponential
-        exp_matrix = scipy.linalg.expm(aug_matrix * dt)
-
-        # Extract discrete A and B
-        A_d = exp_matrix[:self.dim_states, :self.dim_states]
-        B_d = exp_matrix[:self.dim_states, self.dim_states:]
+        # Discretize the system dynamics
+        A_d, B_d = self.discretization(A_c, B_c, dt)
         
         # Check controllability of the discretized system
         controllability_matrix = np.hstack([np.linalg.matrix_power(A_d, i) @ B_d for i in range(self.dim_states)])
         rank = np.linalg.matrix_rank(controllability_matrix)
+
         if rank < self.dim_states:
             raise ValueError(f"System (A, B) is not controllable，rank of controllability matrix is {rank}, while the dimension of state space is {self.dim_states}.")
         
         return A_d, B_d
     
-    def compute_equilibrium_input(self, state: np.ndarray) -> float:
+    def get_equilibrium_input(self, state: np.ndarray) -> float:
 
         p, v = state
-
-        a = ca.SX.sym("a")
+        
+        '''
+        u = ca.SX.sym("u")
         state_sym = ca.vertcat(ca.SX.sym("p"), ca.SX.sym("v"))
         
         # Define equilibrium_condition: dv/dt = 0
-        dynamics_output = self.dynamics_function(state_sym, ca.vertcat(a))
+        dynamics_output = self.dynamics_function(state_sym, ca.vertcat(u))
         dvdt = dynamics_output[1] # extract v_dot
 
         # Substitue the value into symbolic variable to get equilibrium equation
         equilibrium_condition = ca.substitute(dvdt, state_sym, ca.vertcat(p, v))
 
-        # Solve equilibrium equation to get a_eq
-        a_eq = ca.solve(equilibrium_condition, a)
+        # Solve equilibrium equation to get u_eq
+        u_eq = ca.solve(equilibrium_condition, u)
+        '''
 
-        return float(a_eq)
+        theta = self.env.theta(p)
+
+        u_eq = 9.81 * np.sin(theta)
+
+        print("u_eq:", u_eq)
+
+        return float(u_eq)
     
     def one_step_forward(self, current_state: np.ndarray, current_input: np.ndarray, dt: float) -> np.ndarray:
 
@@ -262,33 +325,27 @@ class Dynamics:
 
 
 
-class Env_rl(Env):
+class Env_rl_d(Env):
     def __init__(
             self, 
-            case: int, 
-            init_state: np.ndarray, 
-            target_state: np.ndarray,
-            symbolic_h: Callable[[ca.SX, int], ca.SX] = None, 
-            symbolic_theta: Callable[[ca.Function], ca.Function] = None,
+            env: Env, 
             dynamics: Dynamics = None,
-            state_lbs: np.ndarray = None, 
-            state_ubs: np.ndarray = None, 
-            input_lbs: float = None, 
-            input_ubs: float = None,
-            gamma: float = 0.95,
+            num_states: np.array = np.array([20, 20]),
+            num_actions: int = 10,
             dt: float = 0.1
         ) -> None:
+
+        self.env = env
         
-        if symbolic_h != None and symbolic_theta != None:
-            super().__init__(case, init_state, target_state, symbolic_h, symbolic_theta, state_lbs, state_ubs, input_lbs, input_ubs)
-        else:
-            super().__init__(case, init_state, target_state, state_lbs=state_lbs, state_ubs=state_ubs, input_lbs=input_lbs, input_ubs=input_ubs)
+        super().__init__(self.env.case, self.env.init_state, self.env.target_state, 
+                         state_lbs=self.env.state_lbs, state_ubs=self.env.state_ubs, 
+                         input_lbs=self.env.input_lbs, input_ubs=self.env.input_ubs)
 
-        self.num_pos = 20
-        self.num_vel = 20
-        self.num_acc = 5
+        self.num_pos = num_states[0]
+        self.num_vel = num_states[1]
+        self.num_acc = num_actions
 
-        if state_lbs is None or state_ubs is None or input_lbs is None or input_ubs is None:
+        if self.state_lbs is None or self.state_ubs is None or self.input_lbs is None or self.input_ubs is None:
             raise ValueError("Constraints on states and input must been fully specified!")
 
         # Partitions over state space and input space
@@ -313,9 +370,6 @@ class Env_rl(Env):
         self.T = [None] * self.num_actions  # Shape: list (1, num_actions) -> array (num_states, num_states)
         self.R = [None] * self.num_actions  # Shape: list (1, num_actions) -> array (num_states, num_states)
         
-        # Descount rate
-        self.gamma = gamma
-        
         # Build MDP 
         self.build_stochastic_mdp()
 
@@ -329,6 +383,7 @@ class Env_rl(Env):
         
         # Propagate the state
         next_state = self.dynamics.one_step_forward(cur_state, cur_input, self.dt)  
+        next_state_raw = next_state
 
         # Check whether next state is within the state space
         next_pos = max(min(next_state[0], self.pos_ubs), self.pos_lbs)
@@ -336,8 +391,11 @@ class Env_rl(Env):
         next_state = np.array([next_pos, next_vel])
         
         # Get reward
-        if next_state[0] == self.target_position:
+        next_state_index = self.nearest_state_index_lookup(next_state)
+        if np.all(self.state_space[:, next_state_index] == self.env.target_state):
             reward = 10
+        elif np.any(next_state_raw != next_state):
+            reward = -1
         else:
             reward = -1
         
@@ -367,8 +425,13 @@ class Env_rl(Env):
             for action_index in range(self.num_actions):
                 action = self.input_space[action_index]
 
+                print(f"cur_state: {cur_state}")
+                print(f"action: {action}")
+
                 # Propagate forward to get next state and reward
                 next_state, reward = self.one_step_forward(cur_state, action)
+
+                print(f"next_state: {next_state}")
 
                 # Find the two closest discretized values for position and velocity
                 pos_indices = np.argsort(np.abs(unique_pos - next_state[0]))[:2]
@@ -377,9 +440,15 @@ class Env_rl(Env):
                 pos_bounds = [unique_pos[pos_indices[0]], unique_pos[pos_indices[1]]]
                 vel_bounds = [unique_vel[vel_indices[0]], unique_vel[vel_indices[1]]]
 
+                print(f"pos_bounds: {pos_bounds}")
+                print(f"vel_bounds: {vel_bounds}")
+
                 # Normalize next state within bounds
                 x_norm = (next_state[0] - min(pos_bounds)) / (max(pos_bounds) - min(pos_bounds))
                 y_norm = (next_state[1] - min(vel_bounds)) / (max(vel_bounds) - min(vel_bounds))
+
+                print(f"x_norm: {x_norm}")
+                print(f"y_norm: {y_norm}")
 
                 # Calculate bilinear interpolation probabilities
                 probs = [
@@ -411,14 +480,79 @@ class Env_rl(Env):
 
     # plot t for all states
     def plot_t(self):
-        fig, ax = plt.subplots(1, self.num_actions, figsize=(15, 5))
+
+        fig, ax = plt.subplots(2, self.num_actions, figsize=(15, 5))
+
         for i in range(self.num_actions):
-            ax[i].imshow(self.T[i], cmap='hot', interpolation='nearest')
-            ax[i].set_title(f"Action {i}")
-            ax[i].set_xlabel("Next State")
-            ax[i].set_ylabel("Current State")
+            ax[0, i].imshow(self.T[i], cmap='hot', interpolation='nearest')
+            ax[0, i].set_title(f"Action {i}")
+            ax[0, i].set_xlabel("Next State")
+            ax[0, i].set_ylabel("Current State")
+        
+        for i in range(self.num_actions):
+            ax[1, i].imshow(self.R[i], cmap='hot', interpolation='nearest')
+            ax[1, i].set_title(f"Action {i}")
+            ax[1, i].set_xlabel("Next State")
+            ax[1, i].set_ylabel("Current State")
+
         plt.tight_layout()
         plt.show()
+    
+
+
+class Env_rl_c(Env):
+    def __init__(
+            self, 
+            env: Env, 
+            dynamics: Dynamics = None,
+            dt: float = 0.1
+        ) -> None:
+
+        self.env = env
+        
+        super().__init__(self.env.case, self.env.init_state, self.env.target_state, 
+                         state_lbs=self.env.state_lbs, state_ubs=self.env.state_ubs, 
+                         input_lbs=self.env.input_lbs, input_ubs=self.env.input_ubs)
+
+        if self.state_lbs is None or self.state_ubs is None or self.input_lbs is None or self.input_ubs is None:
+            raise ValueError("Constraints on states and input must been fully specified!")
+        
+        # self.pos_lbs, self.pos_ubs
+        # self.vel_lbs, self.vel_ubs
+        # self.input_lbs, self.input_ubs
+        
+        # State propagation
+        self.dynamics = dynamics
+        self.dt = dt
+
+    def one_step_forward(self, cur_state, cur_input):
+        
+        # Propagate the state
+        next_state = self.dynamics.one_step_forward(cur_state, cur_input, self.dt)  
+        next_state_raw = next_state
+
+        # Check whether next state is within the state space
+        next_pos = max(min(next_state[0], self.pos_ubs), self.pos_lbs)
+        next_vel = max(min(next_state[1], self.vel_ubs), self.vel_lbs)
+        next_state = np.array([next_pos, next_vel])
+        
+        # Get reward
+        if np.linalg.norm(next_state[0]-self.env.target_state[0])<5e-2:
+            done = True
+            reward = 10.0
+        elif np.any(next_state_raw != next_state):
+            done = True
+            reward = -5.0
+        else:
+            done = False
+            reward = np.exp( - 1.0 * np.linalg.norm(next_pos-self.env.target_state[0]))
+
+
+        
+        
+        return done, next_state, reward
+
+
 
 
 def is_square(matrix: np.ndarray) -> bool:
@@ -682,8 +816,10 @@ class DPController(BaseController):
         return self.policy[current_time]
 '''
 
-
-class DPController(BaseController):
+# Implementation of approximate dynamic programming (ADP) controller
+# Can only be used for linear system
+# Implementation based on state discretization and interpolation
+class ADPController(BaseController):
     def __init__(
             self,
             env: Env,
@@ -712,7 +848,7 @@ class DPController(BaseController):
             raise ValueError("Constraints on states must been fully specified for Approximate Dynamic Programming!")
         
         # Number of grid points for discretization
-        self.num_x1 = 60
+        self.num_x1 = 40
         self.num_x2 = 40
         
         # Initialize state and input space
@@ -727,11 +863,11 @@ class DPController(BaseController):
 
     def terminal_cost(self, x):
 
-        return x.T @ self.Qf @ x
+        return (x-self.target_state).T @ self.Qf @ (x-self.target_state)
 
     def stage_cost(self, x, u):
 
-        return x.T @ self.Q @ x + self.R * u**2
+        return (x-self.target_state).T @ self.Q @ (x-self.target_state) + self.R * u**2
 
     def recursion_cost(self, u, x):
 
@@ -742,20 +878,41 @@ class DPController(BaseController):
 
         return self.stage_cost(x, u) + J_next
 
+    def state_constraints(self, u, x):
+
+        # Calculate the next state
+        x_next = self.Ad @ x + self.Bd.flatten() * u
+
+        # Extract the position and velocity from current and next state
+        p_curr, v_curr = x[0], x[1]
+        p_next, v_next = x_next[0], x_next[1]
+
+        # Define constraints on current and next state
+        return [
+            p_curr - self.env.state_lbs[0],  # p_curr >= state_lbs[0]
+            self.env.state_ubs[0] - p_curr,  # p_curr <= state_ubs[0]
+            v_curr - self.env.state_lbs[1],  # v_curr >= state_lbs[1]
+            self.env.state_ubs[1] - v_curr,   # v_curr <= state_ubs[1]
+            p_next - self.env.state_lbs[0],  # p_next >= state_lbs[0]
+            self.env.state_ubs[0] - p_next,  # p_next <= state_ubs[0]
+            v_next - self.env.state_lbs[1],  # v_next >= state_lbs[1]
+            self.env.state_ubs[1] - v_next   # v_next <= state_ubs[1]
+        ]
+
     def setup(self) -> None:
         
         # Generate grid mesh for state space
-        self.X1 = np.linspace(self.env.state_lbs[0]-self.target_state[0], self.env.state_ubs[0]-self.target_state[0], self.num_x1)
-        self.X2 = np.linspace(self.env.state_lbs[1]-self.target_state[1], self.env.state_ubs[1]-self.target_state[1], self.num_x2)
+        self.X1 = np.linspace(self.env.state_lbs[0], self.env.state_ubs[0], self.num_x1)
+        self.X2 = np.linspace(self.env.state_lbs[1], self.env.state_ubs[1], self.num_x2)
         
         # Initialize policy and cost-to-go function, and generate interpolation over grid mesh
         self.U = np.zeros((self.num_x1, self.num_x2))
-        self.U_func = interp2d(self.X1, self.X2, self.U.T, kind='linear')
+        self.U_func = interp2d(self.X1, self.X2, self.U.T, kind='cubic')
         self.J = np.zeros((self.num_x1, self.num_x2))
         for i in range(self.num_x1): # Initialize cost matirx with terminal cost
             for j in range(self.num_x2):
                 self.J[i, j] = self.terminal_cost(np.array([self.X1[i], self.X2[j]]))
-        self.J_func = interp2d(self.X1, self.X2, self.J.T, kind='linear')
+        self.J_func = interp2d(self.X1, self.X2, self.J.T, kind='cubic')
         
         # Iterate over time steps from backward to forward
         for n in range(self.N, 0, -1):
@@ -773,7 +930,12 @@ class DPController(BaseController):
                         x0=0,
                         args=(x_current, ),
                         bounds=[(self.env.input_lbs, self.env.input_ubs)],
-                        method='SLSQP'
+                        method='SLSQP',
+                        constraints={
+                            'type': 'ineq',
+                            'fun': self.state_constraints,
+                            'args': (x_current,)
+                        }
                     )
                     
                     # Extract optimal policy and cost-to-go 
@@ -788,8 +950,8 @@ class DPController(BaseController):
             self.J = J_temp
 
             # Re-interpolation over grid mesh
-            self.J_func = interp2d(self.X1, self.X2, self.J.T, kind='linear')
-            self.U_func = interp2d(self.X1, self.X2, self.U.T, kind='linear')
+            self.J_func = interp2d(self.X1, self.X2, self.J.T, kind='cubic')
+            self.U_func = interp2d(self.X1, self.X2, self.U.T, kind='cubic')
         
         if self.verbose:
             print(f"Dynamic Programming policy with input constraints computed.")
@@ -802,10 +964,16 @@ class DPController(BaseController):
         if np.all(self.U == 0):
             raise ValueError("DP Policy is not computed. Call setup() first.")
         
-        det_x = current_state - self.target_state
+        # Method 1: use linear interpolation to find the value of U at the current state
+        miu = self.U_func(current_state[0], current_state[1]) # interpolation error will degrade the performance
+
+        # Method 2: find the NN for state in grid, and use the related U as input
+        #nearest_x1_index = np.argmin(np.abs(self.X1 - current_state[0]))
+        #nearest_x2_index = np.argmin(np.abs(self.X2 - current_state[1]))
+        #miu = self.U[nearest_x1_index, nearest_x2_index]
         
-        # Use linear interpolation to find the value of U at the current state
-        miu = self.U_func(det_x[0], det_x[1])
+        #if self.verbose:
+        print(f"state: {current_state}, input: {miu}")
 
         return miu
 
@@ -842,6 +1010,341 @@ class DPController(BaseController):
         plt.show()
 
 
+# Implementation of dynamic programming (DP) controller
+# Can only be used for linear system
+# Implementation based on sympy
+class DPController(BaseController):
+    def __init__(
+            self,
+            env: Env,
+            dynamics: Dynamics,
+            Q: np.ndarray,
+            R: np.ndarray,
+            Qf: np.ndarray, 
+            freq: float,
+            Horizon: int,
+            name: str = 'DP',
+            type: str = 'DP', 
+            verbose: bool = False,
+            bangbang: bool = False,
+            symbolic_weight: bool = False
+        ) -> None:
+
+        """
+        DP solver for linear system:
+            x_{k+1} = A x_k + B u_k
+            cost = sum u_k^T R u_k + terminal cost
+        """
+
+        super().__init__(env, dynamics, freq, name, verbose)
+
+        self.N = Horizon
+
+        self.Q = Q
+        self.R = R
+        self.Qf = Qf
+
+        # Solve input at equilibrium
+        self.u_eq = self.dynamics.get_equilibrium_input(self.init_state)
+
+        # Get linearized & discretized A and B matrices
+        self.Ad, self.Bd = self.dynamics.get_linearized_AB_discrete(self.init_state, 0, self.dt)
+        # siqi's case:
+        #self.Ad = sp.Matrix([[1, 0], [0, 0]])
+        #self.Bd = sp.Matrix([[1], [0]])
+        # mountain car case:
+        #self.Ad = sp.Matrix([[1, 1], [0, 1]])
+        #self.Bd = sp.Matrix([[0], [1]])
+
+        self.bangbang = bangbang # True or False
+        self.symbolic_weight = symbolic_weight # True or False
+
+        # Define symbolic variables
+        self.x_sym = None
+        self.u_sym = None
+        self.Q_sym = None
+        self.R_sym = None
+        self.Qf_sym = None
+        self.x_ref_sym = None
+
+        # Store results
+        self.J_sym = [None] * (self.N + 1)
+        self.mu_sym = [None] * self.N
+    
+        self.setup()
+
+    def setup(self) -> None:
+
+        # Create symbolic states and inputs
+        self.x_sym = [sp.Matrix(sp.symbols(f'p_{k} v_{k}')) for k in range(self.N + 1)]
+        self.u_sym = [sp.Symbol(f'u_{k}') for k in range(self.N)]
+        # Create symbolic weight matrices
+        if self.symbolic_weight:
+            q1, q2 = sp.symbols('q_p q_v')
+            self.Q_sym = sp.diag(q1, q2)
+            self.R_sym = sp.Symbol('r')
+            self.Qf_sym = sp.diag(q1, q2)
+        else:
+            self.Q_sym = sp.Matrix(self.Q)
+            self.R_sym = sp.Float(self.R)
+            self.Qf_sym = sp.Matrix(self.Qf)
+        # Create symbolic reference state
+        p_ref, v_ref = sp.symbols('p_ref v_ref')
+        x_ref = [p_ref, v_ref]
+        self.x_ref_sym = sp.Matrix(x_ref) 
+
+        # Make a copy
+        J, mu = self.J_sym, self.mu_sym
+
+        # Terminal cost: J_N = (x_N - x_ref)^T Qf (x_N - x_ref)
+        err_N = self.x_sym[self.N] - self.x_ref_sym
+        J[self.N] = (err_N.T * self.Qf_sym * err_N)[0, 0]
+
+        for k in reversed(range(self.N)):
+
+            # x_{k+1} = A x_k + B u_k
+            x_next = self.Ad * self.x_sym[k] + self.Bd * self.u_sym[k]
+
+            # Cost at step k: u_k^T R u_k + J_{k+1}(x_{k+1})
+            stage_cost = self.R_sym * self.u_sym[k]**2
+            J_kplus1_sub = J[k + 1].subs({self.x_sym[k + 1][i]: x_next[i] for i in range(2)})
+
+            total_cost = stage_cost + J_kplus1_sub
+
+            # Compute the optimal control input and cost-to-go
+            if self.bangbang: # bangbang input (MIP)
+                mu_k, J_k = self.solve_bangbang(total_cost, k)
+            else: # continious input (NLP)
+                mu_k, J_k = self.solve_continuous(total_cost, k)
+            
+            # Store the symbolic expressions
+            mu[k] = mu_k
+            J[k] = J_k
+        
+        # Log the symbolic expressions back
+        self.J_sym = J
+        self.mu_sym = mu
+
+        if self.verbose:
+            print(f"Dynamic Programming policy with input constraints computed.")
+            self.print_solution()
+
+    def solve_continuous(self, total_cost, k):
+
+        # Derivative w.r.t u_k
+        dJ_du = sp.diff(total_cost, self.u_sym[k])
+        u_star = sp.solve(dJ_du, self.u_sym[k])[0]
+        mu_k = sp.simplify(u_star)
+
+        # Plug u_k* back into cost to get J_k
+        cost_k_opt = total_cost.subs(self.u_sym[k], u_star)
+        J_k = sp.simplify(cost_k_opt)
+
+        return mu_k, J_k
+    
+    def solve_bangbang(self, total_cost, k):
+
+        # Evaluate cost for u_k = -1 and u_k = 1
+        cost_minus1 = sp.simplify(total_cost.subs(self.u_sym[k], -1))
+        cost_plus1  = sp.simplify(total_cost.subs(self.u_sym[k], 1))
+
+        # Try subtracting to simplify the condition
+        delta_cost = sp.simplify(cost_plus1 - cost_minus1)
+
+        # Store optimal control policy as piecewise
+        mu_k = sp.Piecewise(
+            (-1, delta_cost > 0),
+            (1,  True)  # fallback
+        )
+        # OR mu_k = sp.simplify(mu_k)
+        # OR mu_k = sp.piecewise_fold(mu_k)
+
+        # Store cost-to-go as piecewise
+        J_k = sp.Piecewise(
+            (cost_minus1, delta_cost > 0),
+            (cost_plus1,  True)
+        )
+        # OR J_k = sp.simplify(J_k)
+        # OR J_k = sp.piecewise_fold(J_k)
+
+        return mu_k, J_k
+
+    def print_solution(self):
+        for k, uk in enumerate(self.mu_sym):
+            print(f"u_{k}*(x_{k}) =", uk)
+        #print("\nJ_0(x_0) =")
+        #sp.pprint(self.J_sym[0])
+
+    def save_policy(self, filename='dp_policy.pkl'):
+        with open(filename, 'wb') as f:
+            pickle.dump({
+                'mu_sym': self.mu_sym,
+                'J_sym': self.J_sym,
+            }, f)
+
+    def load_policy(self, filename='dp_policy.pkl'):
+        with open(filename, 'rb') as f:
+            data = pickle.load(f)
+            self.mu_sym = data['mu_sym']
+            self.J_sym = data['J_sym']
+
+    @check_input_constraints
+    def compute_action(self, current_state: np.ndarray, current_step: int) -> np.ndarray:
+
+        if any(mu is None for mu in self.mu_sym):
+            raise ValueError("DP Policy is not computed yet. Call setup() first.")
+        
+        if current_step >= self.N:
+            raise ValueError(f"current_step = {current_step} exceeds or equals horizon N = {self.N}")
+        
+        mu_expr = self.mu_sym[current_step]
+
+        # Substitute current state into the symbolic expression
+        if self.symbolic_weight:
+            subs_dict = {
+                sp.Symbol(f'p_{current_step}'): current_state[0],
+                sp.Symbol(f'v_{current_step}'): current_state[1],
+                sp.Symbol('q_p'): self.Q[0, 0],
+                sp.Symbol('q_v'): self.Q[1, 1],
+                sp.Symbol('r'): self.R[0, 0],
+                sp.Symbol('p_ref'): self.target_state[0], 
+                sp.Symbol('v_ref'): self.target_state[1]
+            }
+        else:
+            subs_dict = {
+                sp.Symbol(f'p_{current_step}'): current_state[0],
+                sp.Symbol(f'v_{current_step}'): current_state[1],
+                sp.Symbol('p_ref'): self.target_state[0], 
+                sp.Symbol('v_ref'): self.target_state[1]
+            }
+    
+        mu = float(mu_expr.subs(subs_dict).evalf())
+
+        mu += self.u_eq  # Add equilibrium input
+
+        if self.verbose:
+            print(f"state: {current_state}, optimal input: {mu}")
+
+        return mu
+    
+
+# Derived class for LQR Controller with finite horizon
+class FiniteLQRController(BaseController):
+    def __init__(
+            self, 
+            env: Env, 
+            dynamics: Dynamics, 
+            Q: np.ndarray, 
+            R: np.ndarray, 
+            freq: float, 
+            horizon: int,
+            name: str = 'LQR_finite', 
+            type: str = 'LQR_finite', 
+            verbose: bool = False
+        ) -> None:
+
+        super().__init__(env, dynamics, freq, name, type, verbose)
+        
+        # Initialize as private property
+        self._Q = None
+        self._R = None
+
+        self.N = horizon
+
+        self.K_list = [None] * self.N  # LQR gain matrix
+        
+        # Call setter for the check and update the value of private property
+        self.Q = Q
+        self.R = R
+
+        self.A = None  # State transfer matrix
+        self.B = None  # Input matrix
+
+        self.x_eq = None  # Equilibrium state
+        self.u_eq = None  # Equilibrium input
+        
+        self.setup()
+
+    @property
+    def Q(self) -> np.ndarray:
+        return self._Q
+
+    @Q.setter
+    def Q(self, value: np.ndarray) -> None:
+
+        is_square(value)
+        is_symmetric(value)
+        is_positive_semi_definite(value)
+
+        if self.verbose:
+            print("Check passed, Q is a symmetric, positive semi-definite matrix.")
+
+        self._Q = value
+
+    @property
+    def R(self) -> np.ndarray:
+        return self._R
+
+    @R.setter
+    def R(self, value: np.ndarray) -> None:
+
+        is_square(value)
+        is_symmetric(value)
+        is_positive_definite(value)
+
+        if self.verbose:
+            print("Check passed, R is a symmetric, positive definite matrix.")
+        
+        self._R = value
+    
+    def setup(self) -> None:
+        
+        # Set up equilibrium state
+        # Note that if target state is not on the slope, self.u_eq = 0 -> will not work for the nonlinear case
+        self.x_eq = self.target_state
+
+        # Solve input at equilibrium
+        self.u_eq = self.dynamics.get_equilibrium_input(self.x_eq)
+
+        # Linearize dynamics at equilibrium
+        self.A, self.B = self.dynamics.get_linearized_AB_discrete(
+            current_state=self.x_eq, current_input=self.u_eq, dt=self.dt
+        )
+
+        # Initialize terminal cost
+        P = self.Q.copy()
+
+        # Solve Bellman Recursion from backwardsto compute gain matrix
+        for k in reversed(range(self.N)):
+            K = np.linalg.inv(self.R + self.B.T @ P @ self.B) @ (self.B.T @ P @ self.A)
+            self.K_list[k] = K
+            P = self.Q + self.A.T @ P @ self.A - self.A.T @ P @ self.B @ K
+
+        if self.verbose:
+            print(f"LQR Gain Matrix K: {self.K}")
+
+    @check_input_constraints
+    def compute_action(self, current_state: np.ndarray, current_time: int) -> np.ndarray:
+        if any(k is None for k in self.K_list):
+            raise ValueError("LQR gain matrix K is not computed. Call setup() first.")
+        
+        k = current_time  # assume current_time in [0, N-1]
+
+        if k >= self.N:
+            k = self.N - 1  # use terminal gain if past horizon
+
+        # Compute state error
+        det_x = current_state - self.target_state
+
+        # Get the corresponding gain matrix for the current time step
+        K_k = self.K_list[k]
+
+        # Apply control law
+        u = self.u_eq- K_k @ det_x
+
+        return u
+
+
 # Derived class for LQR Controller
 class LQRController(BaseController):
     def __init__(
@@ -853,7 +1356,7 @@ class LQRController(BaseController):
             freq: float, 
             name: str = 'LQR', 
             type: str = 'LQR', 
-            verbose: bool = True
+            verbose: bool = False
         ) -> None:
 
         super().__init__(env, dynamics, freq, name, type, verbose)
@@ -869,6 +1372,9 @@ class LQRController(BaseController):
 
         self.A = None  # State transfer matrix
         self.B = None  # Input matrix
+
+        self.x_eq = None  # Equilibrium state
+        self.u_eq = None  # Equilibrium input
         
         # need no external objects for setup, can directly call the setup function here
         if self.type in ['LQR', 'MPC']:
@@ -914,18 +1420,27 @@ class LQRController(BaseController):
     def K(self, value: np.ndarray) -> None:
 
         eigvals = np.linalg.eigvals(self.A - self.B @ value)
+
         if np.any(np.abs(eigvals) > 1):
             raise ValueError("Warning: not all eigenvalue of A_cl inside unit circle, close-loop system is unstable!")
+        
         elif self.verbose:
             print(f"Check passed, current gain K={value}, close-loop system is stable.")
+
         self._K = value
 
     def setup(self) -> None:
+        
+        # Set up equilibrium state
+        # Note that if target state is not on the slope, self.u_eq = 0 -> will not work for the nonlinear case
+        self.x_eq = self.target_state
+
+        # Solve input at equilibrium
+        self.u_eq = self.dynamics.get_equilibrium_input(self.x_eq)
+
         # Linearize dynamics at equilibrium
-        state_eq = np.zeros(self.dim_states)
-        input_eq = np.zeros(self.dim_inputs)
         self.A, self.B = self.dynamics.get_linearized_AB_discrete(
-            current_state=state_eq, current_input=input_eq, dt=self.dt
+            current_state=self.x_eq, current_input=self.u_eq, dt=self.dt
         )
 
         # Solve DARE to compute gain matrix
@@ -944,7 +1459,7 @@ class LQRController(BaseController):
         det_x = current_state - self.target_state
 
         # Apply control law
-        u = -self.K @ det_x
+        u = self.u_eq- self.K @ det_x
         return u
 
 
@@ -960,8 +1475,8 @@ class iLQRController(LQRController):
             freq: float, 
             name: str = 'iLQR', 
             type: str = 'iLQR', 
-            max_iter: int = 30, 
-            tol: float = 2e-2, 
+            max_iter: int = 100, 
+            tol: float = 1e-1, 
             verbose: bool = True
         ) -> None:
 
@@ -979,7 +1494,15 @@ class iLQRController(LQRController):
         """
         Perform iLQR to compute the optimal control sequence.
         """
+
+        # Set up equilibrium state
+        # Note that if target state is not on the slope, self.u_eq = 0 -> will not work for the nonlinear case
+        self.x_eq = self.target_state
+
+        # Solve input at equilibrium
+        self.u_eq = self.dynamics.get_equilibrium_input(self.x_eq)
         
+        # Start iLQR
         N = len(input_traj)
 
         # Initialize state and control trajectories
@@ -1091,11 +1614,12 @@ class iLQRController(LQRController):
             x_traj = new_x_traj
 
     @check_input_constraints
-    def compute_action(self, current_state: np.ndarray, current_time: int) -> np.ndarray:
+    def compute_action(self, current_state: np.ndarray, current_step: int) -> np.ndarray:
         if self.K_k_arr is None or self.u_kff_arr is None:
             raise ValueError("iLQR parameters are not computed. Call setup() first.")
 
-        u = self.u_kff_arr[current_time] + self.K_k_arr[:, current_time].T @ current_state
+        u = self.u_kff_arr[current_step] + self.K_k_arr[:, current_step].T @ current_state
+
         return u
 
 
@@ -1144,7 +1668,7 @@ class MPCController(LQRController):
         """
         # Initialize Acados model
         model = AcadosModel()
-        model.name = "mpc_controller"
+        model.name = self.name
 
         # Define model: dx/dt = f(x, u)
         model.x = self.dynamics.states
@@ -1160,6 +1684,13 @@ class MPCController(LQRController):
         ocp.solver_options.qp_solver = "PARTIAL_CONDENSING_HPIPM"
         ocp.solver_options.integrator_type = "ERK"
         ocp.solver_options.nlp_solver_type = "SQP"
+
+        # Set up other hyperparameters in SQP solving
+        ocp.solver_options.nlp_solver_max_iter = 100
+        ocp.solver_options.nlp_solver_tol_stat = 1E-6
+        ocp.solver_options.nlp_solver_tol_eq = 1E-6
+        ocp.solver_options.nlp_solver_tol_ineq = 1E-6
+        ocp.solver_options.nlp_solver_tol_comp = 1E-6
 
         # Set up cost function
         ocp.cost.cost_type = "LINEAR_LS"
@@ -1194,21 +1725,29 @@ class MPCController(LQRController):
         ocp.constraints.idxbx = np.arange(self.dim_states)
         ocp.constraints.idxbx_e = np.arange(self.dim_states)
         if self.env.state_lbs is None and self.env.state_ubs is None:
+            ocp.constraints.lbx_0 = np.full(self.dim_states, -1e6)
+            ocp.constraints.ubx_0 = np.full(self.dim_states, 1e6)
             ocp.constraints.lbx = np.full(self.dim_states, -1e6)
             ocp.constraints.ubx = np.full(self.dim_states, 1e6)
             ocp.constraints.lbx_e = np.full(self.dim_states, -1e6)
             ocp.constraints.ubx_e = np.full(self.dim_states, 1e6)
         elif self.env.state_lbs is not None and self.env.state_ubs is None:
+            ocp.constraints.lbx_0 = np.array(self.env.state_lbs)
+            ocp.constraints.ubx_0 = np.full(self.dim_states, 1e6)
             ocp.constraints.lbx = np.array(self.env.state_lbs)
             ocp.constraints.ubx = np.full(self.dim_states, 1e6)
             ocp.constraints.lbx_e = np.array(self.env.state_lbs)
             ocp.constraints.ubx_e = np.full(self.dim_states, 1e6)
         elif self.env.state_lbs is None and self.env.state_ubs is not None:
+            ocp.constraints.lbx_0 = np.full(self.dim_states, -1e6)
+            ocp.constraints.ubx_0 = np.array(self.env.state_ubs)
             ocp.constraints.lbx = np.full(self.dim_states, -1e6)
             ocp.constraints.ubx = np.array(self.env.state_ubs)
             ocp.constraints.lbx_e = np.full(self.dim_states, -1e6)
             ocp.constraints.ubx_e = np.array(self.env.state_ubs)
         else:
+            ocp.constraints.lbx_0 = np.array(self.env.state_lbs)
+            ocp.constraints.ubx_0 = np.array(self.env.state_ubs)
             ocp.constraints.lbx = np.array(self.env.state_lbs)
             ocp.constraints.ubx = np.array(self.env.state_ubs)
             ocp.constraints.lbx_e = np.array(self.env.state_lbs)
@@ -1236,17 +1775,22 @@ class MPCController(LQRController):
             print("MPC setup with Acados completed.")
 
     @check_input_constraints
-    def compute_action(self, current_state: np.ndarray, current_time) -> np.ndarray:
+    def compute_action_external(self, current_state: np.ndarray, current_time) -> np.ndarray:
         """
         Solve the MPC problem and compute the optimal control action.
 
         Args:
         - current_state: The current state of the system.
-        - current_time: The current time (not directly used).
+        - current_time: The current time (not used in this time-invariant case).
 
         Returns:
         - Optimal control action.
         """
+
+        print(f"Current state: {current_state}")
+        print(f"Target state: {self.target_state}")
+
+
         # Update initial state in the solver
         self.solver.set(0, "lbx", current_state)
         self.solver.set(0, "ubx", current_state)
@@ -1260,39 +1804,54 @@ class MPCController(LQRController):
 
         # Solve the MPC problem
         status = self.solver.solve()
-        if status != 0:
-            raise ValueError(f"Acados solver failed with status {status}")
+        #if status != 0:
+        #    raise ValueError(f"Acados solver failed with status {status}")
 
         # Extract the first control action
         u_optimal = self.solver.get(0, "u")
 
+        # Extract the predictions
+        x_pred = np.zeros((self.N + 1, self.dim_states))
+        u_pred = np.zeros((self.N, self.dim_inputs))
+        for i in range(self.N + 1):
+            x_pred[i, :] = self.solver.get(i, "x")
+            if i < self.N:
+                u_pred[i, :] = self.solver.get(i, "u")
+
         if self.verbose:
             print(f"Optimal control action: {u_optimal}")
+            print(f"x_pred: {x_pred}")
+            print(f"u_pred: {u_pred}")
 
-        return u_optimal
+        return u_optimal, x_pred, u_pred
 
 
+# Derived class for RL Controller, solved by General Policy Iteration
 class GPIController(BaseController):
     def __init__(self, 
-                 mdp: Env_rl, 
+                 mdp: Env_rl_d, 
                  freq: float, 
-                 precision_pi: float = 1e-6,
+                 gamma: float = 0.95,
                  precision_pe: float = 1e-6,
-                 max_ite_pi: int = 1000,
-                 max_ite_pe: int = 1000,
+                 precision_pi: float = 1e-6,
+                 max_ite_pe: int = 50,
+                 max_ite_pi: int = 100,
                  name: str = 'GPI', 
                  type: str = 'GPI', 
-                 verbose: bool = False
+                 verbose: bool = True
                  ) -> None:
         
         super().__init__(mdp, mdp.dynamics, freq, name, type, verbose)
-
-        self.precision_pi = precision_pi
+        
+        # VI: max_ite_pi = 1, max_ite_pe > 500, precision_pi not needed, reasonable precision_pe (1e-6)
+        # PI: max_ite_pi > 50, max_ite_pe > 100, reasonable precision_pi (1e-6), precision_pe not needed
         self.precision_pe = precision_pe
-        self.max_ite_pi = max_ite_pi
+        self.precision_pi = precision_pi
         self.max_ite_pe = max_ite_pe
+        self.max_ite_pi = max_ite_pi
 
         self.mdp = mdp
+        self.gamma = gamma
 
         self.dim_states = self.mdp.num_states
         self.dim_inputs = self.mdp.num_actions
@@ -1306,33 +1865,46 @@ class GPIController(BaseController):
     
     def setup(self) -> None:
         """Perform GPI to compute the optimal policy."""
+
+        new_value_function = np.zeros_like(self.value_function)
+
         for pi_iteration in range(self.max_ite_pi):
+
             # Policy Evaluation
             for pe_iteration in range(self.max_ite_pe):
+
+                self.value_function = copy.copy(new_value_function)
 
                 new_value_function = np.zeros_like(self.value_function)
                 
                 for state_index in range(self.dim_states):
-                    for action_index in range(self.dim_inputs):
 
-                        if self.policy[state_index] == action_index:
-                            for next_state_index in range(self.dim_states):
+                    action_index = self.policy[state_index]
 
-                                new_value_function[state_index] += self.mdp.T[action_index][state_index, next_state_index] * (
-                                    self.mdp.R[action_index][state_index, next_state_index] + self.mdp.gamma * self.value_function[next_state_index]
-                                )
+                    for next_state_index in range(self.dim_states):
+
+                        new_value_function[state_index] += self.mdp.T[action_index][state_index, next_state_index] * (
+                            self.mdp.R[action_index][state_index, next_state_index] + self.gamma * self.value_function[next_state_index]
+                        )
+
+                print(f"self.value_function: {self.value_function}")
+                print(f"new_value_function: {new_value_function}")
 
                 # Check for convergence in policy evaluation
                 if np.max(np.abs(new_value_function - self.value_function)) < self.precision_pe:
+                    if self.verbose:
+                        print(f"Policy evaluation converged after {pe_iteration + 1} iterations, max error: {np.max(np.abs(new_value_function - self.value_function))}.")
                     break
-
-                self.value_function = new_value_function
-
+                elif self.verbose:
+                    print(f"Policy evaluation iteration {pe_iteration + 1}, max error: {np.max(np.abs(new_value_function - self.value_function))}")
+            
+            self.value_function = copy.copy(new_value_function)
+            
             # Policy Improvement
             policy_stable = True
+            old_policy = copy.copy(self.policy)
             for state_index in range(self.dim_states):
                 
-                old_action = self.policy[state_index]
                 q_values = np.zeros(self.dim_inputs)
 
                 # Compute Q-values for all actions
@@ -1340,21 +1912,26 @@ class GPIController(BaseController):
                     for next_state_index in range(self.dim_states):
 
                         q_values[action_index] += self.mdp.T[action_index][state_index, next_state_index] * (
-                            self.mdp.R[action_index][state_index, next_state_index] + self.mdp.gamma * self.value_function[next_state_index]
+                            self.mdp.R[action_index][state_index, next_state_index] + self.gamma * self.value_function[next_state_index]
                         )
 
                 # Update policy greedily
                 self.policy[state_index] = np.argmax(q_values)
 
                 # Check for convergence in policy improvement
-                if old_action != self.policy[state_index]:
+                if old_policy[state_index] != self.policy[state_index]:
                     policy_stable = False
 
             # Check for convergence in policy improvement
-            if policy_stable:
+            if policy_stable and np.max(np.abs(new_value_function - self.value_function)) < self.precision_pi:
                 if self.verbose:
                     print(f"Policy converged after {pi_iteration + 1} iterations.")
+                    print(f"Optimal Policy: {self.policy}")
                 break
+            elif self.verbose:
+                print(f"Policy improvement iteration {pi_iteration + 1}, still not converged, keep running.")
+                print(f"Last Policy: {old_policy}")
+                print(f"Current Policy: {self.policy}")
 
     @check_input_constraints
     def compute_action(self, current_state: np.ndarray, current_time) -> np.ndarray:
@@ -1370,52 +1947,510 @@ class GPIController(BaseController):
 
         return np.array([action])
 
-    def plot_policy_map(self):
+    def plot_heatmaps(self):
         """
-        Visualize the policy as a 2D state-value map.
+        Visualize the policy and cost as a 2D state-value map.
         """
-        state_space = self.mdp.state_space  # Assumed to be a 2D grid of states
-        value_map = self.value_function.reshape(state_space.shape[0], state_space.shape[1])
+        value_map = self.value_function.reshape(self.mdp.num_pos, self.mdp.num_vel)
+        policy_map = self.policy.reshape(self.mdp.num_pos, self.mdp.num_vel)
 
-        plt.figure(figsize=(8, 6))
-        plt.imshow(value_map, cmap="viridis", origin="lower", extent=[
-            self.mdp.state_space_bounds[0][0], self.mdp.state_space_bounds[0][1],
-            self.mdp.state_space_bounds[1][0], self.mdp.state_space_bounds[1][1]
-        ])
-        plt.colorbar(label="State Value")
-        plt.xlabel("Car Position")
-        plt.ylabel("Car Velocity")
-        plt.title("State Value: Generalized Policy Iteration")
-        plt.show()
-
-    def plot_policy_and_cost(self):
-        """
-        Generates a plot with two subplots showing the policy (U) and cost-to-go (J)
-        defined on a given grid space.
-        """
         fig, axs = plt.subplots(1, 2, figsize=(12, 4))
 
         # Plot policy (U)
-        im1 = axs[0].imshow(self.U, extent=[self.X1[0], self.X1[-1], self.X2[0], self.X2[-1]], origin='lower', aspect='auto', cmap='viridis')
-        axs[0].set_title('Policy (U)')
+        im1 = axs[0].imshow(policy_map, extent=[
+            self.mdp.pos_partitions[0], self.mdp.pos_partitions[-1],
+            self.mdp.vel_partitions[0], self.mdp.vel_partitions[-1]
+        ], origin='lower', aspect='auto', cmap='viridis')
+        axs[0].set_title('Optimal Policy')
         axs[0].set_xlabel('Car Position')
         axs[0].set_ylabel('Car Velocity')
         fig.colorbar(im1, ax=axs[0], orientation='vertical')
 
-        #axs[0].set_xticks(self.X1[::grid_interval], minor=False)
-        #axs[0].set_yticks(self.X2[::grid_interval], minor=False)
-        #axs[0].grid(color='black', linestyle='--', linewidth=0.5, alpha=0.7)
-
         # Plot cost-to-go (J)
-        im2 = axs[1].imshow(self.J, extent=[self.X1[0], self.X1[-1], self.X2[0], self.X2[-1]], origin='lower', aspect='auto', cmap='viridis')
-        axs[1].set_title('Cost-to-Go (J)')
+        im2 = axs[1].imshow(value_map, extent=[
+            self.mdp.pos_partitions[0], self.mdp.pos_partitions[-1],
+            self.mdp.vel_partitions[0], self.mdp.vel_partitions[-1]
+        ], origin='lower', aspect='auto', cmap='viridis')
+        axs[1].set_title('Optimal Cost')
         axs[1].set_xlabel('Car Position')
         axs[1].set_ylabel('Car Velocity')
         fig.colorbar(im2, ax=axs[1], orientation='vertical')
 
-        #axs[1].set_xticks(self.X1[::grid_interval], minor=False)
-        #axs[1].set_yticks(self.X2[::grid_interval], minor=False)
-        #axs[1].grid(color='black', linestyle='--', linewidth=0.5, alpha=0.7)
+        plt.tight_layout()
+        plt.show()
+
+
+# Derived class for RL Controller, solved by Q-Learning
+class QLearningController(BaseController):
+    def __init__(self, 
+                 mdp: Env_rl_d, 
+                 freq: float, 
+                 epsilon: float = 0.3, 
+                 k_epsilon: float = 0.99, 
+                 epsilon_min: float = 0.01,
+                 learning_rate: float = 0.2, 
+                 gamma: float = 0.95,
+                 max_iterations: int = 1000, 
+                 max_steps_per_episode: int = 100, 
+                 name: str = 'Q-Learning', 
+                 type: str = 'Q-Learning', 
+                 verbose: bool = True
+                 ) -> None:
+        
+        super().__init__(mdp, mdp.dynamics, freq, name, type, verbose)
+
+        self.epsilon = epsilon  # exploration rate
+        self.k_epsilon = k_epsilon  # decay factor for exploration rate
+        self.epsilon_min = epsilon_min
+        self.learning_rate = learning_rate
+        self.gamma = gamma
+        self.max_iterations = max_iterations
+        self.max_steps_per_episode = max_steps_per_episode
+
+        self.mdp = mdp
+
+        self.dim_states = self.mdp.num_states
+        self.dim_inputs = self.mdp.num_actions
+
+        self.init_state = self.env.init_state
+        self.target_state = self.env.target_state
+
+        # Initialize Q table with all 0s
+        self.Q = np.zeros((self.dim_states, self.dim_inputs)) 
+        
+        # Initialize policy as None
+        self.policy = np.zeros((self.dim_states)) 
+        self.value_function = np.zeros((self.dim_states)) 
+
+        # For training curve plotting
+        self.residual_rewards = []
+        self.epsilon_list = []
+        self.SR_100epoch = [] # Successful rounds
+        self.F_100epoch = [] # Failure rounds
+        self.TO_100epoch = [] # Time out rounds
+
+    def _get_action_probabilities(self, state_index: int) -> np.ndarray:
+        """Calculate the action probabilities using epsilon-soft policy."""
+
+        probabilities = np.ones(self.dim_inputs) * (self.epsilon / self.dim_inputs)
+        best_action = np.argmax(self.Q[state_index])
+        probabilities[best_action] += (1.0 - self.epsilon)
+
+        return probabilities
+
+    def setup(self) -> None:
+
+        for iteration in range(self.max_iterations):
+
+            total_reward = 0  # To accumulate rewards for this episode
+
+            if iteration % 100 == 0:
+
+                if iteration != 0:
+                    # Record the SR_100epoch, F_100epoch, TO_100epoch
+                    self.SR_100epoch.append(SR_100epoch)
+                    self.F_100epoch.append(F_100epoch)
+                    self.TO_100epoch.append(TO_100epoch)
+                
+                SR_100epoch = 0
+                F_100epoch = 0
+                TO_100epoch = 0
+
+            # Ramdomly choose a state to start
+            current_state_index = np.random.choice(self.dim_states)
+            current_state = self.mdp.state_space[:, current_state_index]
+
+            for step in range(self.max_steps_per_episode):
+
+                # Choose action based on epsilon-soft policy
+                action_probabilities = self._get_action_probabilities(current_state_index)
+                action_index = np.random.choice(np.arange(self.dim_inputs), p=action_probabilities)
+                current_input = self.mdp.input_space[action_index]
+
+                # Take action and observe the next state and reward
+                next_state, reward = self.mdp.one_step_forward(current_state, current_input)
+                next_state_index = self.mdp.nearest_state_index_lookup(next_state)
+                total_reward += reward  # Accumulate total reward
+                
+                if self.verbose:
+                    print(f"reward: {reward}")
+                    print(f"total_reward: {total_reward}")
+                    print(f"current_state: {current_state}, current_input: {current_input}, next_state: {next_state}, next_state_render: {self.mdp.state_space[:, next_state_index]}, reward: {reward}")
+
+                # Check if the episode is finished
+                terminate_condition_1 = False#next_state[0]==self.mdp.pos_partitions[-1]
+                terminate_condition_2 = False#next_state[0]==self.mdp.pos_partitions[0]
+                terminate_condition_3 = np.all(self.mdp.state_space[:, next_state_index]==self.target_state)
+
+                if terminate_condition_1 or terminate_condition_2 or terminate_condition_3:
+
+                    if terminate_condition_3:
+                        SR_100epoch += 1
+                    else:
+                        F_100epoch += 1
+
+                    if self.verbose:
+                        print(f"Iteration {iteration + 1}/{self.max_iterations}: finished successfully! epsilon: {self.epsilon:.4f}, residual reward: {total_reward:.2f}")
+                    
+                    break
+
+                else:
+                    # Update Q table
+                    q_update = reward + self.gamma * np.max(self.Q[next_state_index, :])
+                    self.Q[current_state_index, action_index] += self.learning_rate * (
+                        q_update - self.Q[current_state_index, action_index]
+                    )
+                    
+                    # Move to the next state
+                    current_state_index = next_state_index
+                    current_state = self.mdp.state_space[:, current_state_index]
+                
+                if step == self.max_steps_per_episode-1:
+                    TO_100epoch +=1
+                    if self.verbose:
+                        print(f"Iteration {iteration + 1}/{self.max_iterations}: time out! epsilon: {self.epsilon:.4f}, residual reward: {total_reward:.2f}")
+                    
+
+            # Decrease epsilon
+            self.epsilon *= self.k_epsilon
+            self.epsilon = max(self.epsilon, self.epsilon_min)
+            self.epsilon_list.append(self.epsilon)
+
+            # Record the residual reward
+            self.residual_rewards.append(total_reward)
+        
+        # Return the deterministic policy and value function
+        self.policy = np.argmax(self.Q, axis=1)
+        self.value_function = np.max(self.Q, axis=1)
+        
+        if self.verbose:
+            print("Training finished！")
+
+    @check_input_constraints
+    def compute_action(self, current_state: np.ndarray, current_time) -> np.ndarray:
+        """
+        Use the optimal policy to compute the action for the given state.
+        """
+        # Find the nearest discrete state index
+        state_index = self.mdp.nearest_state_index_lookup(current_state)
+        
+        # Get the optimal action from the policy
+        action_index = self.policy[state_index]
+        action = self.mdp.input_space[action_index]
+
+        return np.array([action])
+
+    def plot_heatmaps(self):
+        """
+        Visualize the policy and cost as a 2D state-value map.
+        """
+        value_map = self.value_function.reshape(self.mdp.num_pos, self.mdp.num_vel)
+        policy_map = self.policy.reshape(self.mdp.num_pos, self.mdp.num_vel)
+
+        fig, axs = plt.subplots(1, 2, figsize=(12, 4))
+
+        # Plot policy (U)
+        im1 = axs[0].imshow(policy_map, extent=[
+            self.mdp.pos_partitions[0], self.mdp.pos_partitions[-1],
+            self.mdp.vel_partitions[0], self.mdp.vel_partitions[-1]
+        ], origin='lower', aspect='auto', cmap='viridis')
+        axs[0].set_title('Optimal Policy')
+        axs[0].set_xlabel('Car Position')
+        axs[0].set_ylabel('Car Velocity')
+        fig.colorbar(im1, ax=axs[0], orientation='vertical')
+
+        # Plot cost-to-go (J)
+        im2 = axs[1].imshow(value_map, extent=[
+            self.mdp.pos_partitions[0], self.mdp.pos_partitions[-1],
+            self.mdp.vel_partitions[0], self.mdp.vel_partitions[-1]
+        ], origin='lower', aspect='auto', cmap='viridis')
+        axs[1].set_title('Optimal Cost')
+        axs[1].set_xlabel('Car Position')
+        axs[1].set_ylabel('Car Velocity')
+        fig.colorbar(im2, ax=axs[1], orientation='vertical')
+
+        plt.tight_layout()
+        plt.show()
+
+    def plot_training_curve(self):
+        """
+        Visualize the training curve of residual rewards and holdsignal for sr_100epoch in 2 figure.
+        """
+
+        self.SR_100epoch = np.repeat(self.SR_100epoch, 100)
+        self.F_100epoch = np.repeat(self.F_100epoch, 100)
+        self.TO_100epoch = np.repeat(self.TO_100epoch, 100)
+        
+        fig, axs = plt.subplots(1, 3, figsize=(12, 3))
+
+        # Plot residual rewards
+        axs[0].plot(self.residual_rewards)
+        axs[0].set_title('Total Rewards')
+        axs[0].set_xlabel('Iteration')
+        axs[0].set_ylabel('Total Reward')
+
+        # Plot epsilon
+        axs[1].plot(self.epsilon_list)
+        axs[1].set_title('Epsilon')
+        axs[1].set_xlabel('Iteration')
+        axs[1].set_ylabel('Epsilon')
+        axs[1].set_ylim(0, 1)
+
+        # Plot SR_100epoch, F_100epoch, TO_100epoch
+        axs[2].plot(self.SR_100epoch, label='Success rounds / 100Epoch')
+        axs[2].plot(self.F_100epoch, label='Fail rounds / 100Epoch')
+        axs[2].plot(self.TO_100epoch, label='Time out / 100Epoch')
+        axs[2].set_title('Statictics / 100 Epoch')
+        axs[2].set_xlabel('Iteration')
+        axs[2].set_ylabel('Number of rounds')
+        axs[2].set_ylim(0, 100)
+        axs[2].legend()
+
+
+        plt.tight_layout()
+        plt.show()
+
+
+# Derived class for RL Controller, solved by MCRL
+class MCRLController(BaseController):
+    def __init__(self, 
+                 mdp: Env_rl_d, 
+                 freq: float, 
+                 epsilon: float = 0.3, 
+                 k_epsilon: float = 0.99, 
+                 epsilon_min: float = 0.01,
+                 learning_rate: float = 0.2, 
+                 gamma: float = 0.95,
+                 max_iterations: int = 1000, 
+                 max_steps_per_episode: int = 100, 
+                 name: str = 'MCRL', 
+                 type: str = 'MCRL', 
+                 verbose: bool = True
+                 ) -> None:
+        
+        super().__init__(mdp, mdp.dynamics, freq, name, type, verbose)
+
+        self.epsilon = epsilon  # exploration rate
+        self.k_epsilon = k_epsilon  # decay factor for exploration rate
+        self.epsilon_min = epsilon_min
+        self.learning_rate = learning_rate
+        self.gamma = gamma
+        self.max_iterations = max_iterations
+        self.max_steps_per_episode = max_steps_per_episode
+
+        self.mode = "every_visit"  # "first_visit" or "every_visit"
+
+        self.mdp = mdp
+
+        self.dim_states = self.mdp.num_states
+        self.dim_inputs = self.mdp.num_actions
+
+        self.init_state = self.env.init_state
+        self.target_state = self.env.target_state
+
+        # Initialize Q table with all 0s
+        self.Q = np.zeros((self.dim_states, self.dim_inputs)) 
+        self.state_action_counts = np.zeros((self.dim_states, self.dim_inputs))
+        
+        # Initialize policy as None
+        self.policy = np.zeros((self.dim_states)) 
+        self.value_function = np.zeros((self.dim_states)) 
+
+        # For training curve plotting
+        self.residual_rewards = []
+        self.epsilon_list = []
+        self.SR_100epoch = [] # Successful rounds
+        self.F_100epoch = [] # Failure rounds
+        self.TO_100epoch = [] # Time out rounds
+
+    def _get_action_probabilities(self, state_index: int) -> np.ndarray:
+        """Calculate the action probabilities using epsilon-soft policy."""
+
+        probabilities = np.ones(self.dim_inputs) * (self.epsilon / self.dim_inputs)
+        best_action = np.argmax(self.Q[state_index])
+        probabilities[best_action] += (1.0 - self.epsilon)
+
+        return probabilities
+
+    def setup(self) -> None:
+
+        for iteration in range(self.max_iterations):
+
+            episode = []  # storage state, action and reward for current episode
+            total_reward = 0  # total reward for current episode
+
+            if iteration % 100 == 0:
+
+                if iteration != 0:
+                    # Record the SR_100epoch, F_100epoch, TO_100epoch
+                    self.SR_100epoch.append(SR_100epoch)
+                    self.F_100epoch.append(F_100epoch)
+                    self.TO_100epoch.append(TO_100epoch)
+                
+                SR_100epoch = 0
+                F_100epoch = 0
+                TO_100epoch = 0
+
+            # Randomly choose a state to start
+            current_state_index = np.random.choice(self.dim_states)
+            current_state = self.mdp.state_space[:, current_state_index]
+            
+            # Generate an episode
+            for step in range(self.max_steps_per_episode):
+                # Choose action based on epsilon-soft policy
+                action_probabilities = self._get_action_probabilities(current_state_index)
+                action_index = np.random.choice(np.arange(self.dim_inputs), p=action_probabilities)
+                current_input = self.mdp.input_space[action_index]
+
+                # Take action and observe the next state and reward
+                next_state, reward = self.mdp.one_step_forward(current_state, current_input)
+                next_state_index = self.mdp.nearest_state_index_lookup(next_state)
+                total_reward += reward
+
+                # Store the state, action and reward for this step
+                episode.append((current_state_index, action_index, reward))
+
+                # Check if the episode is finished
+                terminate_condition_1 = False#next_state[0]==self.mdp.pos_partitions[-1]
+                terminate_condition_2 = False#next_state[0]==self.mdp.pos_partitions[0]
+                terminate_condition_3 = np.all(self.mdp.state_space[:, next_state_index]==self.target_state)
+
+                if terminate_condition_1 or terminate_condition_2 or terminate_condition_3:
+
+                    if terminate_condition_3:
+                        SR_100epoch += 1
+                    else:
+                        F_100epoch += 1
+
+                    if self.verbose:
+                        print(f"Iteration {iteration + 1}/{self.max_iterations}: finished successfully! epsilon: {self.epsilon:.4f}, residual reward: {total_reward:.2f}")
+                    
+                    break
+
+                if step == self.max_steps_per_episode-1:
+                    TO_100epoch +=1
+                    if self.verbose:
+                        print(f"Iteration {iteration + 1}/{self.max_iterations}: time out! epsilon: {self.epsilon:.4f}, residual reward: {total_reward:.2f}")
+                    
+                # Move to the next state
+                current_state_index = next_state_index
+                current_state = self.mdp.state_space[:, current_state_index]
+
+            # Update Q table using Monte Carlo method
+            G = 0  # Return
+            if self.mode == "first_visit":
+                visited = set()
+
+            for state_index, action_index, reward in reversed(episode):
+                G = reward + self.gamma * G
+                
+                 # update Q table
+                if self.mode == "first_visit" and (state_index, action_index) not in visited:
+                    visited.add((state_index, action_index))
+                    self.state_action_counts[state_index, action_index] += 1
+                    alpha = 1.0 / self.state_action_counts[state_index, action_index]
+                    self.Q[state_index, action_index] += alpha * (G - self.Q[state_index, action_index])
+
+                elif self.mode == "every_visit":
+                    self.state_action_counts[state_index, action_index] += 1
+                    alpha = 1.0 / self.state_action_counts[state_index, action_index]
+                    self.Q[state_index, action_index] += alpha * (G - self.Q[state_index, action_index])
+
+            # Decrease epsilon
+            self.epsilon *= self.k_epsilon
+            self.epsilon = max(self.epsilon, self.epsilon_min)
+            self.epsilon_list.append(self.epsilon)
+
+            # Record the residual reward
+            self.residual_rewards.append(total_reward)
+
+        # Return the deterministic policy and value function
+        self.policy = np.argmax(self.Q, axis=1)
+        self.value_function = np.max(self.Q, axis=1)
+
+        if self.verbose:
+            print("Training finished！")
+
+    @check_input_constraints
+    def compute_action(self, current_state: np.ndarray, current_time) -> np.ndarray:
+        """
+        Use the optimal policy to compute the action for the given state.
+        """
+        # Find the nearest discrete state index
+        state_index = self.mdp.nearest_state_index_lookup(current_state)
+        
+        # Get the optimal action from the policy
+        action_index = self.policy[state_index]
+        action = self.mdp.input_space[action_index]
+
+        return np.array([action])
+
+    def plot_heatmaps(self):
+        """
+        Visualize the policy and cost as a 2D state-value map.
+        """
+        value_map = self.value_function.reshape(self.mdp.num_pos, self.mdp.num_vel)
+        policy_map = self.policy.reshape(self.mdp.num_pos, self.mdp.num_vel)
+
+        fig, axs = plt.subplots(1, 2, figsize=(12, 4))
+
+        # Plot policy (U)
+        im1 = axs[0].imshow(policy_map, extent=[
+            self.mdp.pos_partitions[0], self.mdp.pos_partitions[-1],
+            self.mdp.vel_partitions[0], self.mdp.vel_partitions[-1]
+        ], origin='lower', aspect='auto', cmap='viridis')
+        axs[0].set_title('Optimal Policy')
+        axs[0].set_xlabel('Car Position')
+        axs[0].set_ylabel('Car Velocity')
+        fig.colorbar(im1, ax=axs[0], orientation='vertical')
+
+        # Plot cost-to-go (J)
+        im2 = axs[1].imshow(value_map, extent=[
+            self.mdp.pos_partitions[0], self.mdp.pos_partitions[-1],
+            self.mdp.vel_partitions[0], self.mdp.vel_partitions[-1]
+        ], origin='lower', aspect='auto', cmap='viridis')
+        axs[1].set_title('Optimal Cost')
+        axs[1].set_xlabel('Car Position')
+        axs[1].set_ylabel('Car Velocity')
+        fig.colorbar(im2, ax=axs[1], orientation='vertical')
+
+        plt.tight_layout()
+        plt.show()
+
+    def plot_training_curve(self):
+        """
+        Visualize the training curve of residual rewards and holdsignal for sr_100epoch in 2 figure.
+        """
+
+        self.SR_100epoch = np.repeat(self.SR_100epoch, 100)
+        self.F_100epoch = np.repeat(self.F_100epoch, 100)
+        self.TO_100epoch = np.repeat(self.TO_100epoch, 100)
+        
+        fig, axs = plt.subplots(1, 3, figsize=(12, 3))
+
+        # Plot residual rewards
+        axs[0].plot(self.residual_rewards)
+        axs[0].set_title('Total Rewards')
+        axs[0].set_xlabel('Iteration')
+        axs[0].set_ylabel('Total Reward')
+
+        # Plot epsilon
+        axs[1].plot(self.epsilon_list)
+        axs[1].set_title('Epsilon')
+        axs[1].set_xlabel('Iteration')
+        axs[1].set_ylabel('Epsilon')
+        axs[1].set_ylim(0, 1)
+
+        # Plot SR_100epoch, F_100epoch, TO_100epoch
+        axs[2].plot(self.SR_100epoch, label='Success rounds / 100Epoch')
+        axs[2].plot(self.F_100epoch, label='Fail rounds / 100Epoch')
+        axs[2].plot(self.TO_100epoch, label='Time out / 100Epoch')
+        axs[2].set_title('Statictics / 100 Epoch')
+        axs[2].set_xlabel('Iteration')
+        axs[2].set_ylabel('Number of rounds')
+        axs[2].set_ylim(0, 100)
+        axs[2].legend()
+
 
         plt.tight_layout()
         plt.show()
@@ -1423,41 +2458,59 @@ class GPIController(BaseController):
 
 
 
+
+
+
+
+
+
 class Simulator:
     def __init__(
-            self, 
-            dynamics: Dynamics, 
-            controller: BaseController, 
-            env: Env, 
-            dt: float, 
-            t_terminal: float, 
-            verbose: bool = False
-        ) -> None:
-
+        self,
+        dynamics: Dynamics = None,
+        controller: BaseController = None,
+        env: Env = None,
+        dt: float = None,
+        t_terminal: float = None,
+        verbose: bool = False
+    ) -> None:
+        
         self.dynamics = dynamics
         self.controller = controller
         self.env = env
+        self.verbose = verbose
 
-        self.init_state = self.env.init_state
-        
-        # Define timeline
-        self.t_0 = 0
-        self.t_terminal = t_terminal
-        self.dt = dt
-        self.t_eval = np.linspace(self.t_0, self.t_terminal, int((self.t_terminal - self.t_0) / self.dt))
-        
-        # Initialize recording list for state and input sequence
-        self.state_traj = [] # list -> ndarray(2,)
-        self.input_traj = [] # list -> scalar
+        # Initialize attributes only if 'env' is provided
+        if env is not None:
+            self.init_state = env.init_state
+        else:
+            self.init_state = None
 
-        self.positions = []
-        self.velocities = []
-        self.accelerations = []
-        
-        # Initialize counter to present current time
+        # Initialize timeline attributes only if 'dt' and 't_terminal' are provided
+        if dt is not None and t_terminal is not None:
+            self.t_0 = 0
+            self.t_terminal = t_terminal
+            self.dt = dt
+            self.t_eval = np.linspace(
+                self.t_0, self.t_terminal, int((self.t_terminal - self.t_0) / self.dt) + 1
+            )
+        else:
+            self.t_0 = None
+            self.t_terminal = None
+            self.dt = None
+            self.t_eval = None
+
+        # Initialize recording lists
+        self.state_traj = []
+        self.input_traj = []
+        self.state_pred_traj = []
+        self.input_pred_traj = []
+        self.cost2go_arr = None
         self.counter = 0
 
-        self.verbose = verbose
+        # Set controller character if controller is provided
+        self.controller_name = controller.name if controller is not None else None
+        self.controller_type = controller.type if controller is not None else None
 
     def reset_counter(self) -> None:
         self.counter = 0
@@ -1466,11 +2519,18 @@ class Simulator:
         
         # Initialize state vector
         current_state = self.init_state
+        self.state_traj.append(current_state)
 
-        for current_time in self.t_eval:
+        for current_time in self.t_eval[:-1]:
 
             # Get current state, and call controller to calculate input
-            current_input = self.controller.compute_action(current_state, self.counter)
+            if self.controller.type == 'MPC':
+                current_input, state_pred, input_pred = self.controller.compute_action(current_state, self.counter)
+                # Log the predictions
+                self.state_pred_traj.append(state_pred)
+                self.input_pred_traj.append(input_pred)
+            else:
+                current_input = self.controller.compute_action(current_state, self.counter)
 
             # Do one-step simulation
             current_state = self.dynamics.one_step_forward(current_state, current_input, self.dt)
@@ -1485,6 +2545,35 @@ class Simulator:
         
         print("Simulation finished, will start plotting")
         self.reset_counter()
+    
+    def save(self, filename='dp_sim.pkl'):
+        with open(filename, 'wb') as f:
+            pickle.dump({
+                'controller_name': self.controller_name,
+                'controller_type': self.controller_type,
+                'env': self.env,
+                't_eval': self.t_eval,
+                'state_traj': self.state_traj,
+                'input_traj': self.input_traj,
+            }, f)
+
+    def load(self, filename='dp_sim.pkl'):
+        with open(filename, 'rb') as f:
+            data = pickle.load(f)
+
+            self.controller_name = data['controller_name']
+            self.controller_type = data['controller_type']
+
+            self.env = data['env']
+        
+            self.t_eval = data['t_eval']
+            self.t_0 = self.t_eval[0]
+            self.t_terminal = self.t_eval[-1]
+            self.dt = self.t_eval[1] - self.t_eval[0]
+            
+            self.state_traj = data['state_traj']
+            self.input_traj = data['input_traj']
+            self.init_state = data['state_traj'][0]
 
     def get_trajectories(self) -> Tuple[np.ndarray, np.ndarray]:
         '''Get state and input trajectories, return in ndarray form '''
@@ -1494,6 +2583,43 @@ class Simulator:
         input_traj = np.array(self.input_traj)
 
         return state_traj, input_traj
+
+    def compute_cost2go(
+        self,
+        Q: np.ndarray,
+        R: np.ndarray,
+        Qf: np.ndarray,
+        target_state: np.ndarray
+    ) -> float:
+        
+        """can only be used for quadratic cost function"""
+
+        # Transform state and input traj from list to ndarray
+        state_traj = np.array(self.state_traj)
+        input_traj = np.array(self.input_traj)
+
+        total_cost_arr = np.zeros(len(input_traj))
+        
+        # Terminal cost
+        x_final = state_traj[-1]
+        x_err_final = x_final - target_state
+        cost_terminal = 0.5 * (x_err_final.T @ Qf @ x_err_final)
+        total_cost_arr[-1] = cost_terminal
+
+        # Stage cost, backpropagation
+        for k in range(len(input_traj)-2, -1, -1):
+            x_err = state_traj[k] - target_state
+            u = input_traj[k]
+
+            u_cost = R * (u**2)
+
+            cost_stage = 0.5 * (x_err.T @ Q @ x_err + u_cost)
+            total_cost_arr[k] = total_cost_arr[k+1] +  cost_stage
+        
+        # Update the cost2go_arr
+        self.cost2go_arr = total_cost_arr
+
+        return total_cost_arr
 
 
 
@@ -1516,9 +2642,14 @@ class Visualizer:
         self.dt = simulator.dt
         self.t_eval = simulator.t_eval
 
+        self.delta_index_pred_display = 2
+
         # Define setting of plots and animation
         self.color = "blue"
         self.color_list = ['red', 'green', 'yellow', 'orange']
+
+        self.shadow_space_wide = 0.2
+
         self.car_length= 0.2
         self.figsize = (8, 4)
         self.refresh_rate = 30
@@ -1527,42 +2658,83 @@ class Visualizer:
 
         fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(20, 4))
 
-        # Plot p over time t
+        # Plot predicted positions
+        if self.simulator.controller_type == 'MPC' and len(self.simulator.state_pred_traj)>0:
+            for i in range(len(self.simulator.state_pred_traj)):
+                if i%self.delta_index_pred_display == 0:
+                    state_pred_traj_curr = self.simulator.state_pred_traj[i]
+                    t_eval = np.linspace(self.t_eval[i], self.t_eval[i] + self.simulator.dt * (len(state_pred_traj_curr) - 1), len(state_pred_traj_curr))
+                    ax1.plot(t_eval, state_pred_traj_curr[:, 0], label="Predicted Position", linestyle="--", color="orange")
 
+        # Plot p over time t
         ax1.plot(self.t_eval, self.position, label="Position p(t)", color="blue")
 
+        # Plot shadowed zone for state bounds
         if self.env.state_lbs is not None:
-            ax1.fill_between(self.t_eval, ax1.get_ylim()[0], self.env.state_lbs[0], facecolor='gray', alpha=0.3, label=f'pos_lower_bound')
+            ax1.fill_between(self.t_eval, self.env.state_lbs[0]-self.shadow_space_wide, self.env.state_lbs[0], facecolor='gray', alpha=0.3, label=f'pos_lower_bound')
         if self.env.state_ubs is not None:
-            ax1.fill_between(self.t_eval, self.env.state_ubs[0], ax1.get_ylim()[1], facecolor='gray', alpha=0.3, label=f'pos_upper_bound')
-
+            ax1.fill_between(self.t_eval, self.env.state_ubs[0], self.env.state_ubs[0]+self.shadow_space_wide, facecolor='gray', alpha=0.3, label=f'pos_upper_bound')
+        
         ax1.set_xlabel("Time (s)")
         ax1.set_ylabel("Position (m)")
-        ax1.legend()
+        
+        handles, labels = ax1.get_legend_handles_labels()
+        by_label = dict(zip(labels, handles))
+        ax1.legend(by_label.values(), by_label.keys())
+
+
+        # Plot predicted velocities
+        if self.simulator.controller_type == 'MPC' and len(self.simulator.state_pred_traj)>0:
+            for i in range(len(self.simulator.state_pred_traj)):
+                if i%self.delta_index_pred_display == 0:
+                    state_pred_traj_curr = self.simulator.state_pred_traj[i]
+                    t_eval = np.linspace(self.t_eval[i], self.t_eval[i] + self.simulator.dt * (len(state_pred_traj_curr) - 1), len(state_pred_traj_curr))
+                    ax2.plot(t_eval, state_pred_traj_curr[:, 1], label="Predicted Velocity", linestyle="--", color="orange")
 
         # Plot v over time t
         ax2.plot(self.t_eval, self.velocity, label="Velocity v(t)", color="green")
 
+        # Plot shadowed zone for state bounds
         if self.env.state_lbs is not None:
-            ax2.fill_between(self.t_eval, ax2.get_ylim()[0], self.env.state_lbs[1], facecolor='gray', alpha=0.3, label=f'vel_lower_bound')
+            ax2.fill_between(self.t_eval, self.env.state_lbs[1]-self.shadow_space_wide, self.env.state_lbs[1], facecolor='gray', alpha=0.3, label=f'vel_lower_bound')
         if self.env.state_ubs is not None:
-            ax2.fill_between(self.t_eval, self.env.state_ubs[1], ax2.get_ylim()[1], facecolor='gray', alpha=0.3, label=f'vel_upper_bound')
-            
+            ax2.fill_between(self.t_eval, self.env.state_ubs[1], self.env.state_ubs[1]+self.shadow_space_wide, facecolor='gray', alpha=0.3, label=f'vel_upper_bound')
+    
         ax2.set_xlabel("Time (s)")
         ax2.set_ylabel("Velocity (m/s)")
-        ax2.legend()
+        
+        handles, labels = ax2.get_legend_handles_labels()
+        by_label = dict(zip(labels, handles))
+        ax2.legend(by_label.values(), by_label.keys())
+
+        '''
+        # Not updated yet, still continuous signal instead of ZOH signal
+        # Plot predicted accelerations
+        if self.simulator.controller_type == 'MPC' and len(self.simulator.state_pred_traj)>0:
+            for i in range(len(self.simulator.state_pred_traj)):
+                if i%self.delta_index_pred_display == 0:
+                    input_pred_traj_curr = self.simulator.input_pred_traj[i]
+                    t_eval = np.linspace(self.t_eval[i], self.t_eval[i] + self.simulator.dt * (len(input_pred_traj_curr) - 1), len(input_pred_traj_curr))
+                    ax3.plot(t_eval, input_pred_traj_curr, label="Predicted Input", linestyle="--", color="orange")
+        '''
 
         # Plot a over time t
-        ax3.plot(self.t_eval, self.acceleration, label="Acceleration a(t)", color="red")
+        #ax3.plot(self.t_eval[:-1], self.acceleration, label="Input u(t)", color="red")
+        ax3.step(self.t_eval, np.append(self.acceleration, self.acceleration[-1]), where='post', label="Input u(t)", color='red')
+        #ax3.plot(self.t_eval[:-1], self.acceleration, 'o', color='red')
 
+        # Plot shadowed zone for state bounds
         if self.env.input_lbs is not None:
-            ax3.fill_between(self.t_eval, ax3.get_ylim()[0], self.env.input_lbs, facecolor='gray', alpha=0.3, label=f'acc_lower_bound')
+            ax3.fill_between(self.t_eval, self.env.input_lbs-self.shadow_space_wide, self.env.input_lbs, facecolor='gray', alpha=0.3, label=f'input_lower_bound')
         if self.env.input_ubs is not None:
-            ax3.fill_between(self.t_eval, self.env.input_ubs, ax3.get_ylim()[1], facecolor='gray', alpha=0.3, label=f'acc_upper_bound')
-
+            ax3.fill_between(self.t_eval, self.env.input_ubs, self.env.input_ubs+self.shadow_space_wide, facecolor='gray', alpha=0.3, label=f'input_upper_bound')
+        
         ax3.set_xlabel("Time (s)")
-        ax3.set_ylabel("Acceleration (m/s^2)")
-        ax3.legend()
+        ax3.set_ylabel("Input (m/s^2)")
+
+        handles, labels = ax3.get_legend_handles_labels()
+        by_label = dict(zip(labels, handles))
+        ax3.legend(by_label.values(), by_label.keys())
 
         plt.tight_layout()
         plt.show()
@@ -1579,7 +2751,7 @@ class Visualizer:
         # Plot the reference and evaluated trajectories for each simulator
         for simulator_ref in simulators:
             if not simulator_ref.state_traj:
-                raise ValueError(f"Failed to get trajectory from simulator {simulator_ref.controller.name}. State trajectory list is void; please run 'run_simulation' first.")
+                raise ValueError(f"Failed to get trajectory from simulator {simulator_ref.controller_name}. State trajectory list is void; please run 'run_simulation' first.")
 
             # Get reference trajectories from simulator_ref
             state_traj_ref, input_traj_ref = simulator_ref.get_trajectories()
@@ -1590,34 +2762,41 @@ class Visualizer:
             acceleration_ref = input_traj_ref
 
             # Plot position over time
-            ax1.plot(self.t_eval, position_ref, linestyle="--", label=f"{simulator_ref.controller.name} Position", color=self.color_list[color_index])
+            ax1.plot(self.t_eval, position_ref, linestyle="--", label=f"{simulator_ref.controller_name} Position", color=self.color_list[color_index])
 
             # Plot velocity over time
-            ax2.plot(self.t_eval, velocity_ref, linestyle="--", label=f"{simulator_ref.controller.name} Velocity", color=self.color_list[color_index])
+            ax2.plot(self.t_eval, velocity_ref, linestyle="--", label=f"{simulator_ref.controller_name} Velocity", color=self.color_list[color_index])
 
             # Plot acceleration over time
-            ax3.plot(self.t_eval, acceleration_ref, linestyle="--", label=f"{simulator_ref.controller.name} Acceleration", color=self.color_list[color_index])
-            
+            #ax3.plot(self.t_eval[:-1], acceleration_ref, linestyle="--", label=f"{simulator_ref.controller_name} Input", color=self.color_list[color_index])
+            ax3.step(self.t_eval, np.append(acceleration_ref, acceleration_ref[-1]), where='post', linestyle="--", label=f"{simulator_ref.controller_name} Input", color=self.color_list[color_index])
+
             color_index += 1
 
         # Plot current object's trajectories
-        ax1.plot(self.t_eval, self.position, label=f"{self.controller.name} Position", color=self.color)
+        ax1.plot(self.t_eval, self.position, label=f"{self.simulator.controller_name} Position", color=self.color)
+
+        ax2.plot(self.t_eval, self.velocity, label=f"{self.simulator.controller_name} Velocity", color=self.color)
+
+        #ax3.plot(self.t_eval[:-1], self.acceleration, label=f"{self.simulator.controller_name} Input", color=self.color)
+        ax3.step(self.t_eval, np.append(self.acceleration, self.acceleration[-1]), where='post', label=f"{self.simulator.controller_name} Input", color=self.color)
+
+
+        # Plot shadowed zone for state bounds
         if self.env.state_lbs is not None:
             ax1.fill_between(self.t_eval, ax1.get_ylim()[0], self.env.state_lbs[0], facecolor='gray', alpha=0.3, label=f'pos_lower_bound')
         if self.env.state_ubs is not None:
             ax1.fill_between(self.t_eval, self.env.state_ubs[0], ax1.get_ylim()[1], facecolor='gray', alpha=0.3, label=f'pos_upper_bound')
 
-        ax2.plot(self.t_eval, self.velocity, label=f"{self.controller.name} Velocity", color=self.color)
         if self.env.state_lbs is not None:
             ax2.fill_between(self.t_eval, ax2.get_ylim()[0], self.env.state_lbs[1], facecolor='gray', alpha=0.3, label=f'vel_lower_bound')
         if self.env.state_ubs is not None:
             ax2.fill_between(self.t_eval, self.env.state_ubs[1], ax2.get_ylim()[1], facecolor='gray', alpha=0.3, label=f'vel_upper_bound')
-
-        ax3.plot(self.t_eval, self.acceleration, label=f"{self.controller.name} Acceleration", color=self.color)
+        
         if self.env.input_lbs is not None:
-            ax3.fill_between(self.t_eval, ax3.get_ylim()[0], self.env.input_lbs, facecolor='gray', alpha=0.3, label=f'acc_lower_bound')
+            ax3.fill_between(self.t_eval, ax3.get_ylim()[0], self.env.input_lbs, facecolor='gray', alpha=0.3, label=f'input_lower_bound')
         if self.env.input_ubs is not None:
-            ax3.fill_between(self.t_eval, self.env.input_ubs, ax3.get_ylim()[1], facecolor='gray', alpha=0.3, label=f'acc_upper_bound')
+            ax3.fill_between(self.t_eval, self.env.input_ubs, ax3.get_ylim()[1], facecolor='gray', alpha=0.3, label=f'input_upper_bound')
 
         # Set labels and legends
         ax1.set_xlabel("Time (s)")
@@ -1629,11 +2808,68 @@ class Visualizer:
         ax2.legend()
 
         ax3.set_xlabel("Time (s)")
-        ax3.set_ylabel("Acceleration (m/s^2)")
+        ax3.set_ylabel("Input (m/s^2)")
         ax3.legend()
 
         plt.tight_layout()
         plt.show()
+
+    def display_contrast_cost2go(self, *simulators: Simulator) -> None:
+
+        color_index = 0
+
+        if not simulators:
+            raise ValueError("No simulator references provided.")
+
+        fig, ax = plt.subplots(1, 1, figsize=(10, 4))
+
+        # Plot the reference and evaluated trajectories for each simulator
+        for simulator_ref in simulators:
+            if not np.all(simulator_ref.cost2go_arr):
+                raise ValueError(f"Failed to get trajectory from simulator {simulator_ref.controller_name}. State trajectory list is void; please run 'run_simulation' first.")
+
+            # Plot cost over time
+            ax.plot(self.t_eval, simulator_ref.cost2go_arr, linestyle="--", label=f"{simulator_ref.controller_name} Cost-to-go", color=self.color_list[color_index])
+
+            color_index += 1
+        
+            # Annotate total cost at initial time step
+            initial_cost = simulator_ref.cost2go_arr[0]
+            plt.annotate(
+                f"Total cost: {initial_cost:.2f}",
+                xy=(0, initial_cost),
+                xytext=(10, initial_cost + 0.05 * initial_cost),
+                arrowprops=dict(arrowstyle="->", lw=1.5),
+                fontsize=10,
+                bbox=dict(boxstyle="round,pad=0.3", fc="yellow", alpha=0.3)
+            )
+
+        # Plot cost over time
+        ax.plot(self.t_eval, self.simulator.cost2go_arr, label=f"{self.simulator.controller_name} Cost-to-go", color=self.color_list[color_index])
+
+        color_index += 1
+    
+        # Annotate total cost at initial time step
+        initial_cost = self.simulator.cost2go_arr[0]
+        plt.annotate(
+            f"Total cost: {initial_cost:.2f}",
+            xy=(0, initial_cost),
+            xytext=(10, initial_cost + 0.05 * initial_cost),
+            arrowprops=dict(arrowstyle="->", lw=1.5),
+            fontsize=10,
+            bbox=dict(boxstyle="round,pad=0.3", fc="yellow", alpha=0.3)
+        )
+
+        # Set labels and legends
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Cost-to-go")
+        ax.legend()
+
+        plt.tight_layout()
+        plt.show()
+        
+
+
 
     def display_animation(self) -> HTML:
         
@@ -1665,14 +2901,15 @@ class Visualizer:
         initial_h = float(self.env.h(self.env.initial_position).full().flatten()[0])
         target_h = float(self.env.h(self.env.target_position).full().flatten()[0])
 
-        ax1.scatter([self.env.initial_position], [initial_h], color="blue", label="Initial position")
-        ax1.scatter([self.env.target_position], [target_h], color="orange", label="Target position")
+        ax1.scatter([self.env.initial_position], [initial_h], color="blue", label="Start")
+        #ax1.scatter([self.env.target_position], [target_h], color="orange", label="Target position")
+        ax1.plot(self.env.target_position, target_h, marker='x', color='red', markersize=10, markeredgewidth=3, label='Target')
         ax1.legend()
 
 
         # Setting simplyfied car model as rectangle, and update the plotting to display the animation
         car_height = self.car_length / 2
-        car = Rectangle((0, 0), self.car_length, car_height, color="red")
+        car = Rectangle((0, 0), self.car_length, car_height, color="orange")
         ax1.add_patch(car)
 
         def update(frame):
@@ -1681,7 +2918,7 @@ class Visualizer:
             current_theta = float(self.env.theta(current_position).full().flatten()[0])
 
             # Update position and attitude of car
-            car.set_xy((current_position, float(self.env.h(current_position).full().flatten()[0])))
+            car.set_xy((current_position - self.car_length / 2, float(self.env.h(current_position).full().flatten()[0])))
             car.angle = np.degrees(current_theta)  # rad to deg
 
         # Instantiate animation
@@ -1727,16 +2964,18 @@ class Visualizer:
         # Mark the initial state and the target state in the plotting
         initial_h = float(self.env.h(self.env.initial_position).full().flatten()[0])
         target_h = float(self.env.h(self.env.target_position).full().flatten()[0])
-        axes[0].scatter([self.env.initial_position], [initial_h], color="blue", label="Initial position")
-        axes[0].scatter([self.env.target_position], [target_h], color="orange", label="Target position")
+        axes[0].scatter([self.env.initial_position], [initial_h], color="blue", label="Start")
+        #axes[0].scatter([self.env.target_position], [target_h], color="orange", label="Target position")
+        axes[0].plot(self.env.target_position, target_h, marker='x', color='red', markersize=10, markeredgewidth=3, label='Target')
         axes[0].legend()
 
         for ax, sim in zip(axes[1:], simulators):
 
             initial_h = float(sim.env.h(self.env.initial_position).full().flatten()[0])
             target_h = float(sim.env.h(self.env.target_position).full().flatten()[0])
-            ax.scatter([sim.env.initial_position], [initial_h], color="blue", label="Initial position")
-            ax.scatter([sim.env.target_position], [target_h], color="orange", label="Target position")
+            ax.scatter([sim.env.initial_position], [initial_h], color="blue", label="Start")
+            #ax.scatter([sim.env.target_position], [target_h], color="orange", label="Target position")
+            ax.plot(sim.env.target_position, target_h, marker='x', color='red', markersize=10, markeredgewidth=3, label='Target')
             ax.legend()
 
 
@@ -1747,12 +2986,12 @@ class Visualizer:
 
         car_self = Rectangle((0, 0), self.car_length, car_height, color=self.color)
         axes[0].add_patch(car_self)
-        axes[0].set_title(f"{self.controller.name}")
+        axes[0].set_title(f"{self.simulator.controller_name}")
 
         for ax, sim, color in zip(axes[1:], simulators, colors):
             car = Rectangle((0, 0), self.car_length, car_height, color=color)
             ax.add_patch(car)
-            ax.set_title(f"{sim.controller.name}")
+            ax.set_title(f"{sim.controller_name}")
             car_objects[sim] = car
 
 
@@ -1760,13 +2999,13 @@ class Visualizer:
             # Update car for self
             current_position = self.position[frame]
             current_theta = float(self.env.theta(current_position).full().flatten()[0])
-            car_self.set_xy((current_position, float(self.env.h(current_position).full().flatten()[0])))
+            car_self.set_xy((current_position - self.car_length / 2, float(self.env.h(current_position).full().flatten()[0])))
             car_self.angle = np.degrees(current_theta)  # rad to deg
 
             for sim, car in car_objects.items():
                 current_position = sim.get_trajectories()[0][:, 0][frame]
                 current_theta = float(sim.env.theta(current_position).full().flatten()[0])
-                car.set_xy((current_position, float(sim.env.h(current_position).full().flatten()[0])))
+                car.set_xy((current_position - self.car_length / 2, float(sim.env.h(current_position).full().flatten()[0])))
                 car.angle = np.degrees(current_theta)  # rad to deg
 
         # Instantiate animation
@@ -1779,6 +3018,3 @@ class Visualizer:
 # Actions:
 # add a dataclass to set up all internal & public variable in class (https://docs.python.org/3/library/dataclasses.html)
 
-
-# Next steps:
-# finish PID
