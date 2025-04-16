@@ -20,7 +20,6 @@ from acados_template import AcadosOcp, AcadosOcpSolver, AcadosModel
 
 
 
-
 class Env:
     def __init__(
             self, 
@@ -115,7 +114,7 @@ class Env:
         else:
             ubs_position = self.target_position+0.2
 
-        self.p_vals_disp = np.linspace(lbs_position, ubs_position, 50)
+        self.p_vals_disp = np.linspace(lbs_position, ubs_position, 200)
 
     def test_env(self) -> None:
         
@@ -132,10 +131,12 @@ class Env:
 
         # h(p)
         ax[0].plot(self.p_vals_disp, h_vals, label="h(p)", color='green')
-        ax[0].scatter([self.initial_position], [initial_h], color="blue", label="Initial position")
-        ax[0].scatter([self.target_position], [target_h], color="orange", label="Target position")
+        ax[0].scatter([self.initial_position], [initial_h], color="blue", label="Start")
+        #ax[0].scatter([self.target_position], [target_h], color="orange", label="Target")
+        ax[0].plot(self.target_position, target_h, marker='x', color='red', markersize=10, markeredgewidth=3, label='Target')
         ax[0].set_xlabel("p")
         ax[0].set_ylabel("h")
+        ax[0].set_ylim(-1.4, 1.4)  
         ax[0].set_title("h(p)")
         ax[0].legend()
 
@@ -163,7 +164,7 @@ class Dynamics:
         # Initialize system dynmaics if not given
         if state_names is None and input_names is None:
             state_names = ["p", "v"]
-            input_names = ["a"]
+            input_names = ["u"]
 
         # Define state and input as CasADi symbolic parameters
         self.states = ca.vertcat(*[ca.SX.sym(name) for name in state_names])
@@ -181,17 +182,17 @@ class Dynamics:
 
                 p = ca.SX.sym("p")
                 v = ca.SX.sym("v")
-                a = ca.SX.sym("a")
+                u = ca.SX.sym("u")
                 Gravity = 9.81
 
                 theta = theta_function(p)
         
                 # Expression of dynamics
                 dpdt = v
-                dvdt = a * ca.cos(theta) - Gravity * ca.sin(theta) * ca.cos(theta)
+                dvdt = u * ca.cos(theta) - Gravity * ca.sin(theta) * ca.cos(theta)
                 
                 state = ca.vertcat(p, v)
-                input = ca.vertcat(a)
+                input = ca.vertcat(u)
                 rhs = ca.vertcat(dpdt, dvdt)
 
                 return ca.Function("dynamics_function", [state, input], [rhs])
@@ -200,8 +201,8 @@ class Dynamics:
         self.dynamics_function = setup_dynamics(self.env.theta)
 
         # Initialize Jacobians
-        self.A_func = None
-        self.B_func = None
+        self.A_c_func = None
+        self.B_c_func = None
 
     def linearization(
         self,
@@ -213,14 +214,14 @@ class Dynamics:
         """
 
         f = self.dynamics_function(self.states, self.inputs)
-        A_sym = ca.jacobian(f, self.states)
-        B_sym = ca.jacobian(f, self.inputs)
+        A_c_sym = ca.jacobian(f, self.states)
+        B_c_sym = ca.jacobian(f, self.inputs)
 
-        self.A_func = ca.Function("A_func", [self.states, self.inputs], [A_sym])
-        self.B_func = ca.Function("B_func", [self.states, self.inputs], [B_sym])
+        self.A_c_func = ca.Function("A_func", [self.states, self.inputs], [A_c_sym])
+        self.B_c_func = ca.Function("B_func", [self.states, self.inputs], [B_c_sym])
 
-        A_c = np.array(self.A_func(current_state, current_input))
-        B_c = np.array(self.B_func(current_state, current_input))
+        A_c = np.array(self.A_c_func(current_state, current_input))
+        B_c = np.array(self.B_c_func(current_state, current_input))
 
         return A_c, B_c
     
@@ -280,27 +281,27 @@ class Dynamics:
         p, v = state
         
         '''
-        a = ca.SX.sym("a")
+        u = ca.SX.sym("u")
         state_sym = ca.vertcat(ca.SX.sym("p"), ca.SX.sym("v"))
         
         # Define equilibrium_condition: dv/dt = 0
-        dynamics_output = self.dynamics_function(state_sym, ca.vertcat(a))
+        dynamics_output = self.dynamics_function(state_sym, ca.vertcat(u))
         dvdt = dynamics_output[1] # extract v_dot
 
         # Substitue the value into symbolic variable to get equilibrium equation
         equilibrium_condition = ca.substitute(dvdt, state_sym, ca.vertcat(p, v))
 
-        # Solve equilibrium equation to get a_eq
-        a_eq = ca.solve(equilibrium_condition, a)
+        # Solve equilibrium equation to get u_eq
+        u_eq = ca.solve(equilibrium_condition, u)
         '''
 
         theta = self.env.theta(p)
 
-        a_eq = 9.81 * np.sin(theta)
+        u_eq = 9.81 * np.sin(theta)
 
-        print("a_eq:", a_eq)
+        print("u_eq:", u_eq)
 
-        return float(a_eq)
+        return float(u_eq)
     
     def one_step_forward(self, current_state: np.ndarray, current_input: np.ndarray, dt: float) -> np.ndarray:
 
@@ -2465,45 +2466,51 @@ class MCRLController(BaseController):
 
 class Simulator:
     def __init__(
-            self, 
-            dynamics: Dynamics, 
-            controller: BaseController, 
-            env: Env, 
-            dt: float, 
-            t_terminal: float, 
-            verbose: bool = False
-        ) -> None:
-
+        self,
+        dynamics: Dynamics = None,
+        controller: BaseController = None,
+        env: Env = None,
+        dt: float = None,
+        t_terminal: float = None,
+        verbose: bool = False
+    ) -> None:
+        
         self.dynamics = dynamics
         self.controller = controller
         self.env = env
+        self.verbose = verbose
 
-        self.init_state = self.env.init_state
-        
-        # Define timeline
-        self.t_0 = 0
-        self.t_terminal = t_terminal
-        self.dt = dt
-        self.t_eval = np.linspace(self.t_0, self.t_terminal, (int((self.t_terminal - self.t_0) / self.dt)+1))
-        
-        # Initialize recording list for state and input sequence
-        self.state_traj = [] # list -> ndarray(2,)
-        self.input_traj = [] # list -> scalar
+        # Initialize attributes only if 'env' is provided
+        if env is not None:
+            self.init_state = env.init_state
+        else:
+            self.init_state = None
 
-        # Initialize recording list for predicted state and input sequence
-        self.state_pred_traj = [] # list -> ndarray(2,N)
-        self.input_pred_traj = [] # list -> ndarray(N,)
+        # Initialize timeline attributes only if 'dt' and 't_terminal' are provided
+        if dt is not None and t_terminal is not None:
+            self.t_0 = 0
+            self.t_terminal = t_terminal
+            self.dt = dt
+            self.t_eval = np.linspace(
+                self.t_0, self.t_terminal, int((self.t_terminal - self.t_0) / self.dt) + 1
+            )
+        else:
+            self.t_0 = None
+            self.t_terminal = None
+            self.dt = None
+            self.t_eval = None
 
+        # Initialize recording lists
+        self.state_traj = []
+        self.input_traj = []
+        self.state_pred_traj = []
+        self.input_pred_traj = []
         self.cost2go_arr = None
-
-        self.positions = []
-        self.velocities = []
-        self.accelerations = []
-        
-        # Initialize counter to present current time
         self.counter = 0
 
-        self.verbose = verbose
+        # Set controller character if controller is provided
+        self.controller_name = controller.name if controller is not None else None
+        self.controller_type = controller.type if controller is not None else None
 
     def reset_counter(self) -> None:
         self.counter = 0
@@ -2538,6 +2545,35 @@ class Simulator:
         
         print("Simulation finished, will start plotting")
         self.reset_counter()
+    
+    def save(self, filename='dp_sim.pkl'):
+        with open(filename, 'wb') as f:
+            pickle.dump({
+                'controller_name': self.controller_name,
+                'controller_type': self.controller_type,
+                'env': self.env,
+                't_eval': self.t_eval,
+                'state_traj': self.state_traj,
+                'input_traj': self.input_traj,
+            }, f)
+
+    def load(self, filename='dp_sim.pkl'):
+        with open(filename, 'rb') as f:
+            data = pickle.load(f)
+
+            self.controller_name = data['controller_name']
+            self.controller_type = data['controller_type']
+
+            self.env = data['env']
+        
+            self.t_eval = data['t_eval']
+            self.t_0 = self.t_eval[0]
+            self.t_terminal = self.t_eval[-1]
+            self.dt = self.t_eval[1] - self.t_eval[0]
+            
+            self.state_traj = data['state_traj']
+            self.input_traj = data['input_traj']
+            self.init_state = data['state_traj'][0]
 
     def get_trajectories(self) -> Tuple[np.ndarray, np.ndarray]:
         '''Get state and input trajectories, return in ndarray form '''
@@ -2623,7 +2659,7 @@ class Visualizer:
         fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(20, 4))
 
         # Plot predicted positions
-        if self.simulator.controller.type == 'MPC':
+        if self.simulator.controller_type == 'MPC' and len(self.simulator.state_pred_traj)>0:
             for i in range(len(self.simulator.state_pred_traj)):
                 if i%self.delta_index_pred_display == 0:
                     state_pred_traj_curr = self.simulator.state_pred_traj[i]
@@ -2648,7 +2684,7 @@ class Visualizer:
 
 
         # Plot predicted velocities
-        if self.simulator.controller.type == 'MPC':
+        if self.simulator.controller_type == 'MPC' and len(self.simulator.state_pred_traj)>0:
             for i in range(len(self.simulator.state_pred_traj)):
                 if i%self.delta_index_pred_display == 0:
                     state_pred_traj_curr = self.simulator.state_pred_traj[i]
@@ -2671,26 +2707,30 @@ class Visualizer:
         by_label = dict(zip(labels, handles))
         ax2.legend(by_label.values(), by_label.keys())
 
-
+        '''
+        # Not updated yet, still continuous signal instead of ZOH signal
         # Plot predicted accelerations
-        if self.simulator.controller.type == 'MPC':
+        if self.simulator.controller_type == 'MPC' and len(self.simulator.state_pred_traj)>0:
             for i in range(len(self.simulator.state_pred_traj)):
                 if i%self.delta_index_pred_display == 0:
                     input_pred_traj_curr = self.simulator.input_pred_traj[i]
                     t_eval = np.linspace(self.t_eval[i], self.t_eval[i] + self.simulator.dt * (len(input_pred_traj_curr) - 1), len(input_pred_traj_curr))
-                    ax3.plot(t_eval, input_pred_traj_curr, label="Predicted Acceleration", linestyle="--", color="orange")
+                    ax3.plot(t_eval, input_pred_traj_curr, label="Predicted Input", linestyle="--", color="orange")
+        '''
 
         # Plot a over time t
-        ax3.plot(self.t_eval[:-1], self.acceleration, label="Acceleration a(t)", color="red")
+        #ax3.plot(self.t_eval[:-1], self.acceleration, label="Input u(t)", color="red")
+        ax3.step(self.t_eval, np.append(self.acceleration, self.acceleration[-1]), where='post', label="Input u(t)", color='red')
+        #ax3.plot(self.t_eval[:-1], self.acceleration, 'o', color='red')
 
         # Plot shadowed zone for state bounds
         if self.env.input_lbs is not None:
-            ax3.fill_between(self.t_eval, self.env.input_lbs-self.shadow_space_wide, self.env.input_lbs, facecolor='gray', alpha=0.3, label=f'acc_lower_bound')
+            ax3.fill_between(self.t_eval, self.env.input_lbs-self.shadow_space_wide, self.env.input_lbs, facecolor='gray', alpha=0.3, label=f'input_lower_bound')
         if self.env.input_ubs is not None:
-            ax3.fill_between(self.t_eval, self.env.input_ubs, self.env.input_ubs+self.shadow_space_wide, facecolor='gray', alpha=0.3, label=f'acc_upper_bound')
+            ax3.fill_between(self.t_eval, self.env.input_ubs, self.env.input_ubs+self.shadow_space_wide, facecolor='gray', alpha=0.3, label=f'input_upper_bound')
         
         ax3.set_xlabel("Time (s)")
-        ax3.set_ylabel("Acceleration (m/s^2)")
+        ax3.set_ylabel("Input (m/s^2)")
 
         handles, labels = ax3.get_legend_handles_labels()
         by_label = dict(zip(labels, handles))
@@ -2711,7 +2751,7 @@ class Visualizer:
         # Plot the reference and evaluated trajectories for each simulator
         for simulator_ref in simulators:
             if not simulator_ref.state_traj:
-                raise ValueError(f"Failed to get trajectory from simulator {simulator_ref.controller.name}. State trajectory list is void; please run 'run_simulation' first.")
+                raise ValueError(f"Failed to get trajectory from simulator {simulator_ref.controller_name}. State trajectory list is void; please run 'run_simulation' first.")
 
             # Get reference trajectories from simulator_ref
             state_traj_ref, input_traj_ref = simulator_ref.get_trajectories()
@@ -2722,22 +2762,25 @@ class Visualizer:
             acceleration_ref = input_traj_ref
 
             # Plot position over time
-            ax1.plot(self.t_eval, position_ref, linestyle="--", label=f"{simulator_ref.controller.name} Position", color=self.color_list[color_index])
+            ax1.plot(self.t_eval, position_ref, linestyle="--", label=f"{simulator_ref.controller_name} Position", color=self.color_list[color_index])
 
             # Plot velocity over time
-            ax2.plot(self.t_eval, velocity_ref, linestyle="--", label=f"{simulator_ref.controller.name} Velocity", color=self.color_list[color_index])
+            ax2.plot(self.t_eval, velocity_ref, linestyle="--", label=f"{simulator_ref.controller_name} Velocity", color=self.color_list[color_index])
 
             # Plot acceleration over time
-            ax3.plot(self.t_eval[:-1], acceleration_ref, linestyle="--", label=f"{simulator_ref.controller.name} Acceleration", color=self.color_list[color_index])
-            
+            #ax3.plot(self.t_eval[:-1], acceleration_ref, linestyle="--", label=f"{simulator_ref.controller_name} Input", color=self.color_list[color_index])
+            ax3.step(self.t_eval, np.append(acceleration_ref, acceleration_ref[-1]), where='post', linestyle="--", label=f"{simulator_ref.controller_name} Input", color=self.color_list[color_index])
+
             color_index += 1
 
         # Plot current object's trajectories
-        ax1.plot(self.t_eval, self.position, label=f"{self.controller.name} Position", color=self.color)
+        ax1.plot(self.t_eval, self.position, label=f"{self.simulator.controller_name} Position", color=self.color)
 
-        ax2.plot(self.t_eval, self.velocity, label=f"{self.controller.name} Velocity", color=self.color)
+        ax2.plot(self.t_eval, self.velocity, label=f"{self.simulator.controller_name} Velocity", color=self.color)
 
-        ax3.plot(self.t_eval[:-1], self.acceleration, label=f"{self.controller.name} Acceleration", color=self.color)
+        #ax3.plot(self.t_eval[:-1], self.acceleration, label=f"{self.simulator.controller_name} Input", color=self.color)
+        ax3.step(self.t_eval, np.append(self.acceleration, self.acceleration[-1]), where='post', label=f"{self.simulator.controller_name} Input", color=self.color)
+
 
         # Plot shadowed zone for state bounds
         if self.env.state_lbs is not None:
@@ -2751,9 +2794,9 @@ class Visualizer:
             ax2.fill_between(self.t_eval, self.env.state_ubs[1], ax2.get_ylim()[1], facecolor='gray', alpha=0.3, label=f'vel_upper_bound')
         
         if self.env.input_lbs is not None:
-            ax3.fill_between(self.t_eval, ax3.get_ylim()[0], self.env.input_lbs, facecolor='gray', alpha=0.3, label=f'acc_lower_bound')
+            ax3.fill_between(self.t_eval, ax3.get_ylim()[0], self.env.input_lbs, facecolor='gray', alpha=0.3, label=f'input_lower_bound')
         if self.env.input_ubs is not None:
-            ax3.fill_between(self.t_eval, self.env.input_ubs, ax3.get_ylim()[1], facecolor='gray', alpha=0.3, label=f'acc_upper_bound')
+            ax3.fill_between(self.t_eval, self.env.input_ubs, ax3.get_ylim()[1], facecolor='gray', alpha=0.3, label=f'input_upper_bound')
 
         # Set labels and legends
         ax1.set_xlabel("Time (s)")
@@ -2765,7 +2808,7 @@ class Visualizer:
         ax2.legend()
 
         ax3.set_xlabel("Time (s)")
-        ax3.set_ylabel("Acceleration (m/s^2)")
+        ax3.set_ylabel("Input (m/s^2)")
         ax3.legend()
 
         plt.tight_layout()
@@ -2783,10 +2826,10 @@ class Visualizer:
         # Plot the reference and evaluated trajectories for each simulator
         for simulator_ref in simulators:
             if not np.all(simulator_ref.cost2go_arr):
-                raise ValueError(f"Failed to get trajectory from simulator {simulator_ref.controller.name}. State trajectory list is void; please run 'run_simulation' first.")
+                raise ValueError(f"Failed to get trajectory from simulator {simulator_ref.controller_name}. State trajectory list is void; please run 'run_simulation' first.")
 
             # Plot cost over time
-            ax.plot(self.t_eval, simulator_ref.cost2go_arr, linestyle="--", label=f"{simulator_ref.controller.name} Cost-to-go", color=self.color_list[color_index])
+            ax.plot(self.t_eval, simulator_ref.cost2go_arr, linestyle="--", label=f"{simulator_ref.controller_name} Cost-to-go", color=self.color_list[color_index])
 
             color_index += 1
         
@@ -2802,7 +2845,7 @@ class Visualizer:
             )
 
         # Plot cost over time
-        ax.plot(self.t_eval, self.simulator.cost2go_arr, label=f"{self.simulator.controller.name} Cost-to-go", color=self.color_list[color_index])
+        ax.plot(self.t_eval, self.simulator.cost2go_arr, label=f"{self.simulator.controller_name} Cost-to-go", color=self.color_list[color_index])
 
         color_index += 1
     
@@ -2858,14 +2901,15 @@ class Visualizer:
         initial_h = float(self.env.h(self.env.initial_position).full().flatten()[0])
         target_h = float(self.env.h(self.env.target_position).full().flatten()[0])
 
-        ax1.scatter([self.env.initial_position], [initial_h], color="blue", label="Initial position")
-        ax1.scatter([self.env.target_position], [target_h], color="orange", label="Target position")
+        ax1.scatter([self.env.initial_position], [initial_h], color="blue", label="Start")
+        #ax1.scatter([self.env.target_position], [target_h], color="orange", label="Target position")
+        ax1.plot(self.env.target_position, target_h, marker='x', color='red', markersize=10, markeredgewidth=3, label='Target')
         ax1.legend()
 
 
         # Setting simplyfied car model as rectangle, and update the plotting to display the animation
         car_height = self.car_length / 2
-        car = Rectangle((0, 0), self.car_length, car_height, color="red")
+        car = Rectangle((0, 0), self.car_length, car_height, color="orange")
         ax1.add_patch(car)
 
         def update(frame):
@@ -2874,7 +2918,7 @@ class Visualizer:
             current_theta = float(self.env.theta(current_position).full().flatten()[0])
 
             # Update position and attitude of car
-            car.set_xy((current_position, float(self.env.h(current_position).full().flatten()[0])))
+            car.set_xy((current_position - self.car_length / 2, float(self.env.h(current_position).full().flatten()[0])))
             car.angle = np.degrees(current_theta)  # rad to deg
 
         # Instantiate animation
@@ -2920,16 +2964,18 @@ class Visualizer:
         # Mark the initial state and the target state in the plotting
         initial_h = float(self.env.h(self.env.initial_position).full().flatten()[0])
         target_h = float(self.env.h(self.env.target_position).full().flatten()[0])
-        axes[0].scatter([self.env.initial_position], [initial_h], color="blue", label="Initial position")
-        axes[0].scatter([self.env.target_position], [target_h], color="orange", label="Target position")
+        axes[0].scatter([self.env.initial_position], [initial_h], color="blue", label="Start")
+        #axes[0].scatter([self.env.target_position], [target_h], color="orange", label="Target position")
+        axes[0].plot(self.env.target_position, target_h, marker='x', color='red', markersize=10, markeredgewidth=3, label='Target')
         axes[0].legend()
 
         for ax, sim in zip(axes[1:], simulators):
 
             initial_h = float(sim.env.h(self.env.initial_position).full().flatten()[0])
             target_h = float(sim.env.h(self.env.target_position).full().flatten()[0])
-            ax.scatter([sim.env.initial_position], [initial_h], color="blue", label="Initial position")
-            ax.scatter([sim.env.target_position], [target_h], color="orange", label="Target position")
+            ax.scatter([sim.env.initial_position], [initial_h], color="blue", label="Start")
+            #ax.scatter([sim.env.target_position], [target_h], color="orange", label="Target position")
+            ax.plot(sim.env.target_position, target_h, marker='x', color='red', markersize=10, markeredgewidth=3, label='Target')
             ax.legend()
 
 
@@ -2940,12 +2986,12 @@ class Visualizer:
 
         car_self = Rectangle((0, 0), self.car_length, car_height, color=self.color)
         axes[0].add_patch(car_self)
-        axes[0].set_title(f"{self.controller.name}")
+        axes[0].set_title(f"{self.simulator.controller_name}")
 
         for ax, sim, color in zip(axes[1:], simulators, colors):
             car = Rectangle((0, 0), self.car_length, car_height, color=color)
             ax.add_patch(car)
-            ax.set_title(f"{sim.controller.name}")
+            ax.set_title(f"{sim.controller_name}")
             car_objects[sim] = car
 
 
@@ -2953,13 +2999,13 @@ class Visualizer:
             # Update car for self
             current_position = self.position[frame]
             current_theta = float(self.env.theta(current_position).full().flatten()[0])
-            car_self.set_xy((current_position, float(self.env.h(current_position).full().flatten()[0])))
+            car_self.set_xy((current_position - self.car_length / 2, float(self.env.h(current_position).full().flatten()[0])))
             car_self.angle = np.degrees(current_theta)  # rad to deg
 
             for sim, car in car_objects.items():
                 current_position = sim.get_trajectories()[0][:, 0][frame]
                 current_theta = float(sim.env.theta(current_position).full().flatten()[0])
-                car.set_xy((current_position, float(sim.env.h(current_position).full().flatten()[0])))
+                car.set_xy((current_position - self.car_length / 2, float(sim.env.h(current_position).full().flatten()[0])))
                 car.angle = np.degrees(current_theta)  # rad to deg
 
         # Instantiate animation
