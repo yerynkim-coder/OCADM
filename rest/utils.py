@@ -4,6 +4,7 @@ import pickle
 import casadi as ca
 import scipy.linalg
 import copy
+import time
 from scipy.integrate import solve_ivp
 from scipy.optimize import minimize
 import matplotlib.pyplot as plt
@@ -69,15 +70,8 @@ class Env:
                 elif case == 2: # constant slope
                     h = (ca.pi * p) / 18
 
-                elif case == 3: # varying slope
-                    h_center = ca.cos(3 * (p - ca.pi/2))
-                    h_flat_left = 1
-                    h_flat_right = -1
-
-                    condition_left = p <= -ca.pi/6
-                    condition_right = p >= ca.pi/6
-
-                    h = ca.if_else(condition_left, h_flat_left, ca.if_else(condition_right, h_flat_right, h_center))
+                elif case == 3: # varying slope (small disturbance)
+                    h = 0.1 * ca.cos(18 * p)
 
                 elif case == 4: # varying slope (underactated case)
 
@@ -1084,14 +1078,16 @@ class DPController(BaseController):
             self.Q_sym = sp.diag(q1, q2)
             self.R_sym = sp.Symbol('r')
             self.Qf_sym = sp.diag(q1, q2)
+            # Create symbolic reference state
+            p_ref, v_ref = sp.symbols('p_ref v_ref')
+            x_ref = [p_ref, v_ref]
+            self.x_ref_sym = sp.Matrix(x_ref) 
         else:
             self.Q_sym = sp.Matrix(self.Q)
             self.R_sym = sp.Float(self.R)
             self.Qf_sym = sp.Matrix(self.Qf)
-        # Create symbolic reference state
-        p_ref, v_ref = sp.symbols('p_ref v_ref')
-        x_ref = [p_ref, v_ref]
-        self.x_ref_sym = sp.Matrix(x_ref) 
+            # Create numpy reference state
+            self.x_ref_sym = sp.Matrix(self.target_state) 
 
         # Make a copy
         J, mu = self.J_sym, self.mu_sym
@@ -1214,8 +1210,6 @@ class DPController(BaseController):
             subs_dict = {
                 sp.Symbol(f'p_{current_step}'): current_state[0],
                 sp.Symbol(f'v_{current_step}'): current_state[1],
-                sp.Symbol('p_ref'): self.target_state[0], 
-                sp.Symbol('v_ref'): self.target_state[1]
             }
     
         mu = float(mu_expr.subs(subs_dict).evalf())
@@ -1236,6 +1230,7 @@ class FiniteLQRController(BaseController):
             dynamics: Dynamics, 
             Q: np.ndarray, 
             R: np.ndarray, 
+            Q_N: np.ndarray, 
             freq: float, 
             horizon: int,
             name: str = 'LQR_finite', 
@@ -1248,6 +1243,7 @@ class FiniteLQRController(BaseController):
         # Initialize as private property
         self._Q = None
         self._R = None
+        self._Q_N = None
 
         self.N = horizon
 
@@ -1256,6 +1252,7 @@ class FiniteLQRController(BaseController):
         # Call setter for the check and update the value of private property
         self.Q = Q
         self.R = R
+        self.Q_N = Q_N
 
         self.A = None  # State transfer matrix
         self.B = None  # Input matrix
@@ -1280,6 +1277,22 @@ class FiniteLQRController(BaseController):
             print("Check passed, Q is a symmetric, positive semi-definite matrix.")
 
         self._Q = value
+
+    @property
+    def Q_N(self) -> np.ndarray:
+        return self._Q_N
+
+    @Q_N.setter
+    def Q_N(self, value: np.ndarray) -> None:
+
+        is_square(value)
+        is_symmetric(value)
+        is_positive_semi_definite(value)
+
+        if self.verbose:
+            print("Check passed, Q_N is a symmetric, positive semi-definite matrix.")
+
+        self._Q_N = value
 
     @property
     def R(self) -> np.ndarray:
@@ -1312,13 +1325,13 @@ class FiniteLQRController(BaseController):
         )
 
         # Initialize terminal cost
-        P = self.Q.copy()
+        P = self.Q_N.copy()
 
         # Solve Bellman Recursion from backwardsto compute gain matrix
         for k in reversed(range(self.N)):
-            K = np.linalg.inv(self.R + self.B.T @ P @ self.B) @ (self.B.T @ P @ self.A)
+            K = - np.linalg.inv(self.R + self.B.T @ P @ self.B) @ (self.B.T @ P @ self.A)
             self.K_list[k] = K
-            P = self.Q + self.A.T @ P @ self.A - self.A.T @ P @ self.B @ K
+            P = self.Q + self.A.T @ P @ self.A + self.A.T @ P @ self.B @ K
 
         if self.verbose:
             print(f"LQR Gain Matrix K: {self.K}")
@@ -1340,7 +1353,7 @@ class FiniteLQRController(BaseController):
         K_k = self.K_list[k]
 
         # Apply control law
-        u = self.u_eq- K_k @ det_x
+        u = self.u_eq + K_k @ det_x
 
         return u
 
@@ -1419,7 +1432,7 @@ class LQRController(BaseController):
     @K.setter
     def K(self, value: np.ndarray) -> None:
 
-        eigvals = np.linalg.eigvals(self.A - self.B @ value)
+        eigvals = np.linalg.eigvals(self.A + self.B @ value)
 
         if np.any(np.abs(eigvals) > 1):
             raise ValueError("Warning: not all eigenvalue of A_cl inside unit circle, close-loop system is unstable!")
@@ -1445,7 +1458,7 @@ class LQRController(BaseController):
 
         # Solve DARE to compute gain matrix
         P = scipy.linalg.solve_discrete_are(self.A, self.B, self.Q, self.R)
-        self.K = np.linalg.inv(self.R + self.B.T @ P @ self.B) @ (self.B.T @ P @ self.A)
+        self.K = - np.linalg.inv(self.R + self.B.T @ P @ self.B) @ (self.B.T @ P @ self.A)
 
         if self.verbose:
             print(f"LQR Gain Matrix K: {self.K}")
@@ -1459,7 +1472,7 @@ class LQRController(BaseController):
         det_x = current_state - self.target_state
 
         # Apply control law
-        u = self.u_eq- self.K @ det_x
+        u = self.u_eq + self.K @ det_x
         return u
 
 
