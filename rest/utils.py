@@ -71,7 +71,7 @@ class Env:
                     h = (ca.pi * p) / 18
 
                 elif case == 3: # varying slope (small disturbance)
-                    h = 0.1 * ca.cos(18 * p)
+                    h = 0.005 * ca.cos(18 * p)
 
                 elif case == 4: # varying slope (underactated case)
 
@@ -1473,6 +1473,12 @@ class LQRController(BaseController):
 
         # Apply control law
         u = self.u_eq + self.K @ det_x
+
+        print(f"self.u_eq: {self.u_eq}")
+        print(f"self.K: {self.K}")
+        print(f"det_x: {det_x}")
+        print(f"self.K @ det_x: {self.K @ det_x}")
+
         return u
 
 
@@ -2761,6 +2767,14 @@ class Visualizer:
 
         fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(20, 4))
 
+        # Plot current object's trajectories
+        ax1.plot(self.t_eval, self.position, label=f"{self.simulator.controller_name} Position", color=self.color)
+
+        ax2.plot(self.t_eval, self.velocity, label=f"{self.simulator.controller_name} Velocity", color=self.color)
+
+        #ax3.plot(self.t_eval[:-1], self.acceleration, label=f"{self.simulator.controller_name} Input", color=self.color)
+        ax3.step(self.t_eval, np.append(self.acceleration, self.acceleration[-1]), where='post', label=f"{self.simulator.controller_name} Input", color=self.color)
+
         # Plot the reference and evaluated trajectories for each simulator
         for simulator_ref in simulators:
             if not simulator_ref.state_traj:
@@ -2785,16 +2799,7 @@ class Visualizer:
             ax3.step(self.t_eval, np.append(acceleration_ref, acceleration_ref[-1]), where='post', linestyle="--", label=f"{simulator_ref.controller_name} Input", color=self.color_list[color_index])
 
             color_index += 1
-
-        # Plot current object's trajectories
-        ax1.plot(self.t_eval, self.position, label=f"{self.simulator.controller_name} Position", color=self.color)
-
-        ax2.plot(self.t_eval, self.velocity, label=f"{self.simulator.controller_name} Velocity", color=self.color)
-
-        #ax3.plot(self.t_eval[:-1], self.acceleration, label=f"{self.simulator.controller_name} Input", color=self.color)
-        ax3.step(self.t_eval, np.append(self.acceleration, self.acceleration[-1]), where='post', label=f"{self.simulator.controller_name} Input", color=self.color)
-
-
+            
         # Plot shadowed zone for state bounds
         if self.env.state_lbs is not None:
             ax1.fill_between(self.t_eval, ax1.get_ylim()[0], self.env.state_lbs[0], facecolor='gray', alpha=0.3, label=f'pos_lower_bound')
@@ -2890,19 +2895,19 @@ class Visualizer:
         fig, ax1 = plt.subplots(1, 1, figsize=self.figsize)
         
         # Define size of plotting
-        p_max = max(self.position)
-        p_min = min(self.position)
+        p_max = 1.0 #max(self.position)
+        p_min = -1.0 #min(self.position)
         start_extension = p_min - 0.3
         end_extension = p_max + 0.3
 
-        p_disp_vals = np.linspace(start_extension, end_extension, 50) # generate grid mesh on p
+        p_disp_vals = np.linspace(start_extension, end_extension, 200) # generate grid mesh on p
 
         h_disp_vals = [float(self.env.h(p).full().flatten()[0]) for p in p_disp_vals]
-        h_max = max(h_disp_vals)
-        h_min = min(h_disp_vals)
+        h_max = 1.0 #max(h_disp_vals)
+        h_min = -1.0 #min(h_disp_vals)
 
         ax1.set_xlim(start_extension-0.5, end_extension+0.5)
-        ax1.set_ylim(h_min-0.5, h_max+0.5)
+        ax1.set_ylim(h_min-0.3, h_max+0.3)
 
         # Draw mountain profile curve h(p)
         ax1.plot(p_disp_vals, h_disp_vals, label="Mountain profile h(p)", color="green")
@@ -2946,18 +2951,18 @@ class Visualizer:
         fig, axes = plt.subplots(num_plots, 1, figsize=(self.figsize[0], self.figsize[1] * num_plots), sharex=True)
 
         # Define size of plotting
-        p_max = max(max(sim.get_trajectories()[0][:, 0]) for sim in simulators)
-        p_min = min(min(sim.get_trajectories()[0][:, 0]) for sim in simulators)
+        p_max = 1.0 #max(max(sim.get_trajectories()[0][:, 0]) for sim in simulators)
+        p_min = -1.0 #min(min(sim.get_trajectories()[0][:, 0]) for sim in simulators)
         start_extension = p_min - 0.3
         end_extension = p_max + 0.3
 
-        p_disp_vals = np.linspace(start_extension, end_extension, 50)  # generate grid mesh on p
+        p_disp_vals = np.linspace(start_extension, end_extension, 200)  # generate grid mesh on p
 
         h_disp_vals = [float(self.env.h(p).full().flatten()[0]) for p in p_disp_vals]
-        h_max = max(h_disp_vals)
-        h_min = min(h_disp_vals)
+        h_max = 1.0 #max(h_disp_vals)
+        h_min = -1.0 #min(h_disp_vals)
         axes[0].set_xlim(start_extension - 0.5, end_extension + 0.5)
-        axes[0].set_ylim(h_min - 0.2, h_max + 0.3)
+        axes[0].set_ylim(h_min - 0.3, h_max + 0.3)
         axes[0].plot(p_disp_vals, h_disp_vals, label="Mountain profile h(p)", color="green")
         axes[0].set_xlabel("Position p")
         axes[0].set_ylabel("Height h")
@@ -2965,10 +2970,8 @@ class Visualizer:
         for ax, sim in zip(axes[1:], simulators):
 
             h_disp_vals = [float(sim.env.h(p).full().flatten()[0]) for p in p_disp_vals]
-            h_max = max(h_disp_vals)
-            h_min = min(h_disp_vals)
             ax.set_xlim(start_extension - 0.5, end_extension + 0.5)
-            ax.set_ylim(h_min - 0.2, h_max + 0.3)
+            ax.set_ylim(h_min - 0.3, h_max + 0.3)
             ax.plot(p_disp_vals, h_disp_vals, label="Mountain profile h(p)", color="green")
             ax.set_xlabel("Position p")
             ax.set_ylabel("Height h")
@@ -3012,19 +3015,109 @@ class Visualizer:
             # Update car for self
             current_position = self.position[frame]
             current_theta = float(self.env.theta(current_position).full().flatten()[0])
-            car_self.set_xy((current_position - self.car_length / 2, float(self.env.h(current_position).full().flatten()[0])))
+            car_self.set_xy((current_position - self.car_length / 2, float(self.env.h(current_position - self.car_length / 2).full().flatten()[0])))
             car_self.angle = np.degrees(current_theta)  # rad to deg
 
             for sim, car in car_objects.items():
                 current_position = sim.get_trajectories()[0][:, 0][frame]
                 current_theta = float(sim.env.theta(current_position).full().flatten()[0])
-                car.set_xy((current_position - self.car_length / 2, float(sim.env.h(current_position).full().flatten()[0])))
+                car.set_xy((current_position - self.car_length / 2, float(sim.env.h(current_position - self.car_length / 2).full().flatten()[0])))
                 car.angle = np.degrees(current_theta)  # rad to deg
 
         # Instantiate animation
         anim = FuncAnimation(fig, update, frames=len(self.t_eval), interval=1000 / self.refresh_rate, repeat=False)
 
         return HTML(anim.to_jshtml())
+    
+    def display_contrast_animation_same(self, *simulators) -> HTML:
+        import matplotlib.patches as mpatches
+
+        # Setup figure
+        fig, ax = plt.subplots(1, 1, figsize=(self.figsize[0], self.figsize[1]))
+
+        # Plot mountain profile
+        p_max, p_min = 1.0, -1.0
+        start_extension, end_extension = p_min - 0.3, p_max + 0.3
+        p_disp_vals = np.linspace(start_extension, end_extension, 200)
+        h_disp_vals = [float(self.env.h(p).full().flatten()[0]) for p in p_disp_vals]
+
+        ax.set_xlim(start_extension - 0.5, end_extension + 0.5)
+        ax.set_ylim(-1.3, 1.3)
+        profile_plot, = ax.plot(p_disp_vals, h_disp_vals, label="Mountain profile h(p)", color="green")
+
+        ax.set_xlabel("Position p")
+        ax.set_ylabel("Height h")
+
+        # Start & Target markers
+        initial_h = float(self.env.h(self.env.initial_position).full().flatten()[0])
+        target_h = float(self.env.h(self.env.target_position).full().flatten()[0])
+        start_scatter = ax.scatter([self.env.initial_position], [initial_h], color="blue", label="Start")
+        target_cross = ax.plot(self.env.target_position, target_h, marker='x', color='red', markersize=10, markeredgewidth=3, label='Target')[0]
+
+        # Car setup
+        car_objects = {}
+        colors = [self.color] + self.color_list[:len(simulators)]
+        car_height = self.car_length / 2
+
+        # Self car
+        car_self = Rectangle((0, 0), self.car_length, car_height,
+                            edgecolor=self.color, facecolor='none', linewidth=2)
+        ax.add_patch(car_self)
+        car_objects[self] = car_self
+
+        # Simulators' cars
+        for sim, color in zip(simulators, colors[1:]):
+            car = Rectangle((0, 0), self.car_length, car_height,
+                            edgecolor=color, facecolor='none', linewidth=2)
+            ax.add_patch(car)
+            car_objects[sim] = car
+
+        # Title using correct controller names
+        controller_names = " vs. ".join(
+            [self.simulator.controller_name] + [sim.controller_name for sim in simulators]
+        )
+        ax.set_title(controller_names)
+
+        # Legend
+        custom_handles = [profile_plot, start_scatter, target_cross]
+
+        car_legend_handles = [
+            mpatches.Patch(edgecolor=self.color, facecolor='none', linewidth=2, label=self.simulator.controller_name)
+        ]
+        for sim, color in zip(simulators, colors[1:]):
+            car_legend_handles.append(
+                mpatches.Patch(edgecolor=color, facecolor='none', linewidth=2, label=sim.controller_name)
+            )
+
+        ax.legend(handles=custom_handles + car_legend_handles, loc='best')
+
+        # Animation update function
+        def update(frame):
+            # Self
+            current_position = self.position[frame]
+            current_theta = float(self.env.theta(current_position).full().flatten()[0])
+            y_base = float(self.env.h(current_position).full().flatten()[0])
+            car_self.set_xy((current_position - self.car_length / 2, y_base))
+            car_self.angle = np.degrees(current_theta)
+
+            # Simulators
+            for sim, car in car_objects.items():
+                if sim is self:
+                    continue
+                current_position = sim.get_trajectories()[0][:, 0][frame]
+                current_theta = float(sim.env.theta(current_position).full().flatten()[0])
+                y_base = float(sim.env.h(current_position).full().flatten()[0])
+                car.set_xy((current_position - self.car_length / 2, y_base))
+                car.angle = np.degrees(current_theta)
+
+        # Animate
+        anim = FuncAnimation(fig, update, frames=len(self.t_eval),
+                            interval=1000 / self.refresh_rate, repeat=False)
+        return HTML(anim.to_jshtml())
+
+
+
+
 
 
 
