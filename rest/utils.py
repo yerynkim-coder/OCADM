@@ -109,6 +109,37 @@ class Env:
             ubs_position = self.target_position+0.2
 
         self.p_vals_disp = np.linspace(lbs_position, ubs_position, 200)
+    
+    def show_slope(self) -> None:
+        
+        # Calculate values of h and theta on grid mesh
+        h_vals = [float(self.h(p)) for p in self.p_vals_disp]
+        theta_vals = [float(self.theta(p)) for p in self.p_vals_disp]
+        
+        # Calculate teh value of h for initial state and terminal state
+        initial_h = float(self.h(self.initial_position).full().flatten()[0])
+        target_h = float(self.h(self.target_position).full().flatten()[0])
+        
+        # Display curve theta(p) (left), h(p) (right)
+        _, ax = plt.subplots(1, 2, figsize=(12, 3))
+
+        # h(p)
+        ax[0].plot(self.p_vals_disp, h_vals, label="h(p)", color='green')
+        ax[0].set_xlabel("p")
+        ax[0].set_ylabel("h")
+        ax[0].set_ylim(-1.4, 1.4)  
+        ax[0].set_title("h(p)")
+        ax[0].legend()
+
+        # theta(p)
+        ax[1].plot(self.p_vals_disp, theta_vals, label=r"$\theta(p)$", color='blue')
+        ax[1].set_xlabel("p")
+        ax[1].set_ylabel(r"$\theta$")
+        ax[1].set_ylim(-1.5, 1.5)  
+        ax[1].set_title(r"$\theta$($p$)")
+        ax[1].legend()
+
+        plt.show()
 
     def test_env(self) -> None:
         
@@ -1259,6 +1290,8 @@ class FiniteLQRController(BaseController):
 
         self.x_eq = None  # Equilibrium state
         self.u_eq = None  # Equilibrium input
+
+        self.state_lin = self.target_state
         
         self.setup()
 
@@ -1314,7 +1347,7 @@ class FiniteLQRController(BaseController):
         
         # Set up equilibrium state
         # Note that if target state is not on the slope, self.u_eq = 0 -> will not work for the nonlinear case
-        self.x_eq = self.target_state
+        self.x_eq = self.state_lin
 
         # Solve input at equilibrium
         self.u_eq = self.dynamics.get_equilibrium_input(self.x_eq)
@@ -1388,6 +1421,8 @@ class LQRController(BaseController):
 
         self.x_eq = None  # Equilibrium state
         self.u_eq = None  # Equilibrium input
+
+        self.state_lin = self.target_state
         
         # need no external objects for setup, can directly call the setup function here
         if self.type in ['LQR', 'MPC']:
@@ -1441,12 +1476,19 @@ class LQRController(BaseController):
             print(f"Check passed, current gain K={value}, close-loop system is stable.")
 
         self._K = value
+    
+    def set_lin_point(self, state_lin: np.ndarray) -> None:
+
+        self.state_lin = state_lin
+        
+        # Refresh
+        self.setup()
 
     def setup(self) -> None:
         
         # Set up equilibrium state
         # Note that if target state is not on the slope, self.u_eq = 0 -> will not work for the nonlinear case
-        self.x_eq = self.target_state
+        self.x_eq = self.state_lin
 
         # Solve input at equilibrium
         self.u_eq = self.dynamics.get_equilibrium_input(self.x_eq)
@@ -1474,10 +1516,10 @@ class LQRController(BaseController):
         # Apply control law
         u = self.u_eq + self.K @ det_x
 
-        print(f"self.u_eq: {self.u_eq}")
-        print(f"self.K: {self.K}")
-        print(f"det_x: {det_x}")
-        print(f"self.K @ det_x: {self.K @ det_x}")
+        #print(f"self.u_eq: {self.u_eq}")
+        #print(f"self.K: {self.K}")
+        #print(f"det_x: {det_x}")
+        #print(f"self.K @ det_x: {self.K @ det_x}")
 
         return u
 
@@ -2918,16 +2960,21 @@ class Visualizer:
         # Mark the intial state and the target state in the plotting
         initial_h = float(self.env.h(self.env.initial_position).full().flatten()[0])
         target_h = float(self.env.h(self.env.target_position).full().flatten()[0])
-
         ax1.scatter([self.env.initial_position], [initial_h], color="blue", label="Start")
         #ax1.scatter([self.env.target_position], [target_h], color="orange", label="Target position")
         ax1.plot(self.env.target_position, target_h, marker='x', color='red', markersize=10, markeredgewidth=3, label='Target')
+
+        if self.controller.type is 'LQR' and self.controller.state_lin is not self.controller.target_state:
+            lin_position = self.controller.state_lin[0]
+            lin_h = float(self.env.h(lin_position).full().flatten()[0])
+            ax1.plot(lin_position, lin_h, marker='v', color='orange', markersize=7, markeredgewidth=3, label='Linearization Point')
+
         ax1.legend()
 
 
         # Setting simplyfied car model as rectangle, and update the plotting to display the animation
         car_height = self.car_length / 2
-        car = Rectangle((0, 0), self.car_length, car_height, color="orange")
+        car = Rectangle((0, 0), self.car_length, car_height, color="black")
         ax1.add_patch(car)
 
         def update(frame):
@@ -2936,11 +2983,13 @@ class Visualizer:
             current_theta = float(self.env.theta(current_position).full().flatten()[0])
 
             # Update position and attitude of car
-            car.set_xy((current_position - self.car_length / 2, float(self.env.h(current_position).full().flatten()[0])))
+            car.set_xy((current_position - self.car_length / 2, float(self.env.h(current_position - self.car_length / 2).full().flatten()[0])))
             car.angle = np.degrees(current_theta)  # rad to deg
 
         # Instantiate animation
         anim = FuncAnimation(fig, update, frames=len(self.t_eval), interval=1000 / self.refresh_rate, repeat=False)
+
+        plt.close(fig)
 
         return HTML(anim.to_jshtml())
     
@@ -3026,6 +3075,8 @@ class Visualizer:
 
         # Instantiate animation
         anim = FuncAnimation(fig, update, frames=len(self.t_eval), interval=1000 / self.refresh_rate, repeat=False)
+
+        plt.close(fig)
 
         return HTML(anim.to_jshtml())
     
@@ -3113,6 +3164,9 @@ class Visualizer:
         # Animate
         anim = FuncAnimation(fig, update, frames=len(self.t_eval),
                             interval=1000 / self.refresh_rate, repeat=False)
+        
+        plt.close(fig)
+        
         return HTML(anim.to_jshtml())
 
 
