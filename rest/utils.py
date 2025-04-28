@@ -2964,7 +2964,7 @@ class Visualizer:
         #ax1.scatter([self.env.target_position], [target_h], color="orange", label="Target position")
         ax1.plot(self.env.target_position, target_h, marker='x', color='red', markersize=10, markeredgewidth=3, label='Target')
 
-        if self.controller.type is 'LQR' and self.controller.state_lin is not self.controller.target_state:
+        if self.controller.type == 'LQR' and not np.allclose(self.controller.state_lin, self.controller.target_state):
             lin_position = self.controller.state_lin[0]
             lin_h = float(self.env.h(lin_position).full().flatten()[0])
             ax1.plot(lin_position, lin_h, marker='v', color='orange', markersize=7, markeredgewidth=3, label='Linearization Point')
