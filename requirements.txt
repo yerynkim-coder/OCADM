@@ -1,0 +1,6 @@
+numpy
+sympy
+casadi
+scipy
+matplotlib
+acados_template
