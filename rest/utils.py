@@ -2889,7 +2889,7 @@ class Visualizer:
                 raise ValueError(f"Failed to get trajectory from simulator {simulator_ref.controller_name}. State trajectory list is void; please run 'run_simulation' first.")
 
             # Plot cost over time
-            ax.plot(self.t_eval, simulator_ref.cost2go_arr, linestyle="--", label=f"{simulator_ref.controller_name} Cost-to-go", color=self.color_list[color_index])
+            ax.plot(self.t_eval, np.append(simulator_ref.cost2go_arr, simulator_ref.cost2go_arr[-1]), linestyle="--", label=f"{simulator_ref.controller_name} Cost-to-go", color=self.color_list[color_index])
 
             color_index += 1
         
@@ -2905,7 +2905,7 @@ class Visualizer:
             )
 
         # Plot cost over time
-        ax.plot(self.t_eval, self.simulator.cost2go_arr, label=f"{self.simulator.controller_name} Cost-to-go", color=self.color_list[color_index])
+        ax.plot(self.t_eval, np.append(self.simulator.cost2go_arr, self.simulator.cost2go_arr[-1]), label=f"{self.simulator.controller_name} Cost-to-go", color=self.color_list[color_index])
 
         color_index += 1
     
