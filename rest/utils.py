@@ -3147,7 +3147,7 @@ class Visualizer:
             # Self
             current_position = self.position[frame]
             current_theta = float(self.env.theta(current_position).full().flatten()[0])
-            y_base = float(self.env.h(current_position).full().flatten()[0])
+            y_base = float(self.env.h(current_position - self.car_length / 2).full().flatten()[0])
             car_self.set_xy((current_position - self.car_length / 2, y_base))
             car_self.angle = np.degrees(current_theta)
 
@@ -3157,7 +3157,7 @@ class Visualizer:
                     continue
                 current_position = sim.get_trajectories()[0][:, 0][frame]
                 current_theta = float(sim.env.theta(current_position).full().flatten()[0])
-                y_base = float(sim.env.h(current_position).full().flatten()[0])
+                y_base = float(sim.env.h(current_position - self.car_length / 2).full().flatten()[0])
                 car.set_xy((current_position - self.car_length / 2, y_base))
                 car.angle = np.degrees(current_theta)
 
