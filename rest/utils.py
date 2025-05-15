@@ -13,6 +13,7 @@ from typing import List, Callable, Union, Optional, Tuple, Any
 from functools import wraps
 from matplotlib.patches import Rectangle
 from matplotlib.animation import FuncAnimation
+import matplotlib.gridspec as gridspec
 from IPython.display import display, HTML
 from scipy.interpolate import interp2d
 
@@ -300,6 +301,45 @@ class Dynamics:
             raise ValueError(f"System (A, B) is not controllable，rank of controllability matrix is {rank}, while the dimension of state space is {self.dim_states}.")
         
         return A_d, B_d
+    
+    def get_linearized_AB_discrete_sym(self, dt: float) -> Tuple[ca.Function, ca.Function]:
+        """
+        Return CasADi-wrapped functions A_d(x,u), B_d(x,u) by computing
+        ZOH-discretized matrices using scipy.linalg.expm (safe, plugin-free).
+        """
+
+        # MX symbolic variables
+        x = ca.MX.sym("x", self.dim_states)
+        u = ca.MX.sym("u", self.dim_inputs)
+
+        f = self.dynamics_function(x, u)
+
+        A_c = ca.jacobian(f, x)
+        B_c = ca.jacobian(f, u)
+
+        A_func = ca.Function("A_c_func", [x, u], [A_c])
+        B_func = ca.Function("B_c_func", [x, u], [B_c])
+
+        def compute_discrete_matrices(x_val, u_val):
+            A_val = np.array(A_func(x_val, u_val))
+            B_val = np.array(B_func(x_val, u_val))
+
+            aug = np.zeros((self.dim_states + self.dim_inputs, self.dim_states + self.dim_inputs))
+            aug[:self.dim_states, :self.dim_states] = A_val
+            aug[:self.dim_states, self.dim_states:] = B_val
+
+            expm_matrix = scipy.linalg.expm(aug * dt)
+            A_d_val = expm_matrix[:self.dim_states, :self.dim_states]
+            B_d_val = expm_matrix[:self.dim_states, self.dim_states:]
+
+            return A_d_val, B_d_val
+
+        # CasADi external function wrapping NumPy+SciPy code
+        A_d_func = ca.external("A_d_func", lambda x_, u_: compute_discrete_matrices(x_, u_)[0])
+        B_d_func = ca.external("B_d_func", lambda x_, u_: compute_discrete_matrices(x_, u_)[1])
+
+        return A_d_func, B_d_func
+
     
     def get_equilibrium_input(self, state: np.ndarray) -> float:
 
@@ -1548,6 +1588,7 @@ class iLQRController(LQRController):
 
         self.K_k_arr = None
         self.u_kff_arr = None
+        self.total_cost_list = []  # Store total cost per iteration
 
         super().__init__(env, dynamics, Q, R, freq, name, type, verbose)
 
@@ -1555,64 +1596,49 @@ class iLQRController(LQRController):
         """
         Perform iLQR to compute the optimal control sequence.
         """
-
-        # Set up equilibrium state
-        # Note that if target state is not on the slope, self.u_eq = 0 -> will not work for the nonlinear case
         self.x_eq = self.target_state
-
-        # Solve input at equilibrium
         self.u_eq = self.dynamics.get_equilibrium_input(self.x_eq)
-        
-        # Start iLQR
+
         N = len(input_traj)
 
-        # Initialize state and control trajectories
-        x_traj = np.zeros((self.dim_states, N+1))  # State trajector
-        u_traj = np.copy(input_traj)  # Control trajectory
-        x_traj[:, 0] = self.init_state  # Initial state
-        
-        # Initialize fb and ff gain
+        x_traj = np.zeros((self.dim_states, N+1))
+        u_traj = np.copy(input_traj)
+        x_traj[:, 0] = self.init_state
+
         self.K_k_arr = np.zeros((self.dim_states, N))
-        self.u_kff_arr = np.zeros((N))
+        self.u_kff_arr = np.zeros((N,))
 
         for n in range(self.max_iter):
-
-            # Forward pass: Simulate system using current control sequence
             for k in range(N):
                 next_state = self.dynamics.one_step_forward(current_state=x_traj[:, k], current_input=u_traj[k], dt=self.dt)
                 x_traj[:, k + 1] = next_state
 
-            # Backward pass: Compute cost-to-go and update control
             x_N_det = x_traj[:, -1] - self.target_state
-            x_N_det = x_N_det.reshape(-1, 1) # reshape into column vector
-            #print(f"x_N_det: {x_N_det}")
+            x_N_det = x_N_det.reshape(-1, 1)
 
-            s_k_bar = (x_N_det.T @ self.Qf @ x_N_det) / 2 # Terminal cost
-            s_k = self.Qf @ x_N_det # Terminal cost gradient
-            S_k = self.Qf # Terminal cost Hessian
+            s_k_bar = (x_N_det.T @ self.Qf @ x_N_det) / 2
+            s_k = self.Qf @ x_N_det
+            S_k = self.Qf
 
             for k in range(N - 1, -1, -1):
-
-                # Linearize dynamics: f(x, u) ≈ A*x + B*u
                 A_lin, B_lin = self.dynamics.get_linearized_AB_discrete(current_state=x_traj[:, k], current_input=u_traj[k], dt=self.dt)
 
-                # Compute Q matrices
                 x_k_det = x_traj[:, k] - self.target_state
-                x_k_det = x_k_det.reshape(-1, 1) # reshape into column vector
+                x_k_det = x_k_det.reshape(-1, 1)
                 
                 g_k_bar = (x_k_det.T @ self.Q @ x_k_det + self.R * u_traj[k] ** 2) * self.dt / 2
                 q_k = (self.Q @ x_k_det) * self.dt
                 Q_k = (self.Q) * self.dt
                 r_k = (self.R * u_traj[k]) * self.dt
                 R_k = (self.R) * self.dt
-                P_k = np.zeros((2,)) * self.dt # should be row vector
+                P_k = np.zeros((2,)) * self.dt
 
                 l_k = (r_k + B_lin.T @ s_k)
-                G_k = (P_k + B_lin.T @ S_k @ A_lin) # should be row vector
+                G_k = (P_k + B_lin.T @ S_k @ A_lin)
                 H_k = (R_k + B_lin.T @ S_k @ B_lin)
 
                 det_u_kff = - np.linalg.inv(H_k) @ l_k
-                K_k = - np.linalg.inv(H_k) @ G_k  # should be row vector
+                K_k = - np.linalg.inv(H_k) @ G_k
                 u_kff = u_traj[k] + det_u_kff - (K_k @ x_traj[:, k])
 
                 self.K_k_arr[:, k] = (K_k.T).flatten()
@@ -1651,25 +1677,29 @@ class iLQRController(LQRController):
                     print(f"K_k.T @ H_k @ K_k: {K_k.T @ H_k @ K_k}")
                     print(f"G_k.T @ K_k: {G_k.T @ K_k}")
                 
-            # Update control sequence
             new_u_traj = np.zeros_like(u_traj)
             new_x_traj = np.zeros_like(x_traj)
             new_x_traj[:, 0] = self.init_state
-            
-            # Simulation forward to get input sequence
+
             for k in range(N):
                 new_u_traj[k] = self.u_kff_arr[k] + self.K_k_arr[:, k].T @ new_x_traj[:, k]
                 next_state = self.dynamics.one_step_forward(current_state=new_x_traj[:, k], current_input=new_u_traj[k], dt=self.dt)
                 new_x_traj[:, k + 1] = next_state
 
-            # Check for convergence
+            # ---- Compute total cost for this iteration ----
+            total_cost = 0.0
+            for k in range(N):
+                x_k_det = x_traj[:, k] - self.target_state
+                total_cost += 0.5 * (x_k_det.T @ self.Q @ x_k_det + self.R * u_traj[k] ** 2)
+            x_N_det = x_traj[:, -1] - self.target_state
+            total_cost += 0.5 * (x_N_det.T @ self.Qf @ x_N_det)
+            self.total_cost_list.append(total_cost.item())
+
             if np.max(np.abs(new_u_traj - u_traj)) < self.tol:
                 print(f"Use {n} iteration until converge.")
                 break
             else:
                 print(f"Iteration {n}: residual error is {np.max(np.abs(new_u_traj - u_traj))}")
-                #print(f"Old input trajectory: {u_traj.flatten()}")
-                #print(f"New input trajectory: {new_u_traj.flatten()}")
 
             u_traj = new_u_traj
             x_traj = new_x_traj
@@ -1680,7 +1710,6 @@ class iLQRController(LQRController):
             raise ValueError("iLQR parameters are not computed. Call setup() first.")
 
         u = self.u_kff_arr[current_step] + self.K_k_arr[:, current_step].T @ current_state
-
         return u
 
 
@@ -1836,7 +1865,7 @@ class MPCController(LQRController):
             print("MPC setup with Acados completed.")
 
     @check_input_constraints
-    def compute_action_external(self, current_state: np.ndarray, current_time) -> np.ndarray:
+    def compute_action(self, current_state: np.ndarray, current_time) -> np.ndarray:
         """
         Solve the MPC problem and compute the optimal control action.
 
@@ -2139,8 +2168,8 @@ class QLearningController(BaseController):
                     print(f"current_state: {current_state}, current_input: {current_input}, next_state: {next_state}, next_state_render: {self.mdp.state_space[:, next_state_index]}, reward: {reward}")
 
                 # Check if the episode is finished
-                terminate_condition_1 = False#next_state[0]==self.mdp.pos_partitions[-1]
-                terminate_condition_2 = False#next_state[0]==self.mdp.pos_partitions[0]
+                terminate_condition_1 = False #next_state[0]==self.mdp.pos_partitions[-1]
+                terminate_condition_2 = False #next_state[0]==self.mdp.pos_partitions[0]
                 terminate_condition_3 = np.all(self.mdp.state_space[:, next_state_index]==self.target_state)
 
                 if terminate_condition_1 or terminate_condition_2 or terminate_condition_3:
@@ -2599,7 +2628,7 @@ class Simulator:
 
             # Log the results
             self.state_traj.append(current_state)
-            self.input_traj.append(current_input)
+            self.input_traj.append(np.array(current_input).flatten())
 
             # Update timer
             self.counter += 1
@@ -2810,12 +2839,12 @@ class Visualizer:
         fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(20, 4))
 
         # Plot current object's trajectories
-        ax1.plot(self.t_eval, self.position, label=f"{self.simulator.controller_name} Position", color=self.color)
+        ax1.plot(self.t_eval, self.position, label=f"{self.simulator.controller_name}", color=self.color)
 
-        ax2.plot(self.t_eval, self.velocity, label=f"{self.simulator.controller_name} Velocity", color=self.color)
+        ax2.plot(self.t_eval, self.velocity, label=f"{self.simulator.controller_name}", color=self.color)
 
-        #ax3.plot(self.t_eval[:-1], self.acceleration, label=f"{self.simulator.controller_name} Input", color=self.color)
-        ax3.step(self.t_eval, np.append(self.acceleration, self.acceleration[-1]), where='post', label=f"{self.simulator.controller_name} Input", color=self.color)
+        #ax3.plot(self.t_eval[:-1], self.acceleration, label=f"{self.simulator.controller_name}", color=self.color)
+        ax3.step(self.t_eval, np.append(self.acceleration, self.acceleration[-1]), where='post', label=f"{self.simulator.controller_name}", color=self.color)
 
         # Plot the reference and evaluated trajectories for each simulator
         for simulator_ref in simulators:
@@ -2831,14 +2860,14 @@ class Visualizer:
             acceleration_ref = input_traj_ref
 
             # Plot position over time
-            ax1.plot(self.t_eval, position_ref, linestyle="--", label=f"{simulator_ref.controller_name} Position", color=self.color_list[color_index])
+            ax1.plot(self.t_eval, position_ref, linestyle="--", label=f"{simulator_ref.controller_name}", color=self.color_list[color_index])
 
             # Plot velocity over time
-            ax2.plot(self.t_eval, velocity_ref, linestyle="--", label=f"{simulator_ref.controller_name} Velocity", color=self.color_list[color_index])
+            ax2.plot(self.t_eval, velocity_ref, linestyle="--", label=f"{simulator_ref.controller_name}", color=self.color_list[color_index])
 
             # Plot acceleration over time
-            #ax3.plot(self.t_eval[:-1], acceleration_ref, linestyle="--", label=f"{simulator_ref.controller_name} Input", color=self.color_list[color_index])
-            ax3.step(self.t_eval, np.append(acceleration_ref, acceleration_ref[-1]), where='post', linestyle="--", label=f"{simulator_ref.controller_name} Input", color=self.color_list[color_index])
+            #ax3.plot(self.t_eval[:-1], acceleration_ref, linestyle="--", label=f"{simulator_ref.controller_name}", color=self.color_list[color_index])
+            ax3.step(self.t_eval, np.append(acceleration_ref, acceleration_ref[-1]), where='post', linestyle="--", label=f"{simulator_ref.controller_name}", color=self.color_list[color_index])
 
             color_index += 1
             
@@ -2881,7 +2910,19 @@ class Visualizer:
         if not simulators:
             raise ValueError("No simulator references provided.")
 
-        fig, ax = plt.subplots(1, 1, figsize=(10, 4))
+        fig = plt.figure(figsize=(8, 8))
+        gs = gridspec.GridSpec(2, 2, height_ratios=[1, 1])
+        gs.update(hspace=0.4, wspace=0.3)
+
+        # cost vs time
+        ax0 = fig.add_subplot(gs[0, 0]) 
+        ax0.set_title("Total Cost w.r.t. simulation time")
+
+        # cost vs iteration
+        ax1 = fig.add_subplot(gs[1, :])       
+        ax1.set_title("Total Cost w.r.t. iLQR Iteration")
+
+        ax = [ax0, ax1] 
 
         # Plot the reference and evaluated trajectories for each simulator
         for simulator_ref in simulators:
@@ -2889,13 +2930,13 @@ class Visualizer:
                 raise ValueError(f"Failed to get trajectory from simulator {simulator_ref.controller_name}. State trajectory list is void; please run 'run_simulation' first.")
 
             # Plot cost over time
-            ax.plot(self.t_eval, np.append(simulator_ref.cost2go_arr, simulator_ref.cost2go_arr[-1]), linestyle="--", label=f"{simulator_ref.controller_name} Cost-to-go", color=self.color_list[color_index])
+            ax[0].plot(self.t_eval, np.append(simulator_ref.cost2go_arr, simulator_ref.cost2go_arr[-1]), linestyle="--", label=f"{simulator_ref.controller_name}", color=self.color_list[color_index])
 
             color_index += 1
         
             # Annotate total cost at initial time step
             initial_cost = simulator_ref.cost2go_arr[0]
-            plt.annotate(
+            ax[0].annotate(
                 f"Total cost: {initial_cost:.2f}",
                 xy=(0, initial_cost),
                 xytext=(10, initial_cost + 0.05 * initial_cost),
@@ -2905,13 +2946,13 @@ class Visualizer:
             )
 
         # Plot cost over time
-        ax.plot(self.t_eval, np.append(self.simulator.cost2go_arr, self.simulator.cost2go_arr[-1]), label=f"{self.simulator.controller_name} Cost-to-go", color=self.color_list[color_index])
+        ax[0].plot(self.t_eval, np.append(self.simulator.cost2go_arr, self.simulator.cost2go_arr[-1]), label=f"{self.simulator.controller_name}", color=self.color_list[color_index])
 
         color_index += 1
     
         # Annotate total cost at initial time step
         initial_cost = self.simulator.cost2go_arr[0]
-        plt.annotate(
+        ax[0].annotate(
             f"Total cost: {initial_cost:.2f}",
             xy=(0, initial_cost),
             xytext=(10, initial_cost + 0.05 * initial_cost),
@@ -2921,11 +2962,28 @@ class Visualizer:
         )
 
         # Set labels and legends
-        ax.set_xlabel("Time (s)")
-        ax.set_ylabel("Cost-to-go")
-        ax.legend()
+        ax[0].set_title("Total Cost w.r.t. simulation time")
+        ax[0].set_xlabel("Time (s)")
+        ax[0].set_ylabel("Cost-to-go")
+        ax[0].legend()
 
-        plt.tight_layout()
+        # Show iLQR total cost w.r.t iterations
+        if self.simulator.controller_type == 'iLQR': 
+
+            ilqr_total_cost_list = self.simulator.controller.total_cost_list
+            ilqr_total_cost_list[0] = simulator_ref.cost2go_arr[0]
+
+            ax[1].plot(ilqr_total_cost_list, marker='o', label="iLQR")
+
+            for simulator_ref in simulators:
+                ax[1].axhline(y=simulator_ref.cost2go_arr[0], linestyle='--', color='red', label="LQR")
+
+            ax[1].set_title("Total Cost w.r.t. iLQR Iteration")
+            ax[1].set_xlabel("Iteration")
+            ax[1].set_ylabel("Total Cost")
+            ax[1].legend()
+            ax[1].grid(True)
+
         plt.show()
         
 
@@ -3038,9 +3096,18 @@ class Visualizer:
 
             initial_h = float(sim.env.h(self.env.initial_position).full().flatten()[0])
             target_h = float(sim.env.h(self.env.target_position).full().flatten()[0])
+
             ax.scatter([sim.env.initial_position], [initial_h], color="blue", label="Start")
+
             #ax.scatter([sim.env.target_position], [target_h], color="orange", label="Target position")
             ax.plot(sim.env.target_position, target_h, marker='x', color='red', markersize=10, markeredgewidth=3, label='Target')
+
+
+            if sim.controller.type == 'LQR' and not np.allclose(sim.controller.state_lin, sim.controller.target_state):
+                lin_position = sim.controller.state_lin[0]
+                lin_h = float(sim.env.h(lin_position).full().flatten()[0])
+                ax.plot(lin_position, lin_h, marker='v', color='orange', markersize=7, markeredgewidth=3, label='Linearization Point of LQR')
+
             ax.legend()
 
 
@@ -3083,6 +3150,8 @@ class Visualizer:
     def display_contrast_animation_same(self, *simulators) -> HTML:
         import matplotlib.patches as mpatches
 
+        custom_handles = []
+
         # Setup figure
         fig, ax = plt.subplots(1, 1, figsize=(self.figsize[0], self.figsize[1]))
 
@@ -3095,6 +3164,7 @@ class Visualizer:
         ax.set_xlim(start_extension - 0.5, end_extension + 0.5)
         ax.set_ylim(-1.3, 1.3)
         profile_plot, = ax.plot(p_disp_vals, h_disp_vals, label="Mountain profile h(p)", color="green")
+        custom_handles.append(profile_plot)
 
         ax.set_xlabel("Position p")
         ax.set_ylabel("Height h")
@@ -3103,7 +3173,17 @@ class Visualizer:
         initial_h = float(self.env.h(self.env.initial_position).full().flatten()[0])
         target_h = float(self.env.h(self.env.target_position).full().flatten()[0])
         start_scatter = ax.scatter([self.env.initial_position], [initial_h], color="blue", label="Start")
+        custom_handles.append(start_scatter)
         target_cross = ax.plot(self.env.target_position, target_h, marker='x', color='red', markersize=10, markeredgewidth=3, label='Target')[0]
+        custom_handles.append(target_cross)
+
+        for sim in simulators:
+
+            if sim.controller.type == 'LQR' and not np.allclose(sim.controller.state_lin, sim.controller.target_state):
+                lin_position = sim.controller.state_lin[0]
+                lin_h = float(sim.env.h(lin_position).full().flatten()[0])
+                lin_point = ax.plot(lin_position, lin_h, marker='v', color='orange', markersize=7, markeredgewidth=3, label='Linearization Point of LQR')[0]
+                custom_handles.append(lin_point)
 
         # Car setup
         car_objects = {}
@@ -3130,7 +3210,6 @@ class Visualizer:
         ax.set_title(controller_names)
 
         # Legend
-        custom_handles = [profile_plot, start_scatter, target_cross]
 
         car_legend_handles = [
             mpatches.Patch(edgecolor=self.color, facecolor='none', linewidth=2, label=self.simulator.controller_name)

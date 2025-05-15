@@ -2,7 +2,7 @@
     "acados_include_path": "/home/haocheng/acados/include",
     "acados_lib_path": "/home/haocheng/acados/lib",
     "casadi_pool_names": [],
-    "code_export_directory": "/home/haocheng/core_course_examples/ex4_MPC/c_generated_code",
+    "code_export_directory": "/home/haocheng/core_course_examples/ex5_MPC/c_generated_code",
     "constraints": {
         "C": [],
         "C_e": [],
