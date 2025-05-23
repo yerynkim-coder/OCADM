@@ -66,7 +66,7 @@
 #define LINEARRMPC_N      15
 #define LINEARRMPC_NH     0
 #define LINEARRMPC_NHN    0
-#define LINEARRMPC_NH0    148
+#define LINEARRMPC_NH0    0
 #define LINEARRMPC_NPHI0  0
 #define LINEARRMPC_NPHI   0
 #define LINEARRMPC_NPHIN  0
@@ -115,8 +115,6 @@ typedef struct LinearRMPC_solver_capsule
 
 
 
-    external_function_external_param_casadi nl_constr_h_0_fun_jac;
-    external_function_external_param_casadi nl_constr_h_0_fun;
 
 
 

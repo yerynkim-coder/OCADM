@@ -73,7 +73,7 @@ int LinearRMPC_acados_sim_create(LinearRMPC_sim_solver_capsule * capsule)
     const int np = LINEARRMPC_NP;
     bool tmp_bool;
 
-    double Tsim = 0.2;
+    double Tsim = 0.20000000000000004;
 
     
     // explicit ode

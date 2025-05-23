@@ -2417,8 +2417,8 @@ class MPCController(LQRController):
 
         # Set up Acados solver
         self.ocp = ocp
-        if self.type != 'RMPC':
-            self.solver = AcadosOcpSolver(ocp, json_file=f"{model.name}.json")
+        #if self.type != 'RMPC':
+        self.solver = AcadosOcpSolver(ocp, json_file=f"{model.name}.json")
 
         if self.verbose:
             print("MPC setup with Acados completed.")
@@ -3588,13 +3588,28 @@ class Visualizer:
         # Plot red tube polygons (Ω translated to nominal)
         Omega = self.controller.Omega_tube
         patches = []
+        # Compute axis-aligned bounding box
+        min_bounds = np.min(self.controller.Omega_tube, axis=0)
+        max_bounds = np.max(self.controller.Omega_tube, axis=0)
 
         for i in range(0, len(x_nom), self.delta_index_pred_display):
-            center = np.array([x_nom[i], v_nom[i]])
-            tube_vertices = Omega + center  # Translate tube
-            patch = Polygon(tube_vertices, closed=True, edgecolor='red', facecolor='red', alpha=0.5)
-            patches.append(patch)
-            ax.add_patch(patch)
+
+            # Show polytopes
+            #center = np.array([x_nom[i], v_nom[i]])
+            #tube_vertices = Omega + center  # Translate tube
+            #patch = Polygon(tube_vertices, closed=True, edgecolor='red', facecolor='red', alpha=0.5)
+            #patches.append(patch)
+            #ax.add_patch(patch)
+
+            # Show bounding box
+            bounding_box = np.array([
+                [min_bounds[0]+x_nom[i], min_bounds[1]+v_nom[i]],
+                [min_bounds[0]+x_nom[i], max_bounds[1]+v_nom[i]],
+                [max_bounds[0]+x_nom[i], max_bounds[1]+v_nom[i]],
+                [max_bounds[0]+x_nom[i], min_bounds[1]+v_nom[i]],
+                [min_bounds[0]+x_nom[i], min_bounds[1]+v_nom[i]]
+            ])  # Translate bounding box
+            ax.plot(bounding_box[:, 0], bounding_box[:, 1], 'r--', linewidth=2)
 
         ax.set_xlabel(r"$x_1$")
         ax.set_ylabel(r"$x_2$")

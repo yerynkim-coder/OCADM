@@ -40,8 +40,6 @@ MODEL_SRC+= LinearRMPC_model/LinearRMPC_expl_vde_adj.c
 MODEL_OBJ := $(MODEL_SRC:.c=.o)
 # optimal control problem - mostly CasADi exports
 OCP_SRC=
-OCP_SRC+= LinearRMPC_constraints/LinearRMPC_constr_h_0_fun_jac_uxt_zt.c
-OCP_SRC+= LinearRMPC_constraints/LinearRMPC_constr_h_0_fun.c
 
 OCP_SRC+= acados_solver_LinearRMPC.c
 OCP_OBJ := $(OCP_SRC:.c=.o)
