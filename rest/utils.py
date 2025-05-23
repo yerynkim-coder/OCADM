@@ -14,8 +14,11 @@ from functools import wraps
 from matplotlib.patches import Rectangle
 from matplotlib.animation import FuncAnimation
 import matplotlib.gridspec as gridspec
+from matplotlib.patches import Polygon
+from matplotlib.collections import PatchCollection
 from IPython.display import display, HTML
 from scipy.interpolate import interp2d
+from cvxopt import matrix, solvers
 
 # Add a tutorial to show how to install acados and set interface to python
 from acados_template import AcadosOcp, AcadosOcpSolver, AcadosModel
@@ -33,7 +36,9 @@ class Env:
             state_lbs: np.ndarray = None, 
             state_ubs: np.ndarray = None, 
             input_lbs: float = None, 
-            input_ubs: float = None
+            input_ubs: float = None,
+            disturbance_lbs: np.ndarray = None, 
+            disturbance_ubs: np.ndarray = None
         ) -> None:
 
         self.case = case  # 1, 2, 3, 4
@@ -54,8 +59,12 @@ class Env:
         if state_ubs is not None:
             self.pos_ubs = state_ubs[0]
             self.vel_ubs = state_ubs[1]
+
         self.input_lbs = input_lbs
         self.input_ubs = input_ubs
+
+        self.disturbance_lbs = disturbance_lbs
+        self.disturbance_ubs = disturbance_ubs
 
         # Define argument p as CasADi symbolic parameters
         p = ca.SX.sym("p") # p: horizontal displacement
@@ -364,8 +373,6 @@ class Dynamics:
 
         u_eq = 9.81 * np.sin(theta)
 
-        print("u_eq:", u_eq)
-
         return float(u_eq)
     
     def one_step_forward(self, current_state: np.ndarray, current_input: np.ndarray, dt: float) -> np.ndarray:
@@ -384,7 +391,11 @@ class Dynamics:
         )
         
         next_state = np.array(solution.y)[:, -1]
+
         #print(next_state)
+
+        if self.env.disturbance_lbs is not None and self.env.disturbance_lbs is not None:
+            next_state += np.random.uniform(self.env.disturbance_lbs, self.env.disturbance_ubs) * dt
 
         return next_state
 
@@ -655,11 +666,13 @@ def check_input_constraints(compute_action, mode='clipping'):
         input_ubs = self.env.input_ubs
 
         # Call original method 'compute_action'
-        u = compute_action(self, current_state, current_time)
+        result = compute_action(self, current_state, current_time)
+        u = result if not isinstance(result, tuple) else result[0] # incase mpc (contains predicted trajs)
 
         # Check whether input is compatible with given constraints
         if input_lbs is not None:
-            if not np.all(input_lbs<= u):
+
+            if not np.all(input_lbs <= u):
                 if mode == 'raise_error':
                     raise ValueError(f"Warning: raw control input u={u} is beyond the lower limit {input_lbs}!")
                 elif mode == 'clipping':
@@ -673,8 +686,11 @@ def check_input_constraints(compute_action, mode='clipping'):
                 elif mode == 'clipping':
                     print(f"Warning: raw control input u={u} is beyond the upper limit {input_ubs}! Clip to upper limit u={input_ubs}.")
                     u = np.array([input_ubs])
-
-        return u
+        
+        if isinstance(result, tuple):
+            return (u,) + result[1:]
+        else:
+            return u
     
     return wrapper
 
@@ -1713,6 +1729,548 @@ class iLQRController(LQRController):
         return u
 
 
+
+# Class for linear OCP Controller
+class LinearOCPController:
+    def __init__(self, env, dynamics, Q, R, Qf, freq: float, N: int, name='OCP', type='OCP', verbose=False):
+        self.env = env
+        self.dynamics = dynamics
+        self.Q = Q
+        self.R = R
+        self.Qf = Qf
+        self.freq = freq
+        self.dt = 1.0 / freq
+        self.N = N
+        self.name = name
+        self.type = type
+        self.verbose = verbose
+
+        self.dim_states = dynamics.dim_states
+        self.dim_inputs = dynamics.dim_inputs
+
+        self.u_seq = None
+
+    def compute_action(self, current_state, current_time):
+        if self.u_seq is None:
+
+            start_time = time.time()
+
+            self._solve_ocp(current_state)
+
+            print(f"Current cycle time: {time.time()-start_time}")
+
+        index = current_time
+        if index < self.u_seq.shape[0]:
+            return self.u_seq[index]
+        else:
+            return self.u_seq[-1]
+
+    def _solve_ocp(self, current_state):
+        x0 = current_state.reshape(-1, 1)
+        x_ref = self.env.target_state.reshape(-1, 1)
+        u_ref = np.array(self.dynamics.get_equilibrium_input(x_ref)).reshape(-1, 1)
+
+        A_d, B_d = self.dynamics.get_linearized_AB_discrete(x0, u_ref, self.dt)
+
+        nx = self.dim_states
+        nu = self.dim_inputs
+        N = self.N
+        n_vars = (N + 1) * nx + N * nu
+
+        # Cost
+        H = np.zeros((n_vars, n_vars))
+        f = np.zeros((n_vars, 1))
+
+        for k in range(N):
+            idx_x = slice(k * nx, (k + 1) * nx)
+            idx_u = slice((N + 1) * nx + k * nu, (N + 1) * nx + (k + 1) * nu)
+            H[idx_x, idx_x] = self.Q
+            f[idx_x] = -self.Q @ x_ref
+            H[idx_u, idx_u] = self.R
+            f[idx_u] = -self.R @ u_ref
+
+        idx_terminal = slice(N * nx, (N + 1) * nx)
+        H[idx_terminal, idx_terminal] = self.Qf
+        f[idx_terminal] = -self.Qf @ x_ref
+
+        # Dynamics constraints
+        Aeq = []
+        beq = []
+
+        for k in range(N):
+            row = np.zeros((nx, n_vars))
+            idx_xk = slice(k * nx, (k + 1) * nx)
+            idx_xkp1 = slice((k + 1) * nx, (k + 2) * nx)
+            idx_uk = slice((N + 1) * nx + k * nu, (N + 1) * nx + (k + 1) * nu)
+            row[:, idx_xk] = A_d
+            row[:, idx_uk] = B_d
+            row[:, idx_xkp1] = -np.eye(nx)
+            Aeq.append(row)
+            beq.append(np.zeros((nx, 1)))
+
+        row0 = np.zeros((nx, n_vars))
+        row0[:, 0:nx] = np.eye(nx)
+        Aeq.insert(0, row0)
+        beq.insert(0, x0)
+
+        Aeq = np.vstack(Aeq)
+        beq = np.vstack(beq)
+
+        # Inequality constraints
+        G = []
+        h = []
+
+        for k in range(N + 1):
+            idx_x = slice(k * nx, (k + 1) * nx)
+            if self.env.state_lbs is not None:
+                Gx_l = np.zeros((nx, n_vars))
+                Gx_l[:, idx_x] = -np.eye(nx)
+                G.append(Gx_l)
+                h.append(-np.array(self.env.state_lbs).reshape(-1, 1))
+            if self.env.state_ubs is not None:
+                Gx_u = np.zeros((nx, n_vars))
+                Gx_u[:, idx_x] = np.eye(nx)
+                G.append(Gx_u)
+                h.append(np.array(self.env.state_ubs).reshape(-1, 1))
+
+        for k in range(N):
+            idx_u = slice((N + 1) * nx + k * nu, (N + 1) * nx + (k + 1) * nu)
+            if self.env.input_lbs is not None:
+                Gu_l = np.zeros((nu, n_vars))
+                Gu_l[:, idx_u] = -np.eye(nu)
+                G.append(Gu_l)
+                h.append(-np.array(self.env.input_lbs).reshape(-1, 1))
+            if self.env.input_ubs is not None:
+                Gu_u = np.zeros((nu, n_vars))
+                Gu_u[:, idx_u] = np.eye(nu)
+                G.append(Gu_u)
+                h.append(np.array(self.env.input_ubs).reshape(-1, 1))
+
+        G = np.vstack(G) if G else np.zeros((1, n_vars))
+        h = np.vstack(h) if h else np.array([[1e10]])
+
+        solvers.options['show_progress'] = self.verbose
+        sol = solvers.qp(matrix(H), matrix(f), matrix(G), matrix(h), matrix(Aeq), matrix(beq))
+        z_opt = np.array(sol['x']).flatten()
+
+        u_start = (N + 1) * nx
+        self.u_seq = z_opt[u_start:].reshape(N, nu)
+
+
+
+# Class for linear MPC Controller with 1-norm cost
+class LinearMPC1NormController:
+    def __init__(self, 
+            env: Env, 
+            dynamics: Dynamics, 
+            freq: float, 
+            N: int, 
+            name: str = 'MPC', 
+            type: str = 'MPC', 
+            verbose: bool = False
+        ) -> None:
+
+        self.env = env
+        self.dynamics = dynamics
+
+        self.N = N
+
+        self.name = name
+        self.type = type
+
+        self.freq = freq
+        self.dt = 1.0 / freq
+        
+        self.verbose = verbose
+
+        self.dim_states = dynamics.dim_states
+        self.dim_inputs = dynamics.dim_inputs
+
+        self.x_pred = None
+        self.u_pred = None
+    
+    @check_input_constraints
+    def compute_action(self, current_state, current_time=None):
+        x0 = current_state.reshape(-1, 1)
+        u0 = np.zeros((self.dim_inputs, 1))
+
+        A_d, B_d = self.dynamics.get_linearized_AB_discrete(x0, u0, self.dt)
+
+        # New variable: [x_0,...,x_N, u_0,...,u_{N-1}, t_0,...,t_{N-1}]
+        n_vars = self.dim_states * (self.N + 1) + self.dim_inputs * self.N * 2
+
+        def idx_x(k): return slice(k * self.dim_states, (k + 1) * self.dim_states)
+        def idx_u(k): return slice((self.N + 1) * self.dim_states + k * self.dim_inputs,
+                                (self.N + 1) * self.dim_states + (k + 1) * self.dim_inputs)
+        def idx_t(k): return slice((self.N + 1) * self.dim_states + self.dim_inputs * self.N + k * self.dim_inputs,
+                                (self.N + 1) * self.dim_states + self.dim_inputs * self.N + (k + 1) * self.dim_inputs)
+
+        # Cost: min sum |u_k| via slack t_k
+        H = np.zeros((n_vars, n_vars))
+        f = np.zeros((n_vars, 1))
+        for k in range(self.N):
+            f[idx_t(k)] = 1.0
+
+        # Equality constraints: dynamics + x0 + terminal constraint
+        Aeq, beq = [], []
+
+        for k in range(self.N):
+            row = np.zeros((self.dim_states, n_vars))
+            row[:, idx_x(k)] = A_d
+            row[:, idx_u(k)] = B_d
+            row[:, idx_x(k+1)] = -np.eye(self.dim_states)
+            Aeq.append(row)
+            beq.append(np.zeros((self.dim_states, 1)))
+
+        row0 = np.zeros((self.dim_states, n_vars))
+        row0[:, idx_x(0)] = np.eye(self.dim_states)
+        Aeq.insert(0, row0)
+        beq.insert(0, x0)
+
+        rowT = np.zeros((self.dim_states, n_vars))
+        rowT[:, idx_x(self.N)] = np.eye(self.dim_states)
+        Aeq.append(rowT)
+        xg = self.env.target_state.reshape(-1, 1)
+        beq.append(xg)
+
+        Aeq = np.vstack(Aeq)
+        beq = np.vstack(beq)
+
+        # Inequality constraints: t_k ≥ |u_k| and input bounds
+        G, h = [], []
+
+        for k in range(self.N):
+            G1 = np.zeros((self.dim_inputs, n_vars))
+            G1[:, idx_u(k)] = np.eye(self.dim_inputs)
+            G1[:, idx_t(k)] = -np.eye(self.dim_inputs)
+            G.append(G1)
+            h.append(np.zeros((self.dim_inputs, 1)))
+
+            G2 = np.zeros((self.dim_inputs, n_vars))
+            G2[:, idx_u(k)] = -np.eye(self.dim_inputs)
+            G2[:, idx_t(k)] = -np.eye(self.dim_inputs)
+            G.append(G2)
+            h.append(np.zeros((self.dim_inputs, 1)))
+
+            if self.env.input_ubs is not None:
+                G3 = np.zeros((self.dim_inputs, n_vars))
+                G3[:, idx_u(k)] = np.eye(self.dim_inputs)
+                G.append(G3)
+                h.append(np.array(self.env.input_ubs).reshape(-1, 1))
+
+            if self.env.input_lbs is not None:
+                G4 = np.zeros((self.dim_inputs, n_vars))
+                G4[:, idx_u(k)] = -np.eye(self.dim_inputs)
+                G.append(G4)
+                h.append(-np.array(self.env.input_lbs).reshape(-1, 1))
+
+        G = np.vstack(G)
+        h = np.vstack(h)
+
+        solvers.options['show_progress'] = self.verbose
+        sol = solvers.qp(matrix(H), matrix(f), matrix(G), matrix(h), matrix(Aeq), matrix(beq))
+        z_opt = np.array(sol['x']).flatten()
+
+        x_opt = z_opt[: (self.N + 1) * self.dim_states].reshape(self.N + 1, self.dim_states).T
+        u_opt = z_opt[(self.N + 1) * self.dim_states : (self.N + 1) * self.dim_states + self.N * self.dim_inputs].reshape(self.N, self.dim_inputs).T
+
+        if self.verbose:
+            print(f"Optimal control action: {u_opt[:, 0]}")
+            print(f"Predicted x: {x_opt}")
+            print(f"Predicted u: {u_opt}")
+
+        self.x_pred = x_opt
+        self.u_pred = u_opt
+
+        return u_opt[:, 0].flatten(), x_opt.T, u_opt
+    
+
+
+# Class for linear MPC Controller with 2-norm cost
+class LinearMPC2NormController:
+    def __init__(self, 
+            env: Env, 
+            dynamics: Dynamics, 
+            Q: np.ndarray, 
+            R: np.ndarray, 
+            Qf: np.ndarray, 
+            freq: float, 
+            N: int, 
+            name: str = 'LMPC', 
+            type: str = 'MPC', 
+            verbose: bool = False
+        ) -> None:
+
+        self.env = env
+        self.dynamics = dynamics
+
+        self.Q = Q
+        self.R = R
+        self.Qf = Qf
+
+        self.N = N
+
+        self.name = name
+        self.type = type
+
+        self.freq = freq
+        self.dt = 1.0 / freq
+        
+        self.verbose = verbose
+
+        self.dim_states = dynamics.dim_states
+        self.dim_inputs = dynamics.dim_inputs
+
+        self.x_pred = None
+        self.u_pred = None
+    
+    @check_input_constraints
+    def compute_action(self, current_state, current_time=None):
+
+        x0 = current_state.reshape(-1, 1)
+        u0 = np.zeros((self.dim_inputs, 1))
+
+        A_d, B_d = self.dynamics.get_linearized_AB_discrete(x0, u0, self.dt)
+
+        n_vars = self.dim_states * (self.N + 1) + self.dim_inputs * self.N
+
+        # Cost
+        H = np.zeros((n_vars, n_vars))
+        f = np.zeros((n_vars, 1))
+
+        x_ref = self.env.target_state.reshape(-1, 1)  # assumed constant
+        u_ref = np.array(self.dynamics.get_equilibrium_input(x_ref)).reshape(-1, 1)        # assumed constant
+
+        for k in range(self.N):
+            idx_x = slice(k * self.dim_states, (k + 1) * self.dim_states)
+            idx_u = slice((self.N + 1) * self.dim_states + k * self.dim_inputs,
+                          (self.N + 1) * self.dim_states + (k + 1) * self.dim_inputs)
+
+            Qk = self.Q
+            H[idx_x, idx_x] = Qk
+            H[idx_u, idx_u] = self.R
+
+            f[idx_x] = -Qk @ x_ref
+            f[idx_u] = -self.R @ u_ref
+
+        # Terminal cost
+        idx_x_terminal = slice(self.N * self.dim_states, (self.N + 1) * self.dim_states)
+        H[idx_x_terminal, idx_x_terminal] = self.Qf
+        f[idx_x_terminal] = -self.Qf @ x_ref
+
+        # Dynamics constraints
+        Aeq = []
+        beq = []
+
+        for k in range(self.N):
+            row = np.zeros((self.dim_states, n_vars))
+            idx_xk = slice(k * self.dim_states, (k + 1) * self.dim_states)
+            idx_xk_next = slice((k + 1) * self.dim_states, (k + 2) * self.dim_states)
+            idx_uk = slice((self.N + 1) * self.dim_states + k * self.dim_inputs,
+                           (self.N + 1) * self.dim_states + (k + 1) * self.dim_inputs)
+            row[:, idx_xk_next] = -np.eye(self.dim_states)
+            row[:, idx_xk] = A_d
+            row[:, idx_uk] = B_d
+            Aeq.append(row)
+            beq.append(np.zeros((self.dim_states, 1)))
+
+        # Add x0 = current_state as hard equality constraint
+        row0 = np.zeros((self.dim_states, n_vars))
+        row0[:, :self.dim_states] = np.eye(self.dim_states)
+        Aeq.insert(0, row0)
+        beq.insert(0, x0)
+
+        Aeq = np.vstack(Aeq)
+        beq = np.vstack(beq)
+
+        # Inequality constraints
+        G_list = []
+        h_list = []
+
+        for k in range(self.N + 1):
+            # State constraints
+            if self.env.state_lbs is not None:
+                Gx_l = np.zeros((self.dim_states, n_vars))
+                Gx_l[:, k * self.dim_states:(k + 1) * self.dim_states] = -np.eye(self.dim_states)
+                G_list.append(Gx_l)
+                h_list.append(-np.array(self.env.state_lbs).reshape(-1, 1))
+            if self.env.state_ubs is not None:
+                Gx_u = np.zeros((self.dim_states, n_vars))
+                Gx_u[:, k * self.dim_states:(k + 1) * self.dim_states] = np.eye(self.dim_states)
+                G_list.append(Gx_u)
+                h_list.append(np.array(self.env.state_ubs).reshape(-1, 1))
+
+        for k in range(self.N):
+            # Input constraints
+            if self.env.input_lbs is not None:
+                Gu_l = np.zeros((self.dim_inputs, n_vars))
+                Gu_l[:, (self.N + 1) * self.dim_states + k * self.dim_inputs:
+                          (self.N + 1) * self.dim_states + (k + 1) * self.dim_inputs] = -np.eye(self.dim_inputs)
+                G_list.append(Gu_l)
+                h_list.append(-np.array(self.env.input_lbs).reshape(-1, 1))
+            if self.env.input_ubs is not None:
+                Gu_u = np.zeros((self.dim_inputs, n_vars))
+                Gu_u[:, (self.N + 1) * self.dim_states + k * self.dim_inputs:
+                          (self.N + 1) * self.dim_states + (k + 1) * self.dim_inputs] = np.eye(self.dim_inputs)
+                G_list.append(Gu_u)
+                h_list.append(np.array(self.env.input_ubs).reshape(-1, 1))
+
+        # Check if there are any constraints
+        if len(G_list) > 0:
+            G = np.vstack(G_list)
+            h = np.vstack(h_list)
+        else:
+            G = np.zeros((1, n_vars))
+            h = np.array([[1e10]])
+
+        # Solve the QP
+        solvers.options['show_progress'] = False
+        sol = solvers.qp(matrix(H), matrix(f), matrix(G), matrix(h), matrix(Aeq), matrix(beq))
+        z_opt = np.array(sol['x']).flatten()
+
+        x_opt = z_opt[: (self.N + 1) * self.dim_states].reshape(self.N + 1, self.dim_states).T
+        u_opt = z_opt[(self.N + 1) * self.dim_states:].reshape(self.N, self.dim_inputs).T
+
+        if self.verbose:
+            print(f"Optimal control action: {u_opt[:, 0]}")
+            print(f"Predicted x: {x_opt}")
+            print(f"Predicted u: {u_opt}")
+
+        self.x_pred = x_opt
+        self.u_pred = u_opt
+
+        return u_opt[:, 0].flatten()+u_ref, x_opt.T, u_opt
+
+
+
+# Class for linear MPC Controller with inf-norm cost
+class LinearMPCInfNormController:
+    def __init__(self, 
+            env: Env, 
+            dynamics: Dynamics, 
+            freq: float, 
+            N: int, 
+            name: str = 'LMPC', 
+            type: str = 'MPC', 
+            verbose: bool = False
+        ) -> None:
+
+        self.env = env
+        self.dynamics = dynamics
+
+        self.N = N
+        self.name = name
+        self.type = type
+
+        self.freq = freq
+        self.dt = 1.0 / freq
+        self.verbose = verbose
+
+        self.dim_states = dynamics.dim_states
+        self.dim_inputs = dynamics.dim_inputs
+
+        self.x_pred = None
+        self.u_pred = None
+    
+    @check_input_constraints
+    def compute_action(self, current_state, current_time=None):
+        x0 = current_state.reshape(-1, 1)
+        u0 = np.zeros((self.dim_inputs, 1))
+
+        A_d, B_d = self.dynamics.get_linearized_AB_discrete(x0, u0, self.dt)
+
+        # Variables: [x_0,...,x_N, u_0,...,u_{N-1}, t]
+        n_vars = self.dim_states * (self.N + 1) + self.dim_inputs * self.N + 1  # t is scalar
+
+        def idx_x(k): return slice(k * self.dim_states, (k + 1) * self.dim_states)
+        def idx_u(k): return slice((self.N + 1) * self.dim_states + k * self.dim_inputs,
+                                   (self.N + 1) * self.dim_states + (k + 1) * self.dim_inputs)
+        idx_t = n_vars - 1
+
+        # Cost: minimize t
+        H = np.zeros((n_vars, n_vars))
+        f = np.zeros((n_vars, 1))
+        f[idx_t] = 1.0
+
+        # Equality constraints
+        Aeq, beq = [], []
+
+        for k in range(self.N):
+            row = np.zeros((self.dim_states, n_vars))
+            row[:, idx_x(k)] = A_d
+            row[:, idx_u(k)] = B_d
+            row[:, idx_x(k + 1)] = -np.eye(self.dim_states)
+            Aeq.append(row)
+            beq.append(np.zeros((self.dim_states, 1)))
+
+        row0 = np.zeros((self.dim_states, n_vars))
+        row0[:, idx_x(0)] = np.eye(self.dim_states)
+        Aeq.insert(0, row0)
+        beq.insert(0, x0)
+
+        rowT = np.zeros((self.dim_states, n_vars))
+        rowT[:, idx_x(self.N)] = np.eye(self.dim_states)
+        Aeq.append(rowT)
+        xg = self.env.target_state.reshape(-1, 1)
+        beq.append(xg)
+
+        Aeq = np.vstack(Aeq)
+        beq = np.vstack(beq)
+
+        # Inequality constraints
+        G, h = [], []
+
+        for k in range(self.N):
+            for i in range(self.dim_inputs):
+                # u_k[i] - t <= 0
+                row1 = np.zeros((1, n_vars))
+                row1[0, idx_u(k).start + i] = 1.0
+                row1[0, idx_t] = -1.0
+                G.append(row1)
+                h.append([0.0])
+
+                # -u_k[i] - t <= 0
+                row2 = np.zeros((1, n_vars))
+                row2[0, idx_u(k).start + i] = -1.0
+                row2[0, idx_t] = -1.0
+                G.append(row2)
+                h.append([0.0])
+
+        # Input bounds
+        for k in range(self.N):
+            if self.env.input_ubs is not None:
+                row = np.zeros((self.dim_inputs, n_vars))
+                row[:, idx_u(k)] = np.eye(self.dim_inputs)
+                G.append(row)
+                h.append(np.array(self.env.input_ubs).reshape(-1, 1))
+            if self.env.input_lbs is not None:
+                row = np.zeros((self.dim_inputs, n_vars))
+                row[:, idx_u(k)] = -np.eye(self.dim_inputs)
+                G.append(row)
+                h.append(-np.array(self.env.input_lbs).reshape(-1, 1))
+
+        G = np.vstack(G)
+        h = np.vstack(h)
+
+        solvers.options['show_progress'] = self.verbose
+        sol = solvers.qp(matrix(H), matrix(f), matrix(G), matrix(h), matrix(Aeq), matrix(beq))
+        z_opt = np.array(sol['x']).flatten()
+
+        x_opt = z_opt[: (self.N + 1) * self.dim_states].reshape(self.N + 1, self.dim_states).T
+        u_opt = z_opt[(self.N + 1) * self.dim_states : (self.N + 1) * self.dim_states + self.N * self.dim_inputs].reshape(self.N, self.dim_inputs).T
+
+        if self.verbose:
+            print(f"[inf-norm MPC] Optimal control action: {u_opt[:, 0]}")
+            print(f"[inf-norm MPC] Predicted x: {x_opt}")
+            print(f"[inf-norm MPC] Predicted u: {u_opt}")
+
+        self.x_pred = x_opt
+        self.u_pred = u_opt
+
+        return u_opt[:, 0].flatten(), x_opt.T, u_opt
+
+
+
 # Derived class for MPC Controller
 class MPCController(LQRController):
     def __init__(
@@ -1859,7 +2417,8 @@ class MPCController(LQRController):
 
         # Set up Acados solver
         self.ocp = ocp
-        self.solver = AcadosOcpSolver(ocp, json_file=f"{model.name}.json")
+        if self.type != 'RMPC':
+            self.solver = AcadosOcpSolver(ocp, json_file=f"{model.name}.json")
 
         if self.verbose:
             print("MPC setup with Acados completed.")
@@ -1876,10 +2435,6 @@ class MPCController(LQRController):
         Returns:
         - Optimal control action.
         """
-
-        print(f"Current state: {current_state}")
-        print(f"Target state: {self.target_state}")
-
 
         # Update initial state in the solver
         self.solver.set(0, "lbx", current_state)
@@ -2593,6 +3148,7 @@ class Simulator:
         # Initialize recording lists
         self.state_traj = []
         self.input_traj = []
+        self.nominal_input_traj = []
         self.state_pred_traj = []
         self.input_pred_traj = []
         self.cost2go_arr = None
@@ -2619,6 +3175,11 @@ class Simulator:
                 # Log the predictions
                 self.state_pred_traj.append(state_pred)
                 self.input_pred_traj.append(input_pred)
+            elif self.controller.type == 'RMPC':
+                current_input, state_pred, input_pred, nominal_input = self.controller.compute_action(current_state, self.counter)
+                # Log the predictions
+                self.state_pred_traj.append(state_pred)
+                self.input_pred_traj.append(input_pred)
             else:
                 current_input = self.controller.compute_action(current_state, self.counter)
 
@@ -2629,6 +3190,8 @@ class Simulator:
             # Log the results
             self.state_traj.append(current_state)
             self.input_traj.append(np.array(current_input).flatten())
+            if self.controller.type == 'RMPC':
+                self.nominal_input_traj.append(np.array(nominal_input).flatten())
 
             # Update timer
             self.counter += 1
@@ -2749,7 +3312,7 @@ class Visualizer:
         fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(20, 4))
 
         # Plot predicted positions
-        if self.simulator.controller_type == 'MPC' and len(self.simulator.state_pred_traj)>0:
+        if self.simulator.controller_type in ['MPC', 'RMPC'] and len(self.simulator.state_pred_traj)>0:
             for i in range(len(self.simulator.state_pred_traj)):
                 if i%self.delta_index_pred_display == 0:
                     state_pred_traj_curr = self.simulator.state_pred_traj[i]
@@ -2774,7 +3337,7 @@ class Visualizer:
 
 
         # Plot predicted velocities
-        if self.simulator.controller_type == 'MPC' and len(self.simulator.state_pred_traj)>0:
+        if self.simulator.controller_type in ['MPC', 'RMPC'] and len(self.simulator.state_pred_traj)>0:
             for i in range(len(self.simulator.state_pred_traj)):
                 if i%self.delta_index_pred_display == 0:
                     state_pred_traj_curr = self.simulator.state_pred_traj[i]
@@ -2800,7 +3363,7 @@ class Visualizer:
         '''
         # Not updated yet, still continuous signal instead of ZOH signal
         # Plot predicted accelerations
-        if self.simulator.controller_type == 'MPC' and len(self.simulator.state_pred_traj)>0:
+        if self.simulator.controller_type in ['MPC', 'RMPC'] and len(self.simulator.state_pred_traj)>0:
             for i in range(len(self.simulator.state_pred_traj)):
                 if i%self.delta_index_pred_display == 0:
                     input_pred_traj_curr = self.simulator.input_pred_traj[i]
@@ -2812,8 +3375,11 @@ class Visualizer:
         #ax3.plot(self.t_eval[:-1], self.acceleration, label="Input u(t)", color="red")
         ax3.step(self.t_eval, np.append(self.acceleration, self.acceleration[-1]), where='post', label="Input u(t)", color='red')
         #ax3.plot(self.t_eval[:-1], self.acceleration, 'o', color='red')
+        if self.simulator.controller_type == 'RMPC':
+            nominal_acceleration = self.simulator.nominal_input_traj
+            ax3.step(self.t_eval, np.append(nominal_acceleration, nominal_acceleration[-1]), where='post', label="Nominal Input u(t)", color='purple')
 
-        # Plot shadowed zone for state bounds
+        # Plot shadowed zone for input bounds
         if self.env.input_lbs is not None:
             ax3.fill_between(self.t_eval, self.env.input_lbs-self.shadow_space_wide, self.env.input_lbs, facecolor='gray', alpha=0.3, label=f'input_lower_bound')
         if self.env.input_ubs is not None:
@@ -2873,19 +3439,20 @@ class Visualizer:
             
         # Plot shadowed zone for state bounds
         if self.env.state_lbs is not None:
-            ax1.fill_between(self.t_eval, ax1.get_ylim()[0], self.env.state_lbs[0], facecolor='gray', alpha=0.3, label=f'pos_lower_bound')
+            ax1.fill_between(self.t_eval, self.env.state_lbs[0]-self.shadow_space_wide, self.env.state_lbs[0], facecolor='gray', alpha=0.3, label=f'pos_lower_bound')
         if self.env.state_ubs is not None:
-            ax1.fill_between(self.t_eval, self.env.state_ubs[0], ax1.get_ylim()[1], facecolor='gray', alpha=0.3, label=f'pos_upper_bound')
+            ax1.fill_between(self.t_eval, self.env.state_ubs[0], self.env.state_ubs[0]+self.shadow_space_wide, facecolor='gray', alpha=0.3, label=f'pos_upper_bound')
 
         if self.env.state_lbs is not None:
-            ax2.fill_between(self.t_eval, ax2.get_ylim()[0], self.env.state_lbs[1], facecolor='gray', alpha=0.3, label=f'vel_lower_bound')
+            ax2.fill_between(self.t_eval, self.env.state_lbs[1]-self.shadow_space_wide, self.env.state_lbs[1], facecolor='gray', alpha=0.3, label=f'vel_lower_bound')
         if self.env.state_ubs is not None:
-            ax2.fill_between(self.t_eval, self.env.state_ubs[1], ax2.get_ylim()[1], facecolor='gray', alpha=0.3, label=f'vel_upper_bound')
+            ax2.fill_between(self.t_eval, self.env.state_ubs[1], self.env.state_ubs[1]+self.shadow_space_wide, facecolor='gray', alpha=0.3, label=f'vel_upper_bound')
         
         if self.env.input_lbs is not None:
-            ax3.fill_between(self.t_eval, ax3.get_ylim()[0], self.env.input_lbs, facecolor='gray', alpha=0.3, label=f'input_lower_bound')
+            ax3.fill_between(self.t_eval, self.env.input_lbs-self.shadow_space_wide, self.env.input_lbs, facecolor='gray', alpha=0.3, label=f'input_lower_bound')
         if self.env.input_ubs is not None:
-            ax3.fill_between(self.t_eval, self.env.input_ubs, ax3.get_ylim()[1], facecolor='gray', alpha=0.3, label=f'input_upper_bound')
+            ax3.fill_between(self.t_eval, self.env.input_ubs, self.env.input_ubs+self.shadow_space_wide, facecolor='gray', alpha=0.3, label=f'input_upper_bound')
+
 
         # Set labels and legends
         ax1.set_xlabel("Time (s)")
@@ -2986,6 +3553,59 @@ class Visualizer:
 
         plt.show()
         
+    def display_phase_portrait(self):
+
+        """
+        Display RMPC results in the (x1, x2) plane, showing nominal trajectory,
+        true trajectory, and invariant tube cross-sections.
+        """
+        
+        if self.controller.type != 'RMPC':
+            raise ValueError("This visualization is only supported for Tube-based RMPC controllers.")
+
+        fig, ax = plt.subplots(figsize=(6, 6))
+
+        # Extract true state trajectory
+        x_true = self.state_traj[:, 0]
+        v_true = self.state_traj[:, 1]
+        
+        # Extract nominal trajectory if available
+        x_nom = []
+        v_nom = []
+        for i in range(len(self.simulator.state_pred_traj)):
+            state_pred_traj_curr = self.simulator.state_pred_traj[i]
+            x_nom.append(state_pred_traj_curr[0, 0])
+            v_nom.append(state_pred_traj_curr[0, 1])
+
+        # Plot state constraint line (e.g. x2 <= 2)
+        if self.env.state_ubs is not None:
+            ax.axhline(y=self.env.state_ubs[1], color='black', linewidth=3, label=r"$x_2 \leq 2$")
+
+        # Plot nominal and true trajectories
+        ax.plot(x_nom, v_nom, linestyle='--', color='black', marker='x', label='Nominal state')
+        ax.plot(x_true, v_true, linestyle='-', color='blue', marker='*', label='True state')
+
+        # Plot red tube polygons (Ω translated to nominal)
+        Omega = self.controller.Omega_tube
+        patches = []
+
+        for i in range(0, len(x_nom), self.delta_index_pred_display):
+            center = np.array([x_nom[i], v_nom[i]])
+            tube_vertices = Omega + center  # Translate tube
+            patch = Polygon(tube_vertices, closed=True, edgecolor='red', facecolor='red', alpha=0.5)
+            patches.append(patch)
+            ax.add_patch(patch)
+
+        ax.set_xlabel(r"$x_1$")
+        ax.set_ylabel(r"$x_2$")
+        ax.set_xlim(self.simulator.env.pos_lbs, self.simulator.env.pos_ubs)
+        ax.set_ylim(self.simulator.env.vel_lbs, self.simulator.env.vel_ubs)
+        ax.set_title("RMPC State-Space Tube Projection")
+        ax.legend()
+        ax.grid(True)
+
+        plt.tight_layout()
+        plt.show()
 
 
 
