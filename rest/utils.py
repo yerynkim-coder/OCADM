@@ -193,7 +193,7 @@ class Dynamics:
             env: Env,
             state_names: List[str] = None,
             input_names: List[str] = None,
-            setup_dynamics: Callable[[ca.Function], Callable[[ca.SX, ca.SX], ca.SX]] = None,
+            setup_dynamics: Callable[[ca.Function], Callable[[ca.SX, ca.SX], ca.SX]] = None
         ) -> None:
 
         # Initialize system dynmaics if not given
@@ -231,7 +231,7 @@ class Dynamics:
                 rhs = ca.vertcat(dpdt, dvdt)
 
                 return ca.Function("dynamics_function", [state, input], [rhs])
-        
+            
         # Define system dynamics
         self.dynamics_function = setup_dynamics(self.env.theta)
 
@@ -398,6 +398,69 @@ class Dynamics:
             next_state += np.random.uniform(self.env.disturbance_lbs, self.env.disturbance_ubs) * dt
 
         return next_state
+
+
+
+class InputDynamics:
+    def __init__(self,
+                 param_id: np.array = None,
+                 ):
+        
+        # acc = 1 / (s * params[0] + params[1]) * acc_cmd
+        self.params = param_id 
+        
+        # Define input dynamics
+        if self.params is not None:
+            self.input_function = self.setup_input() #u_dot = self.input_function(u, u_cmd)
+        else:
+            raise ValueError("Error: choose to use the identified input model but no identified parameters are given!")
+    
+    def setup_input(self):
+
+        # Assume a model of the form:
+        # acc = 1 / (s * params[0] + params[1]) * acc_cmd
+        # acc_cmd = (s * params[0] + params[1]) * acc
+        #         = params[0] * jerk + params[1] * acc 
+        #         = [jerk, acc] * [params[0]; params[1]]
+
+        u = ca.SX.sym("u")
+        u_cmd = ca.SX.sym("u_cmd")
+
+        # Expression of dynamics
+        dudt = (1/self.params[0]) * u_cmd - (self.params[1]/self.params[0]) * u
+
+        state = ca.vertcat(u)
+        input = ca.vertcat(u_cmd)
+        rhs = ca.vertcat(dudt)
+
+        return ca.Function("input_function", [state, input], [rhs])
+    
+    def one_step_forward(self, current_input: np.ndarray, input_cmd: np.ndarray, dt: float) -> np.ndarray:
+
+        '''use current input, input_cmd and time difference to calculate next state'''
+
+        current_input = np.ravel(current_input)
+        input_cmd = np.ravel(input_cmd)
+
+        #print(f"current_input: {current_input}")
+        #print(f"input_cmd: {input_cmd}")
+        
+        t_span = [0, dt]
+        sim_dynamics = lambda t, state: self.input_function(state, [input_cmd]).full().flatten()
+
+        solution = solve_ivp(
+            sim_dynamics,
+            t_span,
+            current_input,
+            method='RK45',
+            t_eval=[dt]
+        )
+        
+        new_input = np.array(solution.y)[:, -1]
+
+        return new_input
+
+
 
 
 
@@ -3102,13 +3165,6 @@ class MCRLController(BaseController):
 
 
 
-
-
-
-
-
-
-
 class Simulator:
     def __init__(
         self,
@@ -3117,13 +3173,26 @@ class Simulator:
         env: Env = None,
         dt: float = None,
         t_terminal: float = None,
+        type: str = 'ideal', # 'ideal' OR 'identified'
+        param_id: np.array = None,
         verbose: bool = False
     ) -> None:
         
         self.dynamics = dynamics
         self.controller = controller
         self.env = env
+
+        self.type = type  # 'ideal' or 'identified'
+
         self.verbose = verbose
+
+        if self.type == 'ideal':
+            self.input_dynamics = None
+        elif self.type == 'identified' and param_id is not None:
+            self.input_dynamics = InputDynamics(param_id)
+        elif self.type == 'identified' and param_id == None:
+            raise ValueError("Error: choose to use the identified input model but no identified parameters are given!")
+            
 
         # Initialize attributes only if 'env' is provided
         if env is not None:
@@ -3167,23 +3236,34 @@ class Simulator:
         current_state = self.init_state
         self.state_traj.append(current_state)
 
+        if self.type == 'identified':
+            current_input_old = 0
+
         for current_time in self.t_eval[:-1]:
 
             # Get current state, and call controller to calculate input
             if self.controller.type == 'MPC':
-                current_input, state_pred, input_pred = self.controller.compute_action(current_state, self.counter)
+                input_cmd, state_pred, input_pred = self.controller.compute_action(current_state, self.counter)
                 # Log the predictions
                 self.state_pred_traj.append(state_pred)
                 self.input_pred_traj.append(input_pred)
             elif self.controller.type == 'RMPC':
-                current_input, state_pred, input_pred, nominal_input = self.controller.compute_action(current_state, self.counter)
+                input_cmd, state_pred, input_pred, nominal_input = self.controller.compute_action(current_state, self.counter)
                 # Log the predictions
                 self.state_pred_traj.append(state_pred)
                 self.input_pred_traj.append(input_pred)
             else:
-                current_input = self.controller.compute_action(current_state, self.counter)
+                input_cmd = self.controller.compute_action(current_state, self.counter)
 
             # Do one-step simulation
+            if self.type == 'ideal':
+                current_input = input_cmd
+            elif self.type == 'identified' and self.input_dynamics is not None:
+                current_input = self.input_dynamics.one_step_forward(current_input_old, input_cmd, self.dt)
+                current_input_old = current_input
+            else:
+                raise NotImplementedError("Simulation type not implemented or input dynamics not provided!")
+                
             current_state = self.dynamics.one_step_forward(current_state, current_input, self.dt)
             #print(f"sim_state:{current_state}")
 
@@ -3192,6 +3272,7 @@ class Simulator:
             self.input_traj.append(np.array(current_input).flatten())
             if self.controller.type == 'RMPC':
                 self.nominal_input_traj.append(np.array(nominal_input).flatten())
+            # TODO: also log input_cmd curve for identified case
 
             # Update timer
             self.counter += 1
@@ -3324,10 +3405,16 @@ class Visualizer:
 
         # Plot shadowed zone for state bounds
         if self.env.state_lbs is not None:
-            ax1.fill_between(self.t_eval, self.env.state_lbs[0]-self.shadow_space_wide, self.env.state_lbs[0], facecolor='gray', alpha=0.3, label=f'pos_lower_bound')
+            ymin, _ = ax1.get_ylim()
+            lower_edge = min(self.env.state_lbs[0] - self.shadow_space_wide, ymin)
+            upper_edge = self.env.state_lbs[0]
+            ax1.fill_between(self.t_eval, lower_edge, upper_edge, facecolor='gray', alpha=0.3, label=f'pos_lower_bound')
         if self.env.state_ubs is not None:
-            ax1.fill_between(self.t_eval, self.env.state_ubs[0], self.env.state_ubs[0]+self.shadow_space_wide, facecolor='gray', alpha=0.3, label=f'pos_upper_bound')
-        
+            _, ymax = ax1.get_ylim()
+            lower_edge = self.env.state_ubs[0]
+            upper_edge = max(self.env.state_ubs[0] + self.shadow_space_wide, ymax)
+            ax1.fill_between(self.t_eval, lower_edge, upper_edge, facecolor='gray', alpha=0.3, label=f'pos_upper_bound')
+
         ax1.set_xlabel("Time (s)")
         ax1.set_ylabel("Position (m)")
         
@@ -3349,10 +3436,16 @@ class Visualizer:
 
         # Plot shadowed zone for state bounds
         if self.env.state_lbs is not None:
-            ax2.fill_between(self.t_eval, self.env.state_lbs[1]-self.shadow_space_wide, self.env.state_lbs[1], facecolor='gray', alpha=0.3, label=f'vel_lower_bound')
+            ymin, _ = ax2.get_ylim()
+            lower_edge = min(self.env.state_lbs[1] - self.shadow_space_wide, ymin)
+            upper_edge = self.env.state_lbs[1]
+            ax2.fill_between(self.t_eval, lower_edge, upper_edge, facecolor='gray', alpha=0.3, label=f'vel_lower_bound')
         if self.env.state_ubs is not None:
-            ax2.fill_between(self.t_eval, self.env.state_ubs[1], self.env.state_ubs[1]+self.shadow_space_wide, facecolor='gray', alpha=0.3, label=f'vel_upper_bound')
-    
+            _, ymax = ax2.get_ylim()
+            lower_edge = self.env.state_ubs[1]
+            upper_edge = max(self.env.state_ubs[1] + self.shadow_space_wide, ymax)
+            ax2.fill_between(self.t_eval, lower_edge, upper_edge, facecolor='gray', alpha=0.3, label=f'vel_upper_bound')
+
         ax2.set_xlabel("Time (s)")
         ax2.set_ylabel("Velocity (m/s)")
         
@@ -3381,10 +3474,16 @@ class Visualizer:
 
         # Plot shadowed zone for input bounds
         if self.env.input_lbs is not None:
-            ax3.fill_between(self.t_eval, self.env.input_lbs-self.shadow_space_wide, self.env.input_lbs, facecolor='gray', alpha=0.3, label=f'input_lower_bound')
+            ymin, _ = ax3.get_ylim()
+            lower_edge = min(self.env.input_lbs-self.shadow_space_wide, ymin)
+            upper_edge = self.env.input_lbs
+            ax3.fill_between(self.t_eval, lower_edge, upper_edge, facecolor='gray', alpha=0.3, label=f'input_lower_bound')
         if self.env.input_ubs is not None:
-            ax3.fill_between(self.t_eval, self.env.input_ubs, self.env.input_ubs+self.shadow_space_wide, facecolor='gray', alpha=0.3, label=f'input_upper_bound')
-        
+            _, ymax = ax3.get_ylim()
+            lower_edge = self.env.input_ubs
+            upper_edge = max(self.env.input_ubs+self.shadow_space_wide, ymax)
+            ax3.fill_between(self.t_eval, lower_edge, upper_edge, facecolor='gray', alpha=0.3, label=f'input_upper_bound')
+            
         ax3.set_xlabel("Time (s)")
         ax3.set_ylabel("Input (m/s^2)")
 
@@ -3439,19 +3538,37 @@ class Visualizer:
             
         # Plot shadowed zone for state bounds
         if self.env.state_lbs is not None:
-            ax1.fill_between(self.t_eval, self.env.state_lbs[0]-self.shadow_space_wide, self.env.state_lbs[0], facecolor='gray', alpha=0.3, label=f'pos_lower_bound')
+            ymin, _ = ax1.get_ylim()
+            lower_edge = min(self.env.state_lbs[0] - self.shadow_space_wide, ymin)
+            upper_edge = self.env.state_lbs[0]
+            ax1.fill_between(self.t_eval, lower_edge, upper_edge, facecolor='gray', alpha=0.3, label=f'pos_lower_bound')
         if self.env.state_ubs is not None:
-            ax1.fill_between(self.t_eval, self.env.state_ubs[0], self.env.state_ubs[0]+self.shadow_space_wide, facecolor='gray', alpha=0.3, label=f'pos_upper_bound')
+            _, ymax = ax1.get_ylim()
+            lower_edge = self.env.state_ubs[0]
+            upper_edge = max(self.env.state_ubs[0] + self.shadow_space_wide, ymax)
+            ax1.fill_between(self.t_eval, lower_edge, upper_edge, facecolor='gray', alpha=0.3, label=f'pos_upper_bound')
 
         if self.env.state_lbs is not None:
-            ax2.fill_between(self.t_eval, self.env.state_lbs[1]-self.shadow_space_wide, self.env.state_lbs[1], facecolor='gray', alpha=0.3, label=f'vel_lower_bound')
+            ymin, _ = ax2.get_ylim()
+            lower_edge = min(self.env.state_lbs[1] - self.shadow_space_wide, ymin)
+            upper_edge = self.env.state_lbs[1]
+            ax2.fill_between(self.t_eval, lower_edge, upper_edge, facecolor='gray', alpha=0.3, label=f'vel_lower_bound')
         if self.env.state_ubs is not None:
-            ax2.fill_between(self.t_eval, self.env.state_ubs[1], self.env.state_ubs[1]+self.shadow_space_wide, facecolor='gray', alpha=0.3, label=f'vel_upper_bound')
-        
+            _, ymax = ax2.get_ylim()
+            lower_edge = self.env.state_ubs[1]
+            upper_edge = max(self.env.state_ubs[1] + self.shadow_space_wide, ymax)
+            ax2.fill_between(self.t_eval, lower_edge, upper_edge, facecolor='gray', alpha=0.3, label=f'vel_upper_bound')
+            
         if self.env.input_lbs is not None:
-            ax3.fill_between(self.t_eval, self.env.input_lbs-self.shadow_space_wide, self.env.input_lbs, facecolor='gray', alpha=0.3, label=f'input_lower_bound')
+            ymin, _ = ax3.get_ylim()
+            lower_edge = min(self.env.input_lbs-self.shadow_space_wide, ymin)
+            upper_edge = self.env.input_lbs
+            ax3.fill_between(self.t_eval, lower_edge, upper_edge, facecolor='gray', alpha=0.3, label=f'input_lower_bound')
         if self.env.input_ubs is not None:
-            ax3.fill_between(self.t_eval, self.env.input_ubs, self.env.input_ubs+self.shadow_space_wide, facecolor='gray', alpha=0.3, label=f'input_upper_bound')
+            _, ymax = ax3.get_ylim()
+            lower_edge = self.env.input_ubs
+            upper_edge = max(self.env.input_ubs+self.shadow_space_wide, ymax)
+            ax3.fill_between(self.t_eval, lower_edge, upper_edge, facecolor='gray', alpha=0.3, label=f'input_upper_bound')
 
 
         # Set labels and legends

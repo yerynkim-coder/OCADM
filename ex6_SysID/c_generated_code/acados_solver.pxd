@@ -30,33 +30,33 @@
 
 cimport acados_solver_common
 
-cdef extern from "acados_solver_LinearRMPC.h":
-    ctypedef struct nlp_solver_capsule "LinearRMPC_solver_capsule":
+cdef extern from "acados_solver_MPC_identified.h":
+    ctypedef struct nlp_solver_capsule "MPC_identified_solver_capsule":
         pass
 
-    nlp_solver_capsule * acados_create_capsule "LinearRMPC_acados_create_capsule"()
-    int acados_free_capsule "LinearRMPC_acados_free_capsule"(nlp_solver_capsule *capsule)
+    nlp_solver_capsule * acados_create_capsule "MPC_identified_acados_create_capsule"()
+    int acados_free_capsule "MPC_identified_acados_free_capsule"(nlp_solver_capsule *capsule)
 
-    int acados_create "LinearRMPC_acados_create"(nlp_solver_capsule * capsule)
+    int acados_create "MPC_identified_acados_create"(nlp_solver_capsule * capsule)
 
-    int acados_create_with_discretization "LinearRMPC_acados_create_with_discretization"(nlp_solver_capsule * capsule, int n_time_steps, double* new_time_steps)
-    int acados_update_time_steps "LinearRMPC_acados_update_time_steps"(nlp_solver_capsule * capsule, int N, double* new_time_steps)
-    int acados_update_qp_solver_cond_N "LinearRMPC_acados_update_qp_solver_cond_N"(nlp_solver_capsule * capsule, int qp_solver_cond_N)
+    int acados_create_with_discretization "MPC_identified_acados_create_with_discretization"(nlp_solver_capsule * capsule, int n_time_steps, double* new_time_steps)
+    int acados_update_time_steps "MPC_identified_acados_update_time_steps"(nlp_solver_capsule * capsule, int N, double* new_time_steps)
+    int acados_update_qp_solver_cond_N "MPC_identified_acados_update_qp_solver_cond_N"(nlp_solver_capsule * capsule, int qp_solver_cond_N)
 
-    int acados_update_params "LinearRMPC_acados_update_params"(nlp_solver_capsule * capsule, int stage, double *value, int np_)
-    int acados_update_params_sparse "LinearRMPC_acados_update_params_sparse"(nlp_solver_capsule * capsule, int stage, int *idx, double *p, int n_update)
-    int acados_solve "LinearRMPC_acados_solve"(nlp_solver_capsule * capsule)
-    int acados_reset "LinearRMPC_acados_reset"(nlp_solver_capsule * capsule, int reset_qp_solver_mem)
-    int acados_free "LinearRMPC_acados_free"(nlp_solver_capsule * capsule)
-    void acados_print_stats "LinearRMPC_acados_print_stats"(nlp_solver_capsule * capsule)
+    int acados_update_params "MPC_identified_acados_update_params"(nlp_solver_capsule * capsule, int stage, double *value, int np_)
+    int acados_update_params_sparse "MPC_identified_acados_update_params_sparse"(nlp_solver_capsule * capsule, int stage, int *idx, double *p, int n_update)
+    int acados_solve "MPC_identified_acados_solve"(nlp_solver_capsule * capsule)
+    int acados_reset "MPC_identified_acados_reset"(nlp_solver_capsule * capsule, int reset_qp_solver_mem)
+    int acados_free "MPC_identified_acados_free"(nlp_solver_capsule * capsule)
+    void acados_print_stats "MPC_identified_acados_print_stats"(nlp_solver_capsule * capsule)
 
-    int acados_custom_update "LinearRMPC_acados_custom_update"(nlp_solver_capsule* capsule, double * data, int data_len)
+    int acados_custom_update "MPC_identified_acados_custom_update"(nlp_solver_capsule* capsule, double * data, int data_len)
 
-    acados_solver_common.ocp_nlp_in *acados_get_nlp_in "LinearRMPC_acados_get_nlp_in"(nlp_solver_capsule * capsule)
-    acados_solver_common.ocp_nlp_out *acados_get_nlp_out "LinearRMPC_acados_get_nlp_out"(nlp_solver_capsule * capsule)
-    acados_solver_common.ocp_nlp_out *acados_get_sens_out "LinearRMPC_acados_get_sens_out"(nlp_solver_capsule * capsule)
-    acados_solver_common.ocp_nlp_solver *acados_get_nlp_solver "LinearRMPC_acados_get_nlp_solver"(nlp_solver_capsule * capsule)
-    acados_solver_common.ocp_nlp_config *acados_get_nlp_config "LinearRMPC_acados_get_nlp_config"(nlp_solver_capsule * capsule)
-    void *acados_get_nlp_opts "LinearRMPC_acados_get_nlp_opts"(nlp_solver_capsule * capsule)
-    acados_solver_common.ocp_nlp_dims *acados_get_nlp_dims "LinearRMPC_acados_get_nlp_dims"(nlp_solver_capsule * capsule)
-    acados_solver_common.ocp_nlp_plan *acados_get_nlp_plan "LinearRMPC_acados_get_nlp_plan"(nlp_solver_capsule * capsule)
+    acados_solver_common.ocp_nlp_in *acados_get_nlp_in "MPC_identified_acados_get_nlp_in"(nlp_solver_capsule * capsule)
+    acados_solver_common.ocp_nlp_out *acados_get_nlp_out "MPC_identified_acados_get_nlp_out"(nlp_solver_capsule * capsule)
+    acados_solver_common.ocp_nlp_out *acados_get_sens_out "MPC_identified_acados_get_sens_out"(nlp_solver_capsule * capsule)
+    acados_solver_common.ocp_nlp_solver *acados_get_nlp_solver "MPC_identified_acados_get_nlp_solver"(nlp_solver_capsule * capsule)
+    acados_solver_common.ocp_nlp_config *acados_get_nlp_config "MPC_identified_acados_get_nlp_config"(nlp_solver_capsule * capsule)
+    void *acados_get_nlp_opts "MPC_identified_acados_get_nlp_opts"(nlp_solver_capsule * capsule)
+    acados_solver_common.ocp_nlp_dims *acados_get_nlp_dims "MPC_identified_acados_get_nlp_dims"(nlp_solver_capsule * capsule)
+    acados_solver_common.ocp_nlp_plan *acados_get_nlp_plan "MPC_identified_acados_get_nlp_plan"(nlp_solver_capsule * capsule)

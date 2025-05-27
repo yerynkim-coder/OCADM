@@ -34,25 +34,25 @@
 
 # model
 MODEL_SRC=
-MODEL_SRC+= LinearRMPC_model/LinearRMPC_expl_ode_fun.c
-MODEL_SRC+= LinearRMPC_model/LinearRMPC_expl_vde_forw.c
-MODEL_SRC+= LinearRMPC_model/LinearRMPC_expl_vde_adj.c
+MODEL_SRC+= MPC_identified_model/MPC_identified_expl_ode_fun.c
+MODEL_SRC+= MPC_identified_model/MPC_identified_expl_vde_forw.c
+MODEL_SRC+= MPC_identified_model/MPC_identified_expl_vde_adj.c
 MODEL_OBJ := $(MODEL_SRC:.c=.o)
 # optimal control problem - mostly CasADi exports
 OCP_SRC=
 
-OCP_SRC+= acados_solver_LinearRMPC.c
+OCP_SRC+= acados_solver_MPC_identified.c
 OCP_OBJ := $(OCP_SRC:.c=.o)
 # for sim solver
-SIM_SRC= acados_sim_solver_LinearRMPC.c
+SIM_SRC= acados_sim_solver_MPC_identified.c
 SIM_OBJ := $(SIM_SRC:.c=.o)
 
 # for target example_sim
-EX_SIM_SRC= main_sim_LinearRMPC.c
+EX_SIM_SRC= main_sim_MPC_identified.c
 EX_SIM_OBJ := $(EX_SIM_SRC:.c=.o)
 EX_SIM_EXE := $(EX_SIM_SRC:.c=)
 # for target example
-EX_SRC= main_LinearRMPC.c
+EX_SRC= main_MPC_identified.c
 EX_OBJ := $(EX_SRC:.c=.o)
 EX_EXE := $(EX_SRC:.c=)
 
@@ -94,8 +94,8 @@ LDLIBS+= -lm
 LDLIBS+= 
 
 # libraries
-LIBACADOS_SOLVER=libacados_solver_LinearRMPC.so
-LIBACADOS_OCP_SOLVER=libacados_ocp_solver_LinearRMPC.so
+LIBACADOS_SOLVER=libacados_solver_MPC_identified.so
+LIBACADOS_OCP_SOLVER=libacados_ocp_solver_MPC_identified.so
 LIBACADOS_SIM_SOLVER=lib$(SIM_SRC:.c=.so)
 
 # virtual targets
@@ -145,7 +145,7 @@ ocp_cython: ocp_cython_o
 	-o acados_ocp_solver_pyx.so \
 	-Wl,-rpath=$(LIB_PATH) \
 	acados_ocp_solver_pyx.o \
-	$(abspath .)/libacados_ocp_solver_LinearRMPC.so \
+	$(abspath .)/libacados_ocp_solver_MPC_identified.so \
 	$(LDFLAGS) $(LDLIBS)
 
 
@@ -173,7 +173,7 @@ sim_cython: sim_cython_o
 	-o acados_sim_solver_pyx.so \
 	-Wl,-rpath=$(LIB_PATH) \
 	acados_sim_solver_pyx.o \
-	$(abspath .)/libacados_sim_solver_LinearRMPC.so \
+	$(abspath .)/libacados_sim_solver_MPC_identified.so \
 	$(LDFLAGS) $(LDLIBS)
 
 clean:
@@ -185,13 +185,13 @@ clean_ocp_shared_lib:
 	$(RM) $(OCP_OBJ)
 
 clean_ocp_cython:
-	$(RM) libacados_ocp_solver_LinearRMPC.so
-	$(RM) acados_solver_LinearRMPC.o
+	$(RM) libacados_ocp_solver_MPC_identified.so
+	$(RM) acados_solver_MPC_identified.o
 	$(RM) acados_ocp_solver_pyx.so
 	$(RM) acados_ocp_solver_pyx.o
 
 clean_sim_cython:
-	$(RM) libacados_sim_solver_LinearRMPC.so
-	$(RM) acados_sim_solver_LinearRMPC.o
+	$(RM) libacados_sim_solver_MPC_identified.so
+	$(RM) acados_sim_solver_MPC_identified.o
 	$(RM) acados_sim_solver_pyx.so
 	$(RM) acados_sim_solver_pyx.o

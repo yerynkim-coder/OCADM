@@ -63,7 +63,7 @@
 #define MPC_NY0    3
 #define MPC_NY     3
 #define MPC_NYN    2
-#define MPC_N      15
+#define MPC_N      40
 #define MPC_NH     0
 #define MPC_NHN    0
 #define MPC_NH0    0

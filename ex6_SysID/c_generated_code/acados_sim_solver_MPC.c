@@ -73,7 +73,7 @@ int MPC_acados_sim_create(MPC_sim_solver_capsule * capsule)
     const int np = MPC_NP;
     bool tmp_bool;
 
-    double Tsim = 0.2;
+    double Tsim = 0.1;
 
     
     // explicit ode

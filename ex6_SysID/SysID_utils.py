@@ -250,7 +250,10 @@ class ModelIdentifier:
         self.output_indices = output_indices # DataVarIndex.JERK, DataVarIndex.ACC
 
         # Assume a model of the form:
-        # acc_cmd = params[0] * jerk + params[1] * acc = [jerk, acc] * [params[0]; params[1]]
+        # acc = 1 / (s * params[0] + params[1]) * acc_cmd
+        # acc_cmd = (s * params[0] + params[1]) * acc
+        #         = params[0] * jerk + params[1] * acc 
+        #         = [jerk, acc] * [params[0]; params[1]]
         # where acc_cmd = dot(vel_cmd), jerk = dot(acc), acc = dot(vel), vel = dot(pos)
         input_data = self.smoother.data[:, self.input_indices]
         #input_data = np.expand_dims(input_data, axis=1)
