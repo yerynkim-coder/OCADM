@@ -1795,7 +1795,7 @@ class iLQRController(LQRController):
 
 # Class for linear OCP Controller
 class LinearOCPController:
-    def __init__(self, env, dynamics, Q, R, Qf, freq: float, N: int, name='OCP', type='OCP', verbose=False):
+    def __init__(self, env, dynamics, Q, R, Qf, freq: float, N: int, name='OCP-2-norm', type='OCP', verbose=False):
         self.env = env
         self.dynamics = dynamics
         self.Q = Q
@@ -1820,7 +1820,7 @@ class LinearOCPController:
 
             self._solve_ocp(current_state)
 
-            print(f"Current cycle time: {time.time()-start_time}")
+            print(f"Computation time: {time.time()-start_time}")
 
         index = current_time
         if index < self.u_seq.shape[0]:
@@ -1917,71 +1917,176 @@ class LinearOCPController:
         z_opt = np.array(sol['x']).flatten()
 
         u_start = (N + 1) * nx
-        self.u_seq = z_opt[u_start:].reshape(N, nu)
+        self.u_seq = z_opt[u_start:].reshape(N, nu) + u_ref
 
 
 
-# Class for linear MPC Controller with 1-norm cost
-class LinearMPC1NormController:
-    def __init__(self, 
-            env: Env, 
-            dynamics: Dynamics, 
-            freq: float, 
-            N: int, 
-            name: str = 'MPC', 
-            type: str = 'MPC', 
-            verbose: bool = False
-        ) -> None:
-
+class LinearOCP1NormController:
+    def __init__(self, env, dynamics, freq: float, N: int, name='OCP-1-norm', type='OCP', verbose=False):
         self.env = env
         self.dynamics = dynamics
-
-        self.N = N
-
-        self.name = name
-        self.type = type
-
         self.freq = freq
         self.dt = 1.0 / freq
-        
+        self.N = N
+        self.name = name
+        self.type = type
         self.verbose = verbose
 
         self.dim_states = dynamics.dim_states
         self.dim_inputs = dynamics.dim_inputs
 
-        self.x_pred = None
-        self.u_pred = None
+        self.u_seq = None  # open-loop control sequence
+
+    def compute_action(self, current_state, current_time):
+        if self.u_seq is None:
+            self._solve_ocp(current_state)
+
+        index = current_time
+        if index < self.u_seq.shape[0]:
+            return self.u_seq[index]
+        else:
+            return self.u_seq[-1]
+
+    def _solve_ocp(self, current_state):
+        x0 = current_state.reshape(-1, 1)
+        u0 = np.zeros((self.dim_inputs, 1))
+        A_d, B_d = self.dynamics.get_linearized_AB_discrete(x0, u0, self.dt)
+
+        nx = self.dim_states
+        nu = self.dim_inputs
+        N = self.N
+        n_vars = nx * (N + 1) + nu * N + nu * N  # x, u, t
+
+        def idx_x(k): return slice(k * nx, (k + 1) * nx)
+        def idx_u(k): return slice((N + 1) * nx + k * nu, (N + 1) * nx + (k + 1) * nu)
+        def idx_t(k): return slice((N + 1) * nx + N * nu + k * nu, (N + 1) * nx + N * nu + (k + 1) * nu)
+
+        # Cost: sum of slack variables t_k
+        H = np.zeros((n_vars, n_vars))
+        f = np.zeros((n_vars, 1))
+        for k in range(N):
+            f[idx_t(k)] = 1.0
+
+        # Equality constraints
+        Aeq = []
+        beq = []
+
+        for k in range(N):
+            row = np.zeros((nx, n_vars))
+            row[:, idx_x(k)] = A_d
+            row[:, idx_u(k)] = B_d
+            row[:, idx_x(k+1)] = -np.eye(nx)
+            Aeq.append(row)
+            beq.append(np.zeros((nx, 1)))
+
+        row0 = np.zeros((nx, n_vars))
+        row0[:, idx_x(0)] = np.eye(nx)
+        Aeq.insert(0, row0)
+        beq.insert(0, x0)
+
+        xg = self.env.target_state.reshape(-1, 1)
+        rowT = np.zeros((nx, n_vars))
+        rowT[:, idx_x(N)] = np.eye(nx)
+        Aeq.append(rowT)
+        beq.append(xg)
+
+        Aeq = np.vstack(Aeq)
+        beq = np.vstack(beq)
+
+        # Inequality constraints
+        G = []
+        h = []
+
+        for k in range(N):
+            G1 = np.zeros((nu, n_vars))
+            G1[:, idx_u(k)] = np.eye(nu)
+            G1[:, idx_t(k)] = -np.eye(nu)
+            G.append(G1)
+            h.append(np.zeros((nu, 1)))
+
+            G2 = np.zeros((nu, n_vars))
+            G2[:, idx_u(k)] = -np.eye(nu)
+            G2[:, idx_t(k)] = -np.eye(nu)
+            G.append(G2)
+            h.append(np.zeros((nu, 1)))
+
+            if self.env.input_ubs is not None:
+                G3 = np.zeros((nu, n_vars))
+                G3[:, idx_u(k)] = np.eye(nu)
+                G.append(G3)
+                h.append(np.array(self.env.input_ubs).reshape(-1, 1))
+
+            if self.env.input_lbs is not None:
+                G4 = np.zeros((nu, n_vars))
+                G4[:, idx_u(k)] = -np.eye(nu)
+                G.append(G4)
+                h.append(-np.array(self.env.input_lbs).reshape(-1, 1))
+
+        G = np.vstack(G)
+        h = np.vstack(h)
+
+        # Solve QP
+        solvers.options['show_progress'] = self.verbose
+        sol = solvers.qp(matrix(H), matrix(f), matrix(G), matrix(h), matrix(Aeq), matrix(beq))
+        z_opt = np.array(sol['x']).flatten()
+
+        u_start = (N + 1) * nx
+        self.u_seq = z_opt[u_start:u_start + N * nu].reshape(N, nu)
+
     
+
+
+# Class for linear OCP Controller with inf-norm cost (open-loop version)
+class LinearOCPInfNormController:
+    def __init__(self, env: Env, dynamics: Dynamics, freq: float, N: int,
+                 name: str = 'OCP-inf-norm', type: str = 'OCP', verbose: bool = False) -> None:
+        self.env = env
+        self.dynamics = dynamics
+        self.N = N
+        self.name = name
+        self.type = type
+        self.freq = freq
+        self.dt = 1.0 / freq
+        self.verbose = verbose
+
+        self.dim_states = dynamics.dim_states
+        self.dim_inputs = dynamics.dim_inputs
+
+        self.u_seq = None  # store open-loop sequence
+
     @check_input_constraints
-    def compute_action(self, current_state, current_time=None):
+    def compute_action(self, current_state, current_time: int):
+        if self.u_seq is None:
+            self._solve_ocp(current_state)
+
+        if current_time < len(self.u_seq):
+            return self.u_seq[current_time]
+        else:
+            return self.u_seq[-1]  # repeat last action if time exceeds
+
+    def _solve_ocp(self, current_state):
         x0 = current_state.reshape(-1, 1)
         u0 = np.zeros((self.dim_inputs, 1))
 
         A_d, B_d = self.dynamics.get_linearized_AB_discrete(x0, u0, self.dt)
 
-        # New variable: [x_0,...,x_N, u_0,...,u_{N-1}, t_0,...,t_{N-1}]
-        n_vars = self.dim_states * (self.N + 1) + self.dim_inputs * self.N * 2
-
+        n_vars = self.dim_states * (self.N + 1) + self.dim_inputs * self.N + 1
         def idx_x(k): return slice(k * self.dim_states, (k + 1) * self.dim_states)
         def idx_u(k): return slice((self.N + 1) * self.dim_states + k * self.dim_inputs,
-                                (self.N + 1) * self.dim_states + (k + 1) * self.dim_inputs)
-        def idx_t(k): return slice((self.N + 1) * self.dim_states + self.dim_inputs * self.N + k * self.dim_inputs,
-                                (self.N + 1) * self.dim_states + self.dim_inputs * self.N + (k + 1) * self.dim_inputs)
+                                   (self.N + 1) * self.dim_states + (k + 1) * self.dim_inputs)
+        idx_t = n_vars - 1
 
-        # Cost: min sum |u_k| via slack t_k
         H = np.zeros((n_vars, n_vars))
         f = np.zeros((n_vars, 1))
-        for k in range(self.N):
-            f[idx_t(k)] = 1.0
+        f[idx_t] = 1.0
 
-        # Equality constraints: dynamics + x0 + terminal constraint
         Aeq, beq = [], []
 
         for k in range(self.N):
             row = np.zeros((self.dim_states, n_vars))
             row[:, idx_x(k)] = A_d
             row[:, idx_u(k)] = B_d
-            row[:, idx_x(k+1)] = -np.eye(self.dim_states)
+            row[:, idx_x(k + 1)] = -np.eye(self.dim_states)
             Aeq.append(row)
             beq.append(np.zeros((self.dim_states, 1)))
 
@@ -1999,32 +2104,32 @@ class LinearMPC1NormController:
         Aeq = np.vstack(Aeq)
         beq = np.vstack(beq)
 
-        # Inequality constraints: t_k ≥ |u_k| and input bounds
         G, h = [], []
 
         for k in range(self.N):
-            G1 = np.zeros((self.dim_inputs, n_vars))
-            G1[:, idx_u(k)] = np.eye(self.dim_inputs)
-            G1[:, idx_t(k)] = -np.eye(self.dim_inputs)
-            G.append(G1)
-            h.append(np.zeros((self.dim_inputs, 1)))
+            for i in range(self.dim_inputs):
+                row1 = np.zeros((1, n_vars))
+                row1[0, idx_u(k).start + i] = 1.0
+                row1[0, idx_t] = -1.0
+                G.append(row1)
+                h.append([0.0])
 
-            G2 = np.zeros((self.dim_inputs, n_vars))
-            G2[:, idx_u(k)] = -np.eye(self.dim_inputs)
-            G2[:, idx_t(k)] = -np.eye(self.dim_inputs)
-            G.append(G2)
-            h.append(np.zeros((self.dim_inputs, 1)))
+                row2 = np.zeros((1, n_vars))
+                row2[0, idx_u(k).start + i] = -1.0
+                row2[0, idx_t] = -1.0
+                G.append(row2)
+                h.append([0.0])
 
             if self.env.input_ubs is not None:
-                G3 = np.zeros((self.dim_inputs, n_vars))
-                G3[:, idx_u(k)] = np.eye(self.dim_inputs)
-                G.append(G3)
+                row = np.zeros((self.dim_inputs, n_vars))
+                row[:, idx_u(k)] = np.eye(self.dim_inputs)
+                G.append(row)
                 h.append(np.array(self.env.input_ubs).reshape(-1, 1))
 
             if self.env.input_lbs is not None:
-                G4 = np.zeros((self.dim_inputs, n_vars))
-                G4[:, idx_u(k)] = -np.eye(self.dim_inputs)
-                G.append(G4)
+                row = np.zeros((self.dim_inputs, n_vars))
+                row[:, idx_u(k)] = -np.eye(self.dim_inputs)
+                G.append(row)
                 h.append(-np.array(self.env.input_lbs).reshape(-1, 1))
 
         G = np.vstack(G)
@@ -2034,23 +2139,16 @@ class LinearMPC1NormController:
         sol = solvers.qp(matrix(H), matrix(f), matrix(G), matrix(h), matrix(Aeq), matrix(beq))
         z_opt = np.array(sol['x']).flatten()
 
-        x_opt = z_opt[: (self.N + 1) * self.dim_states].reshape(self.N + 1, self.dim_states).T
-        u_opt = z_opt[(self.N + 1) * self.dim_states : (self.N + 1) * self.dim_states + self.N * self.dim_inputs].reshape(self.N, self.dim_inputs).T
+        u_start = (self.N + 1) * self.dim_states
+        self.u_seq = z_opt[u_start:u_start + self.N * self.dim_inputs].reshape(self.N, self.dim_inputs)
 
         if self.verbose:
-            print(f"Optimal control action: {u_opt[:, 0]}")
-            print(f"Predicted x: {x_opt}")
-            print(f"Predicted u: {u_opt}")
-
-        self.x_pred = x_opt
-        self.u_pred = u_opt
-
-        return u_opt[:, 0].flatten(), x_opt.T, u_opt
+            print(f"[open-loop inf-norm OCP] Optimal u_seq:\n{self.u_seq}")
     
 
 
 # Class for linear MPC Controller with 2-norm cost
-class LinearMPC2NormController:
+class LinearMPCController:
     def __init__(self, 
             env: Env, 
             dynamics: Dynamics, 
@@ -2206,134 +2304,6 @@ class LinearMPC2NormController:
 
 
 
-# Class for linear MPC Controller with inf-norm cost
-class LinearMPCInfNormController:
-    def __init__(self, 
-            env: Env, 
-            dynamics: Dynamics, 
-            freq: float, 
-            N: int, 
-            name: str = 'LMPC', 
-            type: str = 'MPC', 
-            verbose: bool = False
-        ) -> None:
-
-        self.env = env
-        self.dynamics = dynamics
-
-        self.N = N
-        self.name = name
-        self.type = type
-
-        self.freq = freq
-        self.dt = 1.0 / freq
-        self.verbose = verbose
-
-        self.dim_states = dynamics.dim_states
-        self.dim_inputs = dynamics.dim_inputs
-
-        self.x_pred = None
-        self.u_pred = None
-    
-    @check_input_constraints
-    def compute_action(self, current_state, current_time=None):
-        x0 = current_state.reshape(-1, 1)
-        u0 = np.zeros((self.dim_inputs, 1))
-
-        A_d, B_d = self.dynamics.get_linearized_AB_discrete(x0, u0, self.dt)
-
-        # Variables: [x_0,...,x_N, u_0,...,u_{N-1}, t]
-        n_vars = self.dim_states * (self.N + 1) + self.dim_inputs * self.N + 1  # t is scalar
-
-        def idx_x(k): return slice(k * self.dim_states, (k + 1) * self.dim_states)
-        def idx_u(k): return slice((self.N + 1) * self.dim_states + k * self.dim_inputs,
-                                   (self.N + 1) * self.dim_states + (k + 1) * self.dim_inputs)
-        idx_t = n_vars - 1
-
-        # Cost: minimize t
-        H = np.zeros((n_vars, n_vars))
-        f = np.zeros((n_vars, 1))
-        f[idx_t] = 1.0
-
-        # Equality constraints
-        Aeq, beq = [], []
-
-        for k in range(self.N):
-            row = np.zeros((self.dim_states, n_vars))
-            row[:, idx_x(k)] = A_d
-            row[:, idx_u(k)] = B_d
-            row[:, idx_x(k + 1)] = -np.eye(self.dim_states)
-            Aeq.append(row)
-            beq.append(np.zeros((self.dim_states, 1)))
-
-        row0 = np.zeros((self.dim_states, n_vars))
-        row0[:, idx_x(0)] = np.eye(self.dim_states)
-        Aeq.insert(0, row0)
-        beq.insert(0, x0)
-
-        rowT = np.zeros((self.dim_states, n_vars))
-        rowT[:, idx_x(self.N)] = np.eye(self.dim_states)
-        Aeq.append(rowT)
-        xg = self.env.target_state.reshape(-1, 1)
-        beq.append(xg)
-
-        Aeq = np.vstack(Aeq)
-        beq = np.vstack(beq)
-
-        # Inequality constraints
-        G, h = [], []
-
-        for k in range(self.N):
-            for i in range(self.dim_inputs):
-                # u_k[i] - t <= 0
-                row1 = np.zeros((1, n_vars))
-                row1[0, idx_u(k).start + i] = 1.0
-                row1[0, idx_t] = -1.0
-                G.append(row1)
-                h.append([0.0])
-
-                # -u_k[i] - t <= 0
-                row2 = np.zeros((1, n_vars))
-                row2[0, idx_u(k).start + i] = -1.0
-                row2[0, idx_t] = -1.0
-                G.append(row2)
-                h.append([0.0])
-
-        # Input bounds
-        for k in range(self.N):
-            if self.env.input_ubs is not None:
-                row = np.zeros((self.dim_inputs, n_vars))
-                row[:, idx_u(k)] = np.eye(self.dim_inputs)
-                G.append(row)
-                h.append(np.array(self.env.input_ubs).reshape(-1, 1))
-            if self.env.input_lbs is not None:
-                row = np.zeros((self.dim_inputs, n_vars))
-                row[:, idx_u(k)] = -np.eye(self.dim_inputs)
-                G.append(row)
-                h.append(-np.array(self.env.input_lbs).reshape(-1, 1))
-
-        G = np.vstack(G)
-        h = np.vstack(h)
-
-        solvers.options['show_progress'] = self.verbose
-        sol = solvers.qp(matrix(H), matrix(f), matrix(G), matrix(h), matrix(Aeq), matrix(beq))
-        z_opt = np.array(sol['x']).flatten()
-
-        x_opt = z_opt[: (self.N + 1) * self.dim_states].reshape(self.N + 1, self.dim_states).T
-        u_opt = z_opt[(self.N + 1) * self.dim_states : (self.N + 1) * self.dim_states + self.N * self.dim_inputs].reshape(self.N, self.dim_inputs).T
-
-        if self.verbose:
-            print(f"[inf-norm MPC] Optimal control action: {u_opt[:, 0]}")
-            print(f"[inf-norm MPC] Predicted x: {x_opt}")
-            print(f"[inf-norm MPC] Predicted u: {u_opt}")
-
-        self.x_pred = x_opt
-        self.u_pred = u_opt
-
-        return u_opt[:, 0].flatten(), x_opt.T, u_opt
-
-
-
 # Derived class for MPC Controller
 class MPCController(LQRController):
     def __init__(
@@ -2377,24 +2347,28 @@ class MPCController(LQRController):
         """
         Define the MPC optimization problem using Acados.
         """
-        # Initialize Acados model
+        
+        ## Model
+        # Set up Acados model
         model = AcadosModel()
         model.name = self.name
 
-        # Define model: dx/dt = f(x, u)
+        # Define model: x_dot = f(x, u)
         model.x = self.dynamics.states
         model.u = self.dynamics.inputs
         model.f_expl_expr = ca.vertcat(self.dynamics.dynamics_function(self.dynamics.states, self.dynamics.inputs))
-        model.f_impl_expr = None
+        model.f_impl_expr = None # no needed, we already have the explicit model
 
+
+        ## Optimal control problem
         # Set up Acados OCP
         ocp = AcadosOcp()
-        ocp.model = model
-        ocp.dims.N = self.N  # Prediction horizon
-        ocp.solver_options.tf = self.N * self.dt  # Total prediction time
-        ocp.solver_options.qp_solver = "PARTIAL_CONDENSING_HPIPM"
-        ocp.solver_options.integrator_type = "ERK"
-        ocp.solver_options.nlp_solver_type = "SQP"
+        ocp.model = model # link to the model (class: AcadosModel)
+        ocp.dims.N = self.N  # prediction horizon
+        ocp.solver_options.tf = self.N * self.dt  # total prediction time
+        ocp.solver_options.qp_solver = "FULL_CONDENSING_HPIPM" # Partially condensing interior-point method
+        ocp.solver_options.integrator_type = "ERK" # explicit Runge-Kutta
+        ocp.solver_options.nlp_solver_type = "SQP" # sequential quadratic programming
 
         # Set up other hyperparameters in SQP solving
         ocp.solver_options.nlp_solver_max_iter = 100
@@ -2402,6 +2376,9 @@ class MPCController(LQRController):
         ocp.solver_options.nlp_solver_tol_eq = 1E-6
         ocp.solver_options.nlp_solver_tol_ineq = 1E-6
         ocp.solver_options.nlp_solver_tol_comp = 1E-6
+        
+        # For debugging
+        #ocp.solver_options.print_level = 2
 
         # Set up cost function
         ocp.cost.cost_type = "LINEAR_LS"
@@ -2432,7 +2409,8 @@ class MPCController(LQRController):
 
         # Define constraints
         ocp.constraints.x0 = self.init_state  # Initial state
-        
+
+        # State constraints
         ocp.constraints.idxbx = np.arange(self.dim_states)
         ocp.constraints.idxbx_e = np.arange(self.dim_states)
         if self.env.state_lbs is None and self.env.state_ubs is None:
@@ -2464,6 +2442,7 @@ class MPCController(LQRController):
             ocp.constraints.lbx_e = np.array(self.env.state_lbs)
             ocp.constraints.ubx_e = np.array(self.env.state_ubs)
         
+        # Input constraints
         ocp.constraints.idxbu = np.arange(self.dim_inputs)
         if self.env.input_lbs is None and self.env.input_ubs is None:
             ocp.constraints.lbu = np.full(self.dim_inputs, -1e6)
@@ -2478,9 +2457,10 @@ class MPCController(LQRController):
             ocp.constraints.lbu = np.array(self.env.input_lbs)
             ocp.constraints.ubu = np.array(self.env.input_ubs)
 
+
+        ## Ocp Solver
         # Set up Acados solver
         self.ocp = ocp
-        #if self.type != 'RMPC':
         self.solver = AcadosOcpSolver(ocp, json_file=f"{model.name}.json")
 
         if self.verbose:
