@@ -45,6 +45,7 @@ COPY . /app
 # install python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install --no-cache-dir jupyterlab
+RUN pip install --no-cache-dir cvxopt
 
 # expose the port for jupyterlab
 EXPOSE 8888
