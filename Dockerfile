@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y \
     libblas-dev \
     liblapack-dev \
     libopenblas-dev \
+    libcdd-dev \
     python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
@@ -44,8 +45,7 @@ COPY . /app
 
 # install python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
-RUN pip install --no-cache-dir jupyterlab
-RUN pip install --no-cache-dir cvxopt
+RUN pip install --no-cache-dir jupyterlab cvxopt scipy pycddlib==2.1.0 pytope
 
 # expose the port for jupyterlab
 EXPOSE 8888
