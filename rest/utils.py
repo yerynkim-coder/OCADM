@@ -2366,7 +2366,7 @@ class MPCController(LQRController):
         # Set up Acados OCP
         ocp = AcadosOcp()
         ocp.model = model # link to the model (class: AcadosModel)
-        ocp.dims.N = self.N  # prediction horizon
+        ocp.solver_options.N_horizon = self.N
         ocp.solver_options.tf = self.N * self.dt  # total prediction time
         ocp.solver_options.qp_solver = "FULL_CONDENSING_HPIPM" # Partially condensing interior-point method
         ocp.solver_options.integrator_type = "ERK" # explicit Runge-Kutta
@@ -2578,7 +2578,7 @@ class TrackingMPCController(LQRController):
         # Set up Acados OCP
         ocp = AcadosOcp()
         ocp.model = model # link to the model (class: AcadosModel)
-        ocp.dims.N = self.N  # prediction horizon
+        ocp.solver_options.N_horizon = self.N
         ocp.solver_options.tf = self.N * self.dt  # total prediction time
         ocp.solver_options.qp_solver = "FULL_CONDENSING_HPIPM" # Partially condensing interior-point method
         ocp.solver_options.integrator_type = "ERK" # explicit Runge-Kutta
@@ -2885,7 +2885,7 @@ class LinearRMPCController(LQRController):
         # Set up Acados OCP
         ocp = AcadosOcp()
         ocp.model = model # link to the model (class: AcadosModel)
-        ocp.dims.N = self.N  # prediction horizon
+        ocp.solver_options.N_horizon = self.N
         ocp.solver_options.tf = self.N * self.dt  # total prediction time
         ocp.solver_options.qp_solver = "FULL_CONDENSING_HPIPM" # Partially condensing interior-point method
         ocp.solver_options.integrator_type = "ERK" # explicit Runge-Kutta
