@@ -33,8 +33,10 @@ class Env:
             case: int, 
             init_state: np.ndarray, 
             target_state: np.ndarray,
-            symbolic_h: Callable[[ca.SX, int], ca.SX] = None, 
-            symbolic_theta: Callable[[ca.Function], ca.Function] = None,
+            symbolic_h_mean_ext: Callable[[ca.Function], ca.Function] = None, 
+            symbolic_h_cov_ext: Callable[[ca.Function], ca.Function] = None, 
+            symbolic_theta_ext: Callable[[ca.Function], ca.Function] = None,
+            param: float = None,
             state_lbs: np.ndarray = None, 
             state_ubs: np.ndarray = None, 
             input_lbs: float = None, 
@@ -44,6 +46,7 @@ class Env:
         ) -> None:
 
         self.case = case  # 1, 2, 3, 4
+        self.param = param  # terrain parameter, used in case 2, 3, 4
 
         self.initial_position = init_state[0]
         self.initial_velocity = init_state[1]
@@ -71,42 +74,43 @@ class Env:
         # Define argument p as CasADi symbolic parameters
         p = ca.SX.sym("p") # p: horizontal displacement
 
-        # Initialize symbolic h and theta if not given
-        if symbolic_h == None:
-
+        # Set functions h(p) based on symbolic parameters or given expression
+        if symbolic_h_mean_ext:
+            self.h = symbolic_h_mean_ext # function of height h w.r.t. p
+        else:
             def symbolic_h(p, case):
-
                 if case == 1:  # zero slope
                     h = 0
-
                 elif case == 2: # constant slope
-                    h = (ca.pi * p) / 18
-
+                    param = self.param if self.param is not None else 18
+                    h = (ca.pi * p) / param
                 elif case == 3: # varying slope (small disturbance)
-                    h = 0.005 * ca.cos(18 * p)
-
+                    param = self.param if self.param is not None else 0.005
+                    h = param * ca.cos(18 * p)
                 elif case == 4: # varying slope (underactated case)
-
                     condition_left = p <= -ca.pi/2
                     condition_right = p >= ca.pi/6
-                    
                     h_center = ca.sin(3 * p)
                     h_flat = 1
-
                     h = ca.if_else(condition_left, h_flat, ca.if_else(condition_right, h_flat, h_center))
-                    
                 return h
+            self.h = ca.Function("h", [p], [symbolic_h(p, case)]) # function of height h w.r.t. p
         
-        if symbolic_theta == None:
-
+        # Set functions h_cov(p) based on given expression
+        if symbolic_h_cov_ext:
+            self.h_cov = symbolic_h_cov_ext
+        else:
+            self.h_cov = None
+        
+        # Set functions theta(p) based on symbolic parameters or given expression
+        if symbolic_theta_ext:
+            symbolic_theta = symbolic_theta_ext
+        else:
             def symbolic_theta(h_func):
                 h = h_func(p) 
                 dh_dp = ca.jacobian(h, p)
                 theta = ca.atan(dh_dp)
                 return ca.Function("theta", [p], [theta])
-
-        # Set functions h(p) and theta(p) based on symbolic parameters
-        self.h = ca.Function("h", [p], [symbolic_h(p, case)]) # function of height h w.r.t. p
         self.theta = symbolic_theta(self.h) # function of inclination angle theta w.r.t. p
         
         # Generate grid mesh along p to visualize the curve of slope and inclination angle
@@ -234,7 +238,6 @@ class Dynamics:
 
                 return ca.Function("dynamics_function", [state, input], [rhs])
             
-        # Define system dynamics
         self.dynamics_function = setup_dynamics(self.env.theta)
 
         # Initialize Jacobians
@@ -400,6 +403,60 @@ class Dynamics:
             next_state += np.random.uniform(self.env.disturbance_lbs, self.env.disturbance_ubs) * dt
 
         return next_state
+    
+    def build_stochastic_model(self, dt: float):
+        """
+        Build CasADi expressions for continuous-time and discrete-time
+        process noise covariance matrices based on self.env.h and self.env.h_cov.
+
+        Stores:
+        - self.dynamics_variance_function_cont: continuous-time Σ^w(x,u)
+        - self.dynamics_variance_function_disc: discrete-time Σ^w(x,u)
+        """
+
+        # Get symbolic variables
+        p = self.states[0]
+        v = self.states[1]
+        u = self.inputs[0]
+        x = ca.vertcat(p, v)
+
+        Gravity = 9.81
+
+        # Automatic differentiation of h(p) and Var[h(p)]
+        mu_h = self.env.h(p)
+        dmu_h = ca.gradient(mu_h, p)
+        sigma_h2 = self.env.h_cov(p)
+        dsigma_h2 = ca.gradient(sigma_h2, p)
+
+        mu_dh = dmu_h
+        sigma_dh = ca.fabs(dsigma_h2)  # safety clamp to non-negative
+
+        # Mean of trig terms
+        denom = ca.sqrt(1 + mu_dh**2)
+        mu_cos = 1 / denom
+        mu_sin = mu_dh / denom
+
+        # Variance propagation
+        dcos_dz = -mu_dh / (1 + mu_dh**2)**(3/2)
+        dsin_dz = 1 / (1 + mu_dh**2)**(3/2)
+        dprod_dz = mu_cos * dsin_dz + mu_sin * dcos_dz
+
+        sigma_cos2 = (dcos_dz**2) * sigma_dh
+        sigma_sincos2 = (dprod_dz**2) * sigma_dh
+
+        sigma_v_cont = Gravity**2 * sigma_sincos2 + u**2 * sigma_cos2
+        sigma_vec_cont = ca.vertcat(0, sigma_v_cont)
+        Sigma_w_cont = ca.diag(sigma_vec_cont)
+        Sigma_w_disc = dt**2 * Sigma_w_cont
+
+        # Store CasADi functions
+        self.dynamics_variance_function_cont = ca.Function(
+            "Sigma_w_cont", [self.states, self.inputs], [Sigma_w_cont]
+        )
+        self.dynamics_variance_function_disc = ca.Function(
+            "Sigma_w_disc", [self.states, self.inputs], [Sigma_w_disc]
+        )
+
 
 
 
@@ -2986,38 +3043,63 @@ class LinearRMPCController(LQRController):
 
         return u_real, x_pred, u_pred, u_nominal
     
-    def plot_robust_invariant_set(self):
+    def plot_robust_invariant_set(self, lbz, ubz, tol=1e-4, max_iter=10):
+        
         """
-        Plot the 2D invariant set (Ω) and its axis-aligned bounding box.
-        Assumes 2D state space.
+        Plot the 2D invariant set (Ω). Assumes 2D state space.
         """
-        Omega_vertices = self.Omega_tube.V
-        assert Omega_vertices.shape[1] == 2, "Only 2D invariant sets are supported."
-
-        # Convex hull of the Omega polytope
-        hull = ConvexHull(Omega_vertices)
-        hull_pts = Omega_vertices[hull.vertices]
-
-        # Compute axis-aligned bounding box
-        min_bounds = np.min(Omega_vertices, axis=0)
-        max_bounds = np.max(Omega_vertices, axis=0)
-        bounding_box = np.array([
-            [min_bounds[0], min_bounds[1]],
-            [min_bounds[0], max_bounds[1]],
-            [max_bounds[0], max_bounds[1]],
-            [max_bounds[0], min_bounds[1]],
-            [min_bounds[0], min_bounds[1]]
-        ])
 
         # Plot
         plt.figure(figsize=(6, 6))
-        plt.fill(hull_pts[:, 0], hull_pts[:, 1], color='skyblue', alpha=0.5, label='Ω (Invariant Set)')
-        plt.plot(hull_pts[:, 0], hull_pts[:, 1], 'b-', linewidth=2)
-        plt.plot(bounding_box[:, 0], bounding_box[:, 1], 'r--', linewidth=2, label='Bounding Box')
 
-        plt.title("Invariant Set Ω and Bounding Box")
-        plt.xlabel("State x₁")
-        plt.ylabel("State x₂")
+        def plot_polytope(Omega: pt.Polytope, label=None):
+            Omega_vertices = Omega.V
+            assert Omega_vertices.shape[1] == 2, "Only 2D invariant sets are supported."
+
+            # Convex hull of the Omega polytope
+            hull = ConvexHull(Omega_vertices)
+            hull_pts = Omega_vertices[hull.vertices]
+            hull_pts = np.vstack([hull_pts, hull_pts[0]])
+
+            plt.fill(hull_pts[:, 0], hull_pts[:, 1], color='red', alpha=0.1, label=label)
+            plt.plot(hull_pts[:, 0], hull_pts[:, 1], color='red', linewidth=2)
+
+        # Step 1: Define initial disturbance set D (box)
+        dim = len(ubz)
+
+        # H-representation: H x ≤ h
+        H_box = np.vstack([np.eye(dim), -np.eye(dim)])
+        h_box = np.hstack([ubz, -lbz])
+
+        # Create polytope with both H-rep and V-rep
+        D = pt.Polytope(H_box, h_box)
+
+        # Step 2: Initialize Omega := D
+        Omega = D
+        plot_polytope(Omega, label = "Ω")
+
+        A_cl = self.A + self.B @ self.K_feedback
+
+        for i in range(max_iter):
+            # Step 3: Apply affine map A_cl to Omega: A_cl * Omega
+            A_Omega = self.affine_map(Omega, A_cl)
+
+            # Step 4: Minkowski sum: Omega_next = A_Omega ⊕ D
+            Omega_next = A_Omega + D
+
+            # Step 5: Check convergence via bounding box approximation
+            bounds_old = self.estimate_bounds_from_polytope(Omega)
+            bounds_new = self.estimate_bounds_from_polytope(Omega_next)
+
+            if np.allclose(bounds_old, bounds_new, atol=tol):
+                return Omega_next  # Return as vertices
+
+            Omega = Omega_next
+            plot_polytope(Omega)
+
+        plt.title("Robust Invariant Set Ω")
+        plt.xlabel("Position p")
+        plt.ylabel("Velocity v")
         plt.axis('equal')
         plt.grid(True)
         plt.legend()
@@ -3698,8 +3780,6 @@ class Simulator:
         env: Env = None,
         dt: float = None,
         t_terminal: float = None,
-        type: str = 'ideal', # 'ideal' OR 'identified'
-        param_id: np.array = None,
         verbose: bool = False
     ) -> None:
         
@@ -3707,17 +3787,7 @@ class Simulator:
         self.controller = controller
         self.env = env
 
-        self.type = type  # 'ideal' or 'identified'
-
         self.verbose = verbose
-
-        if self.type == 'ideal':
-            self.input_dynamics = None
-        elif self.type == 'identified' and param_id is not None:
-            self.input_dynamics = InputDynamics(param_id)
-        elif self.type == 'identified' and param_id == None:
-            raise ValueError("Error: choose to use the identified input model but no identified parameters are given!")
-            
 
         # Initialize attributes only if 'env' is provided
         if env is not None:
@@ -3761,9 +3831,6 @@ class Simulator:
         current_state = self.init_state
         self.state_traj.append(current_state)
 
-        if self.type == 'identified':
-            current_input_old = 0
-
         for current_time in self.t_eval[:-1]:
 
             # Get current state, and call controller to calculate input
@@ -3780,14 +3847,7 @@ class Simulator:
             else:
                 input_cmd = self.controller.compute_action(current_state, self.counter)
 
-            # Do one-step simulation
-            if self.type == 'ideal':
-                current_input = input_cmd
-            elif self.type == 'identified' and self.input_dynamics is not None:
-                current_input = self.input_dynamics.one_step_forward(current_input_old, input_cmd, self.dt)
-                current_input_old = current_input
-            else:
-                raise NotImplementedError("Simulation type not implemented or input dynamics not provided!")
+            current_input = input_cmd
                 
             current_state = self.dynamics.one_step_forward(current_state, current_input, self.dt)
             #print(f"sim_state:{current_state}")
@@ -4056,7 +4116,7 @@ class Visualizer:
 
         # Plot the reference and evaluated trajectories for each simulator
         for simulator_ref in simulators:
-            if not simulator_ref.state_traj:
+            if simulator_ref.state_traj is None or len(simulator_ref.state_traj) == 0:
                 raise ValueError(f"Failed to get trajectory from simulator {simulator_ref.controller_name}. State trajectory list is void; please run 'run_simulation' first.")
 
             # Get reference trajectories from simulator_ref
