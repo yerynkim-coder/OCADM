@@ -7,11 +7,12 @@ from matplotlib.animation import FuncAnimation
 
 class GenerateData:
 
-    def __init__(self, p_range=[(-2, 2)], p_weights=None, num_samples=100, case=None):
+    def __init__(self, p_range=[(-2, 2)], p_weights=None, num_samples=100, case=None, param: float = None):
         self.p_range = p_range if isinstance(p_range[0], tuple) else [p_range]
         self.num_samples = num_samples
         self.p_weights = p_weights  # None by default
         self.case = case if case is not None else np.random.randint(1, 5)
+        self.param = param
 
         self.noise_mean = 0.0
         self.noise_std = 0.0
@@ -46,9 +47,11 @@ class GenerateData:
         if case == 1:
             h = 0
         elif case == 2:
-            h = (ca.pi * p) / 18
+            param = self.param if self.param is not None else 18
+            h = (ca.pi * p) / param
         elif case == 3:
-            h = 0.005 * ca.cos(18 * p)
+            param = self.param if self.param is not None else 0.005
+            h = param * ca.cos(18 * p)
         elif case == 4:
             condition_left = p <= -ca.pi / 2
             condition_right = p >= ca.pi / 6
@@ -198,7 +201,12 @@ class Identifier_LR:
             ax.plot(p_test, h_true, 'b--', linewidth=2, label='True Function')
 
         # Training data
-        ax.plot(self.p_train, self.h_train, 'k.', label='Training Data', alpha=0.5)
+        if len(self.p_train)<50:
+            ax.plot(self.p_train, self.h_train, 'k.', label='Training Data', alpha=0.5, markersize=15)
+        elif len(self.p_train)<200:
+            ax.plot(self.p_train, self.h_train, 'k.', label='Training Data', alpha=0.5, markersize=10)
+        else:
+            ax.plot(self.p_train, self.h_train, 'k.', label='Training Data', alpha=0.5)
 
         # Prediction
         ax.plot(p_test, h_pred, color='red', linewidth=2, label='Fitted Curve (LR)')
@@ -259,7 +267,7 @@ class Identifier_BLR(Identifier_LR):
         std = np.sqrt(var)
         return mean, std
 
-    def plot(self, p_test=None, true_func=None, title='Bayesian Linear Regression', ax=None):
+    def plot(self, p_test=None, true_func=None, title='Bayesian Linear Regression', ax=None, larger_dot=False):
         if self.p_train is None or self.h_train is None:
             raise ValueError("You must fit the model before plotting.")
 
@@ -279,7 +287,12 @@ class Identifier_BLR(Identifier_LR):
             ax.plot(p_test, y_true, 'b--', label='True function', linewidth=2)
 
         # Training data
-        ax.plot(self.p_train, self.h_train, 'k.', label='Training Data', alpha=0.5)
+        if len(self.p_train)<50:
+            ax.plot(self.p_train, self.h_train, 'k.', label='Training Data', alpha=0.5, markersize=15)
+        elif len(self.p_train)<200:
+            ax.plot(self.p_train, self.h_train, 'k.', label='Training Data', alpha=0.5, markersize=10)
+        else:
+            ax.plot(self.p_train, self.h_train, 'k.', label='Training Data', alpha=0.5)
 
         # Prediction mean
         ax.plot(p_test, y_mean, color='red', label='Model prediction (BLR)', linewidth=2)
