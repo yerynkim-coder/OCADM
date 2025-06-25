@@ -20,11 +20,21 @@ from IPython.display import display, HTML
 from scipy.interpolate import interp2d
 from cvxopt import matrix, solvers
 import pytope as pt
-from scipy.spatial import ConvexHull, QhullError
+from scipy.spatial import ConvexHull, QhullError, cKDTree
 
 # Add a tutorial to show how to install acados and set interface to python
 from acados_template import AcadosOcp, AcadosOcpSolver, AcadosModel
 
+
+def timing(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        start = time.perf_counter()
+        result = func(*args, **kwargs)
+        end = time.perf_counter()
+        print(f"{func.__qualname__} took {end - start:.6f} seconds")
+        return result
+    return wrapper
 
 
 class Env:
@@ -463,8 +473,32 @@ class InputDynamics:
         return new_input
 
 
+def linspace_include_target(target, lb, ub, num):
+    assert target >= lb and target <= ub, "Target is out of bounds"
+    # Create the original linspace
+    linspace_array = np.linspace(lb, ub, num)
 
+    # Find the closest index to target
+    closest_idx = np.argmin(np.abs(linspace_array - target))
 
+    # Calculate the difference and shift the entire array
+    difference = target - linspace_array[closest_idx]
+    linspace_array += difference
+
+    return linspace_array
+
+def plot_discrete_state_space(pos_partitions, vel_partitions, target_state=None):
+
+    fig, ax = plt.subplots(1, 1, figsize=(5, 5))
+
+    pos_grid, vel_grid = np.meshgrid(pos_partitions, vel_partitions)
+    ax.plot(pos_grid.flatten(), vel_grid.flatten(), 'o', label='Discrete States')
+    if target_state is not None:
+        ax.plot(target_state[0], target_state[1], 'r*', label='Target State')
+    ax.set_xlabel('Position')
+    ax.set_ylabel('Velocity')
+    ax.legend()
+    plt.show()
 
 class Env_rl_d(Env):
     def __init__(
@@ -473,7 +507,11 @@ class Env_rl_d(Env):
             dynamics: Dynamics = None,
             num_states: np.array = np.array([20, 20]),
             num_actions: int = 10,
-            dt: float = 0.1
+            dt: float = 0.1,
+            use_nn: bool = True,
+            num_samples: int = 100,
+            state_noise_levels: np.array = np.array([1e-2, 1e-3]),
+            input_noise_levels: np.array = np.array([1e-3])
         ) -> None:
 
         self.env = env
@@ -490,9 +528,20 @@ class Env_rl_d(Env):
             raise ValueError("Constraints on states and input must been fully specified!")
 
         # Partitions over state space and input space
-        self.pos_partitions = np.linspace(self.pos_lbs, self.pos_ubs, self.num_pos)
-        self.vel_partitions = np.linspace(self.vel_lbs, self.vel_ubs, self.num_vel)
-        self.acc_partitions = np.linspace(self.input_lbs, self.input_ubs, self.num_acc)
+        # self.pos_partitions = np.linspace(self.pos_lbs, self.pos_ubs, self.num_pos)
+        # self.vel_partitions = np.linspace(self.vel_lbs, self.vel_ubs, self.num_vel)
+        # self.acc_partitions = np.linspace(self.input_lbs, self.input_ubs, self.num_acc)
+        self.pos_partitions = linspace_include_target(self.env.target_state[0], self.pos_lbs, self.pos_ubs, self.num_pos)
+        self.vel_partitions = linspace_include_target(self.env.target_state[1], self.vel_lbs, self.vel_ubs, self.num_vel)
+        self.acc_partitions = linspace_include_target(0.0, self.input_lbs, self.input_ubs, self.num_acc)
+
+        # Create kdtrees for state space and input space
+        self.kdtree_pos = cKDTree(self.pos_partitions.reshape(-1, 1))
+        self.kdtree_vel = cKDTree(self.vel_partitions.reshape(-1, 1))
+        self.kdtree_acc = cKDTree(self.acc_partitions.reshape(-1, 1))
+
+        # Look up closest state index for the target state
+        self.target_state_index = self.nearest_state_index_lookup_kdtree(self.env.target_state)
 
         # Generate state space (position, velocity combinations)
         POS, VEL = np.meshgrid(self.pos_partitions, self.vel_partitions)
@@ -512,6 +561,16 @@ class Env_rl_d(Env):
         self.R = [None] * self.num_actions  # Shape: list (1, num_actions) -> array (num_states, num_states)
         
         # Build MDP 
+        self.use_nn = use_nn
+        if self.use_nn:
+            self.num_samples = num_samples
+            self.state_noise_levels = state_noise_levels
+            self.input_noise_levels = input_noise_levels
+        else:
+            self.num_samples = 1
+            self.state_noise_levels = np.array([0.0, 0.0])
+            self.input_noise_levels = np.array([0.0])
+
         self.build_stochastic_mdp()
 
     def one_step_forward(self, cur_state, cur_input):
@@ -532,8 +591,8 @@ class Env_rl_d(Env):
         next_state = np.array([next_pos, next_vel])
         
         # Get reward
-        next_state_index = self.nearest_state_index_lookup(next_state)
-        if np.all(self.state_space[:, next_state_index] == self.env.target_state):
+        next_state_index = self.nearest_state_index_lookup_kdtree(next_state)
+        if next_state_index == self.target_state_index:
             reward = 10
         elif np.any(next_state_raw != next_state):
             reward = -1
@@ -549,14 +608,19 @@ class Env_rl_d(Env):
         distances = np.linalg.norm(self.state_space.T - np.array(state), axis=1)
         return np.argmin(distances)
     
-    def build_stochastic_mdp(self):
+    def nearest_state_index_lookup_kdtree(self, state):
+        """
+        Find the nearest state index in the discrete state space for a given state.
+        """
+        nearest_pos_idx = self.kdtree_pos.query(state[0])[1]
+        nearest_vel_idx = self.kdtree_vel.query(state[1])[1]
+
+        return nearest_pos_idx + nearest_vel_idx * self.num_pos
+    
+    def build_stochastic_mdp(self, verbose=False):
         """
         Construct transition probability (T) and reward (R) matrices for the MDP.
         """
-        # Unique values for position and velocity
-        unique_pos = self.pos_partitions
-        unique_vel = self.vel_partitions
-
         # Iterate over all states
         for state_index in range(self.num_states):
             cur_state = self.state_space[:, state_index]
@@ -566,46 +630,15 @@ class Env_rl_d(Env):
             for action_index in range(self.num_actions):
                 action = self.input_space[action_index]
 
-                print(f"cur_state: {cur_state}")
-                print(f"action: {action}")
+                if verbose:
+                    print(f"cur_state: {cur_state}")
+                    print(f"action: {action}")
 
-                # Propagate forward to get next state and reward
-                next_state, reward = self.one_step_forward(cur_state, action)
+                if self.use_nn:
+                    probs, nodes, rewards = self.nearest_neighbor_approach(cur_state, action, verbose)
 
-                print(f"next_state: {next_state}")
-
-                # Find the two closest discretized values for position and velocity
-                pos_indices = np.argsort(np.abs(unique_pos - next_state[0]))[:2]
-                vel_indices = np.argsort(np.abs(unique_vel - next_state[1]))[:2]
-
-                pos_bounds = [unique_pos[pos_indices[0]], unique_pos[pos_indices[1]]]
-                vel_bounds = [unique_vel[vel_indices[0]], unique_vel[vel_indices[1]]]
-
-                print(f"pos_bounds: {pos_bounds}")
-                print(f"vel_bounds: {vel_bounds}")
-
-                # Normalize next state within bounds
-                x_norm = (next_state[0] - min(pos_bounds)) / (max(pos_bounds) - min(pos_bounds))
-                y_norm = (next_state[1] - min(vel_bounds)) / (max(vel_bounds) - min(vel_bounds))
-
-                print(f"x_norm: {x_norm}")
-                print(f"y_norm: {y_norm}")
-
-                # Calculate bilinear interpolation probabilities
-                probs = [
-                    (1 - x_norm) * (1 - y_norm),  # bottom-left
-                    x_norm * (1 - y_norm),        # bottom-right
-                    x_norm * y_norm,              # top-right
-                    (1 - x_norm) * y_norm         # top-left
-                ]
-
-                # Four vertices of the enclosing box
-                nodes = [
-                    [min(pos_bounds), min(vel_bounds)],  # bottom-left
-                    [max(pos_bounds), min(vel_bounds)],  # bottom-right
-                    [max(pos_bounds), max(vel_bounds)],  # top-right
-                    [min(pos_bounds), max(vel_bounds)]   # top-left
-                ]
+                else:
+                    probs, nodes, rewards = self.linear_interpolation_approach(cur_state, action, verbose)
 
                 # Initialize T and R matrices if not already done
                 if self.T[action_index] is None:
@@ -615,9 +648,80 @@ class Env_rl_d(Env):
 
                 # Update transition and reward matrices
                 for i, node in enumerate(nodes):
-                    node_index = self.nearest_state_index_lookup(node)
-                    self.T[action_index][state_index, node_index] += probs[i]
-                    self.R[action_index][state_index, node_index] += reward
+                    # node_index = self.nearest_state_index_lookup(node)
+                    node_index = self.nearest_state_index_lookup_kdtree(node)
+                    
+                    self.T[action_index][state_index, node_index] += probs[i] / self.num_samples
+                    self.R[action_index][state_index, node_index] += rewards[i] / self.num_samples
+
+    def nearest_neighbor_approach(self, cur_state, action, verbose=False):
+        probs = [1.0] * self.num_samples
+        nodes = []
+        rewards = []
+        for i in range(self.num_samples):
+            # Sample noise
+            state_noise = np.random.normal(0, 1.0, size=cur_state.shape) * self.state_noise_levels
+            input_noise = np.random.normal(0, 1.0, size=1) * self.input_noise_levels
+
+            if verbose:
+                print(f"state_noise: {state_noise}")
+                print(f"input_noise: {input_noise}")
+
+            # Propagate forward to get next state and reward
+            next_state, reward = self.one_step_forward(cur_state + state_noise, action + input_noise)
+
+            if verbose:
+                print(f"next_state: {next_state}")
+
+            nodes.append(next_state)
+            rewards.append(reward)
+
+        return probs, nodes, rewards
+    
+    def linear_interpolation_approach(self, cur_state, action, verbose=False):
+        # Propagate forward to get next state and reward
+        next_state, reward = self.one_step_forward(cur_state, action)
+
+        if verbose:
+            print(f"next_state: {next_state}")
+
+        pos_indices = self.kdtree_pos.query(next_state[0], k=2)[1]
+        vel_indices = self.kdtree_vel.query(next_state[1], k=2)[1]
+
+        pos_bounds = [self.pos_partitions[pos_indices[0]], self.pos_partitions[pos_indices[1]]]
+        vel_bounds = [self.vel_partitions[vel_indices[0]], self.vel_partitions[vel_indices[1]]]
+
+        if verbose:
+            print(f"pos_bounds: {pos_bounds}")
+            print(f"vel_bounds: {vel_bounds}")
+
+        # Normalize next state within bounds
+        x_norm = (next_state[0] - min(pos_bounds)) / (max(pos_bounds) - min(pos_bounds))
+        y_norm = (next_state[1] - min(vel_bounds)) / (max(vel_bounds) - min(vel_bounds))
+
+        if verbose:
+            print(f"x_norm: {x_norm}")
+            print(f"y_norm: {y_norm}")
+
+        # Calculate bilinear interpolation probabilities
+        probs = [
+            (1 - x_norm) * (1 - y_norm),  # bottom-left
+            x_norm * (1 - y_norm),        # bottom-right
+            x_norm * y_norm,              # top-right
+            (1 - x_norm) * y_norm         # top-left
+        ]
+
+        # Four vertices of the enclosing box
+        nodes = [
+            [min(pos_bounds), min(vel_bounds)],  # bottom-left
+            [max(pos_bounds), min(vel_bounds)],  # bottom-right
+            [max(pos_bounds), max(vel_bounds)],  # top-right
+            [min(pos_bounds), max(vel_bounds)]   # top-left
+        ]
+
+        rewards = [reward] * len(nodes)
+
+        return probs, nodes, rewards
 
     # plot t for all states
     def plot_t(self):
@@ -638,7 +742,6 @@ class Env_rl_d(Env):
 
         plt.tight_layout()
         plt.show()
-    
 
 
 class Env_rl_c(Env):
@@ -3095,7 +3198,11 @@ class GPIController(BaseController):
         # Initialize policy and value function
         self.policy = np.zeros(self.dim_states, dtype=int)  # Initial policy: choose action 0 for all states
         self.value_function = np.zeros(self.dim_states)  # Initial value function
+
+        self.num_pe_iterations = 0
+        self.num_pi_iterations = 0
     
+    @timing
     def setup(self) -> None:
         """Perform GPI to compute the optimal policy."""
 
@@ -3104,56 +3211,10 @@ class GPIController(BaseController):
         for pi_iteration in range(self.max_ite_pi):
 
             # Policy Evaluation
-            for pe_iteration in range(self.max_ite_pe):
+            new_value_function, pe_iteration = self.policy_evaluation(new_value_function)
 
-                self.value_function = copy.copy(new_value_function)
-
-                new_value_function = np.zeros_like(self.value_function)
-                
-                for state_index in range(self.dim_states):
-
-                    action_index = self.policy[state_index]
-
-                    for next_state_index in range(self.dim_states):
-
-                        new_value_function[state_index] += self.mdp.T[action_index][state_index, next_state_index] * (
-                            self.mdp.R[action_index][state_index, next_state_index] + self.gamma * self.value_function[next_state_index]
-                        )
-
-                print(f"self.value_function: {self.value_function}")
-                print(f"new_value_function: {new_value_function}")
-
-                # Check for convergence in policy evaluation
-                if np.max(np.abs(new_value_function - self.value_function)) < self.precision_pe:
-                    if self.verbose:
-                        print(f"Policy evaluation converged after {pe_iteration + 1} iterations, max error: {np.max(np.abs(new_value_function - self.value_function))}.")
-                    break
-                elif self.verbose:
-                    print(f"Policy evaluation iteration {pe_iteration + 1}, max error: {np.max(np.abs(new_value_function - self.value_function))}")
-            
-            self.value_function = copy.copy(new_value_function)
-            
             # Policy Improvement
-            policy_stable = True
-            old_policy = copy.copy(self.policy)
-            for state_index in range(self.dim_states):
-                
-                q_values = np.zeros(self.dim_inputs)
-
-                # Compute Q-values for all actions
-                for action_index in range(self.dim_inputs):
-                    for next_state_index in range(self.dim_states):
-
-                        q_values[action_index] += self.mdp.T[action_index][state_index, next_state_index] * (
-                            self.mdp.R[action_index][state_index, next_state_index] + self.gamma * self.value_function[next_state_index]
-                        )
-
-                # Update policy greedily
-                self.policy[state_index] = np.argmax(q_values)
-
-                # Check for convergence in policy improvement
-                if old_policy[state_index] != self.policy[state_index]:
-                    policy_stable = False
+            policy_stable, old_policy = self.policy_improvement()
 
             # Check for convergence in policy improvement
             if policy_stable and np.max(np.abs(new_value_function - self.value_function)) < self.precision_pi:
@@ -3165,6 +3226,71 @@ class GPIController(BaseController):
                 print(f"Policy improvement iteration {pi_iteration + 1}, still not converged, keep running.")
                 print(f"Last Policy: {old_policy}")
                 print(f"Current Policy: {self.policy}")
+
+            self.num_pi_iterations += 1
+
+        print(f"Total policy evaluation iterations: {self.num_pe_iterations}")
+        print(f"Total policy improvement iterations: {self.num_pi_iterations}")
+
+    def policy_evaluation(self, new_value_function):
+        # Policy Evaluation
+        for pe_iteration in range(self.max_ite_pe):
+
+            self.value_function = copy.copy(new_value_function)
+
+            new_value_function = np.zeros_like(self.value_function)
+            
+            for state_index in range(self.dim_states):
+
+                action_index = self.policy[state_index]
+
+                for next_state_index in range(self.dim_states):
+
+                    new_value_function[state_index] += self.mdp.T[action_index][state_index, next_state_index] * (
+                        self.mdp.R[action_index][state_index, next_state_index] + self.gamma * self.value_function[next_state_index]
+                    )
+
+            print(f"self.value_function: {self.value_function}")
+            print(f"new_value_function: {new_value_function}")
+
+            self.num_pe_iterations += 1
+
+            # Check for convergence in policy evaluation
+            if np.max(np.abs(new_value_function - self.value_function)) < self.precision_pe:
+                if self.verbose:
+                    print(f"Policy evaluation converged after {pe_iteration + 1} iterations, max error: {np.max(np.abs(new_value_function - self.value_function))}.")
+                break
+            elif self.verbose:
+                print(f"Policy evaluation iteration {pe_iteration + 1}, max error: {np.max(np.abs(new_value_function - self.value_function))}")
+        
+        self.value_function = copy.copy(new_value_function)
+
+        return new_value_function, pe_iteration
+
+    def policy_improvement(self):
+        # Policy Improvement
+        policy_stable = True
+        old_policy = copy.copy(self.policy)
+        for state_index in range(self.dim_states):
+            
+            q_values = np.zeros(self.dim_inputs)
+
+            # Compute Q-values for all actions
+            for action_index in range(self.dim_inputs):
+                for next_state_index in range(self.dim_states):
+
+                    q_values[action_index] += self.mdp.T[action_index][state_index, next_state_index] * (
+                        self.mdp.R[action_index][state_index, next_state_index] + self.gamma * self.value_function[next_state_index]
+                    )
+
+            # Update policy greedily
+            self.policy[state_index] = np.argmax(q_values)
+
+            # Check for convergence in policy improvement
+            if old_policy[state_index] != self.policy[state_index]:
+                policy_stable = False
+
+        return policy_stable, old_policy
 
     @check_input_constraints
     def compute_action(self, current_state: np.ndarray, current_time) -> np.ndarray:
@@ -3186,11 +3312,13 @@ class GPIController(BaseController):
         """
         value_map = self.value_function.reshape(self.mdp.num_pos, self.mdp.num_vel)
         policy_map = self.policy.reshape(self.mdp.num_pos, self.mdp.num_vel)
+        # turn policy map into input map
+        input_map = self.mdp.input_space[self.policy].reshape(self.mdp.num_pos, self.mdp.num_vel)
 
         fig, axs = plt.subplots(1, 2, figsize=(12, 4))
 
         # Plot policy (U)
-        im1 = axs[0].imshow(policy_map, extent=[
+        im1 = axs[0].imshow(input_map, extent=[
             self.mdp.pos_partitions[0], self.mdp.pos_partitions[-1],
             self.mdp.vel_partitions[0], self.mdp.vel_partitions[-1]
         ], origin='lower', aspect='auto', cmap='viridis')
