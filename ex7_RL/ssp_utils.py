@@ -79,9 +79,10 @@ def plot_transition_matrix(P, u=0):
     ax.plot_surface(X, Y, Z, cmap='viridis')
     ax.set_xlabel('Node i')
     ax.set_ylabel('Node j')
-    ax.set_zlabel('p_ij')
-    ax.set_title(f'Transition Probabilities, u = {u + 1}')
-    plt.tight_layout()
+    ax.set_zlabel('p')
+    ax.set_title(r'Transition Probabilities $p_{{ij}}(u)$, $u = {}$'.format(u + 1))
+    ax.set_box_aspect([1, 1, 0.6])  # X:Y:Z = 1:1:0.6
+    ax.view_init(elev=25, azim=250)
     plt.show()
 
 
@@ -98,7 +99,7 @@ def plot_transition_matrix(P, u=0):
 #
 # Outputs (from `solve()` method):
 # - J: Optimal cost-to-go for each state, shape (n+1,)
-# - F: Optimal policy (action index starting from 1), shape (n+1,)
+# - pi: Optimal policy (action index starting from 1), shape (n+1,)
 #
 # Notes:
 # - Assumes stage cost is 1 for non-terminal states, 0 for the terminal state.
@@ -111,8 +112,8 @@ class SSPPolicyIteration:
         self.m = P.shape[2]      # number of control inputs
 
         # Stage cost: cost of 1 for all non-terminal states, 0 for terminal state
-        self.G = np.ones((self.n + 1, self.m))
-        self.G[self.n, :] = 0
+        self.l = np.ones((self.n + 1, self.m))
+        self.l[self.n, :] = 0
 
     def solve(self):
         """
@@ -120,9 +121,9 @@ class SSPPolicyIteration:
 
         Returns:
             J (np.ndarray): optimal cost-to-go vector of shape (n+1,)
-            F (np.ndarray): optimal policy vector of shape (n+1,) with actions in [1, ..., m]
+            pi (np.ndarray): optimal policy vector of shape (n+1,) with actions in [1, ..., m]
         """
-        F = np.ones(self.n + 1, dtype=int)  # Initial policy: action 1 for all states
+        pi = np.ones(self.n + 1, dtype=int)  # Initial policy: action 1 for all states
         J = np.zeros(self.n + 1)            # Initial cost-to-go
         iter_count = 0
 
@@ -138,26 +139,26 @@ class SSPPolicyIteration:
 
             # Build system of equations: A * J = B
             for i in range(self.n + 1):
-                u = F[i] - 1
+                u = pi[i] - 1
                 A[i, :] -= self.P[i, :, u]
-                B[i] = self.G[i, u]
+                B[i] = self.l[i, u]
 
             # Solve only for first n rows (terminal state's equation is trivial)
             J[:self.n] = np.linalg.solve(A[:self.n, :self.n], B[:self.n])
 
             # === 2) POLICY IMPROVEMENT ===
-            F_prev = F.copy()
+            pi_prev = pi.copy()
             for i in range(self.n):
                 # Compute expected cost for each control input at state i
-                costs = self.G[i, :] + self.P[i, :, :].T @ J
-                F[i] = np.argmin(costs) + 1  # Select action minimizing cost
+                costs = self.l[i, :] + self.P[i, :, :].T @ J
+                pi[i] = np.argmin(costs) + 1  # Select action minimizing cost
 
             # === 3) CONVERGENCE CHECK ===
-            if np.all(F == F_prev) or np.linalg.norm(J - J_prev) < 1e-10:
+            if np.all(pi == pi_prev) or np.linalg.norm(J - J_prev) < 1e-10:
                 print("Policy iteration converged.")
                 break
 
-        return J, F
+        return J, pi
 
 
 
@@ -174,7 +175,7 @@ class SSPPolicyIteration:
 #
 # Outputs (from `solve()` method):
 # - J: Optimal cost-to-go for each state, shape (n+1,)
-# - F: Optimal policy (action index starting from 1), shape (n+1,)
+# - pi: Optimal policy (action index starting from 1), shape (n+1,)
 #
 # Notes:
 # - Stage cost is 1 for all non-terminal states, and 0 for terminal state.
@@ -187,8 +188,8 @@ class SSPValueIteration:
         self.m = P.shape[2]      # number of control inputs
 
         # Stage cost: 1 per step, except for terminal state which has zero cost
-        self.G = np.ones((self.n + 1, self.m))
-        self.G[self.n, :] = 0
+        self.l = np.ones((self.n + 1, self.m))
+        self.l[self.n, :] = 0
 
     def solve(self, epsilon=0.1):
         """
@@ -199,11 +200,11 @@ class SSPValueIteration:
 
         Returns:
             J (np.ndarray): optimal cost-to-go vector of shape (n+1,)
-            F (np.ndarray): optimal policy vector of shape (n+1,) with actions in [1, ..., m]
+            pi (np.ndarray): optimal policy vector of shape (n+1,) with actions in [1, ..., m]
         """
         # === 0) INITIALIZATION ===
         J = np.zeros(self.n + 1)            # initial cost-to-go
-        F = np.ones(self.n + 1, dtype=int)  # initial policy: action 1 for all states
+        pi = np.ones(self.n + 1, dtype=int)  # initial policy: action 1 for all states
         iter_count = 0
 
         while True:
@@ -214,9 +215,9 @@ class SSPValueIteration:
             # === 1) VALUE FUNCTION UPDATE ===
             for i in range(self.n):
                 # Compute expected cost for each control input at state i
-                costs = self.G[i, :] + self.P[i, :, :].T @ J
+                costs = self.l[i, :] + self.P[i, :, :].T @ J
                 J[i] = np.min(costs)
-                F[i] = np.argmin(costs) + 1
+                pi[i] = np.argmin(costs) + 1
 
             # === 2) CONVERGENCE CHECK ===
             delta_J = np.linalg.norm(J - J_prev)
@@ -224,7 +225,7 @@ class SSPValueIteration:
                 print(f"Convergence criteria reached (delta J = {delta_J:.2f}).")
                 break
 
-        return J, F
+        return J, pi
 
 
 
@@ -240,7 +241,7 @@ class SSPValueIteration:
 #
 # Outputs (from `solve()` method):
 # - J: Optimal cost-to-go for each state, shape (n+1,)
-# - F: Optimal policy (action index starting from 1), shape (n+1,)
+# - pi: Optimal policy (action index starting from 1), shape (n+1,)
 #
 # Notes:
 # - Stage cost is 1 for all non-terminal states and 0 for the terminal state.
@@ -253,8 +254,8 @@ class SSPLinearProgram:
         self.m = P.shape[2]      # number of control inputs
 
         # Stage cost: 1 per step, 0 at terminal state
-        self.G = np.ones((self.n + 1, self.m))
-        self.G[self.n, :] = 0
+        self.l = np.ones((self.n + 1, self.m))
+        self.l[self.n, :] = 0
 
     def solve(self):
         """
@@ -262,7 +263,7 @@ class SSPLinearProgram:
 
         Returns:
             J (np.ndarray): optimal cost-to-go vector of shape (n+1,)
-            F (np.ndarray): optimal policy vector of shape (n+1,) with actions in [1, ..., m]
+            pi (np.ndarray): optimal policy vector of shape (n+1,) with actions in [1, ..., m]
         """
         # === 1) SETUP LINEAR PROGRAM ===
         # We solve a large LP:
@@ -274,13 +275,13 @@ class SSPLinearProgram:
         b = []
 
         for i in range(self.n):
-            Pi = self.P[i, :self.n, :]  # exclude terminal state's cost-to-go
+            P_i = self.P[i, :self.n, :]  # exclude terminal state's cost-to-go
             for u in range(self.m):
                 row = np.zeros(self.n)
                 row[i] = 1                      # cost-to-go at state i
-                row -= Pi[:, u]                # subtract expected next cost
+                row -= P_i[:, u]                # subtract expected next cost
                 A.append(row)
-                b.append(self.G[i, u])         # stage cost for input u at state i
+                b.append(self.l[i, u])         # stage cost for input u at state i
 
         A = np.array(A)  # Shape: (n * m, n)
         b = np.array(b)
@@ -294,14 +295,14 @@ class SSPLinearProgram:
         # === 2) DERIVE COST AND POLICY ===
         J = np.zeros(self.n + 1)
         J[:self.n] = res.x                   # optimal cost-to-go
-        F = np.ones(self.n + 1, dtype=int)   # policy initialized to action 1
+        pi = np.ones(self.n + 1, dtype=int)   # policy initialized to action 1
 
         # Recover policy by finding the action that minimizes cost-to-go
         for i in range(self.n):
-            costs = self.G[i, :] + self.P[i, :, :].T @ J
-            F[i] = np.argmin(costs) + 1
+            costs = self.l[i, :] + self.P[i, :, :].T @ J
+            pi[i] = np.argmin(costs) + 1
 
-        return J, F
+        return J, pi
 
 
 
@@ -339,8 +340,8 @@ def simulate_ssp(P, i0, SIM_NUM, policy):
     m = P.shape[2]      # number of control inputs
 
     # Stage costs: 1 for all non-terminal states, 0 for terminal state
-    G = np.ones((n + 1, m))
-    G[n, :] = 0
+    l = np.ones((n + 1, m))
+    l[n, :] = 0
 
     # Precompute cumulative transition matrices for faster sampling
     PP = np.zeros_like(P)
@@ -353,7 +354,7 @@ def simulate_ssp(P, i0, SIM_NUM, policy):
         i = i0
         while i != n:  # until terminal state is reached
             u = policy[i] - 1  # convert 1-based policy to 0-based index
-            sim_costs[s] += G[i, u]
+            sim_costs[s] += l[i, u]
 
             # Sample next state from cumulative distribution
             r = np.random.rand()
