@@ -5,9 +5,11 @@ import casadi as ca
 import scipy.linalg
 import copy
 import time
+import os
 from scipy.integrate import solve_ivp
 from scipy.optimize import minimize
 import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
 from abc import ABC, abstractmethod
 from typing import List, Callable, Union, Optional, Tuple, Any
 from functools import wraps
@@ -26,6 +28,7 @@ from scipy.spatial import ConvexHull, QhullError, cKDTree
 from acados_template import AcadosOcp, AcadosOcpSolver, AcadosModel
 
 
+
 def timing(func):
     @wraps(func)
     def wrapper(*args, **kwargs):
@@ -37,14 +40,17 @@ def timing(func):
     return wrapper
 
 
+
 class Env:
     def __init__(
             self, 
             case: int, 
             init_state: np.ndarray, 
             target_state: np.ndarray,
-            symbolic_h: Callable[[ca.SX, int], ca.SX] = None, 
-            symbolic_theta: Callable[[ca.Function], ca.Function] = None,
+            symbolic_h_mean_ext: Callable[[ca.Function], ca.Function] = None, 
+            symbolic_h_cov_ext: Callable[[ca.Function], ca.Function] = None, 
+            symbolic_theta_ext: Callable[[ca.Function], ca.Function] = None,
+            param: float = None,
             state_lbs: np.ndarray = None, 
             state_ubs: np.ndarray = None, 
             input_lbs: float = None, 
@@ -54,6 +60,7 @@ class Env:
         ) -> None:
 
         self.case = case  # 1, 2, 3, 4
+        self.param = param  # terrain parameter, used in case 2, 3, 4
 
         self.initial_position = init_state[0]
         self.initial_velocity = init_state[1]
@@ -81,42 +88,43 @@ class Env:
         # Define argument p as CasADi symbolic parameters
         p = ca.SX.sym("p") # p: horizontal displacement
 
-        # Initialize symbolic h and theta if not given
-        if symbolic_h == None:
-
+        # Set functions h(p) based on symbolic parameters or given expression
+        if symbolic_h_mean_ext:
+            self.h = symbolic_h_mean_ext # function of height h w.r.t. p
+        else:
             def symbolic_h(p, case):
-
                 if case == 1:  # zero slope
                     h = 0
-
                 elif case == 2: # constant slope
-                    h = (ca.pi * p) / 18
-
+                    param = self.param if self.param is not None else 18
+                    h = (ca.pi * p) / param
                 elif case == 3: # varying slope (small disturbance)
-                    h = 0.005 * ca.cos(18 * p)
-
+                    param = self.param if self.param is not None else 0.005
+                    h = param * ca.cos(18 * p)
                 elif case == 4: # varying slope (underactated case)
-
                     condition_left = p <= -ca.pi/2
                     condition_right = p >= ca.pi/6
-                    
                     h_center = ca.sin(3 * p)
                     h_flat = 1
-
                     h = ca.if_else(condition_left, h_flat, ca.if_else(condition_right, h_flat, h_center))
-                    
                 return h
+            self.h = ca.Function("h", [p], [symbolic_h(p, case)]) # function of height h w.r.t. p
         
-        if symbolic_theta == None:
-
+        # Set functions h_cov(p) based on given expression
+        if symbolic_h_cov_ext:
+            self.h_cov = symbolic_h_cov_ext
+        else:
+            self.h_cov = None
+        
+        # Set functions theta(p) based on symbolic parameters or given expression
+        if symbolic_theta_ext:
+            symbolic_theta = symbolic_theta_ext
+        else:
             def symbolic_theta(h_func):
                 h = h_func(p) 
                 dh_dp = ca.jacobian(h, p)
                 theta = ca.atan(dh_dp)
                 return ca.Function("theta", [p], [theta])
-
-        # Set functions h(p) and theta(p) based on symbolic parameters
-        self.h = ca.Function("h", [p], [symbolic_h(p, case)]) # function of height h w.r.t. p
         self.theta = symbolic_theta(self.h) # function of inclination angle theta w.r.t. p
         
         # Generate grid mesh along p to visualize the curve of slope and inclination angle
@@ -244,7 +252,6 @@ class Dynamics:
 
                 return ca.Function("dynamics_function", [state, input], [rhs])
             
-        # Define system dynamics
         self.dynamics_function = setup_dynamics(self.env.theta)
 
         # Initialize Jacobians
@@ -410,6 +417,60 @@ class Dynamics:
             next_state += np.random.uniform(self.env.disturbance_lbs, self.env.disturbance_ubs) * dt
 
         return next_state
+    
+    def build_stochastic_model(self, dt: float):
+        """
+        Build CasADi expressions for continuous-time and discrete-time
+        process noise covariance matrices based on self.env.h and self.env.h_cov.
+
+        Stores:
+        - self.dynamics_variance_function_cont: continuous-time Σ^w(x,u)
+        - self.dynamics_variance_function_disc: discrete-time Σ^w(x,u)
+        """
+
+        # Get symbolic variables
+        p = self.states[0]
+        v = self.states[1]
+        u = self.inputs[0]
+        x = ca.vertcat(p, v)
+
+        Gravity = 9.81
+
+        # Automatic differentiation of h(p) and Var[h(p)]
+        mu_h = self.env.h(p)
+        dmu_h = ca.gradient(mu_h, p)
+        sigma_h2 = self.env.h_cov(p)
+        dsigma_h2 = ca.gradient(sigma_h2, p)
+
+        mu_dh = dmu_h
+        sigma_dh = ca.fabs(dsigma_h2)  # safety clamp to non-negative
+
+        # Mean of trig terms
+        denom = ca.sqrt(1 + mu_dh**2)
+        mu_cos = 1 / denom
+        mu_sin = mu_dh / denom
+
+        # Variance propagation
+        dcos_dz = -mu_dh / (1 + mu_dh**2)**(3/2)
+        dsin_dz = 1 / (1 + mu_dh**2)**(3/2)
+        dprod_dz = mu_cos * dsin_dz + mu_sin * dcos_dz
+
+        sigma_cos2 = (dcos_dz**2) * sigma_dh
+        sigma_sincos2 = (dprod_dz**2) * sigma_dh
+
+        sigma_v_cont = Gravity**2 * sigma_sincos2 + u**2 * sigma_cos2
+        sigma_vec_cont = ca.vertcat(0, sigma_v_cont)
+        Sigma_w_cont = ca.diag(sigma_vec_cont)
+        Sigma_w_disc = dt**2 * Sigma_w_cont
+
+        # Store CasADi functions
+        self.dynamics_variance_function_cont = ca.Function(
+            "Sigma_w_cont", [self.states, self.inputs], [Sigma_w_cont]
+        )
+        self.dynamics_variance_function_disc = ca.Function(
+            "Sigma_w_disc", [self.states, self.inputs], [Sigma_w_disc]
+        )
+
 
 
 
@@ -471,6 +532,7 @@ class InputDynamics:
         new_input = np.array(solution.y)[:, -1]
 
         return new_input
+    
 
 
 def linspace_include_target(target, lb, ub, num):
@@ -500,6 +562,8 @@ def plot_discrete_state_space(pos_partitions, vel_partitions, target_state=None)
     ax.legend()
     plt.show()
 
+
+
 class Env_rl_d(Env):
     def __init__(
             self, 
@@ -511,7 +575,8 @@ class Env_rl_d(Env):
             use_nn: bool = True,
             num_samples: int = 100,
             state_noise_levels: np.array = np.array([1e-2, 1e-3]),
-            input_noise_levels: np.array = np.array([1e-3])
+            input_noise_levels: np.array = np.array([1e-3]),
+            build_stochastic_mdp = True
         ) -> None:
 
         self.env = env
@@ -561,17 +626,17 @@ class Env_rl_d(Env):
         self.R = [None] * self.num_actions  # Shape: list (1, num_actions) -> array (num_states, num_states)
         
         # Build MDP 
-        self.use_nn = use_nn
-        if self.use_nn:
-            self.num_samples = num_samples
-            self.state_noise_levels = state_noise_levels
-            self.input_noise_levels = input_noise_levels
-        else:
-            self.num_samples = 1
-            self.state_noise_levels = np.array([0.0, 0.0])
-            self.input_noise_levels = np.array([0.0])
-
-        self.build_stochastic_mdp()
+        if build_stochastic_mdp: 
+            self.use_nn = use_nn
+            if self.use_nn:
+                self.num_samples = num_samples
+                self.state_noise_levels = state_noise_levels
+                self.input_noise_levels = input_noise_levels
+            else:
+                self.num_samples = 1
+                self.state_noise_levels = np.array([0.0, 0.0])
+                self.input_noise_levels = np.array([0.0])
+            self.build_stochastic_mdp()
 
     def one_step_forward(self, cur_state, cur_input):
         
@@ -583,19 +648,18 @@ class Env_rl_d(Env):
         
         # Propagate the state
         next_state = self.dynamics.one_step_forward(cur_state, cur_input, self.dt)  
-        next_state_raw = next_state
 
         # Check whether next state is within the state space
         next_pos = max(min(next_state[0], self.pos_ubs), self.pos_lbs)
         next_vel = max(min(next_state[1], self.vel_ubs), self.vel_lbs)
-        next_state = np.array([next_pos, next_vel])
+        next_state_filtered = np.array([next_pos, next_vel])
         
         # Get reward
         next_state_index = self.nearest_state_index_lookup_kdtree(next_state)
         if next_state_index == self.target_state_index:
             reward = 10
-        elif np.any(next_state_raw != next_state):
-            reward = -1
+        elif np.any(next_state != next_state_filtered):
+            reward = -10
         else:
             reward = -1
         
@@ -742,6 +806,7 @@ class Env_rl_d(Env):
 
         plt.tight_layout()
         plt.show()
+    
 
 
 class Env_rl_c(Env):
@@ -791,34 +856,28 @@ class Env_rl_c(Env):
             done = False
             reward = np.exp( - 1.0 * np.linalg.norm(next_pos-self.env.target_state[0]))
 
-
-        
-        
         return done, next_state, reward
-
-
-
 
 def is_square(matrix: np.ndarray) -> bool:
     if matrix.shape[0] != matrix.shape[1]:
-        raise ValueError("Warning: must be a square matrix!")
+        raise ValueError(f"Warning: must be a square matrix! ({matrix})")
     return True
 
 def is_symmetric(matrix: np.ndarray) -> bool:
     if not np.allclose(matrix, matrix.T):
-        raise ValueError("Warning: must be a symmetric matrix!")
+        raise ValueError(f"Warning: must be a symmetric matrix! ({matrix})")
     return True
 
 def is_positive_semi_definite(matrix: np.ndarray) -> bool:
     eigvals = np.linalg.eigvals(matrix)
     if not np.all(np.greater_equal(eigvals, 0)):
-        raise ValueError("Warning: must be a positive semi-definite matrix!")
+        raise ValueError(f"Warning: must be a positive semi-definite matrix! ({matrix})")
     return True
 
 def is_positive_definite(matrix: np.ndarray) -> bool:
     eigvals = np.linalg.eigvals(matrix)
     if not np.all(np.greater(eigvals, 0)):
-        raise ValueError("Warning: must be a positive definite matrix!")
+        raise ValueError(f"Warning: must be a positive definite matrix! ({matrix})")
     return True
 
 def check_input_constraints(compute_action, mode='clipping'):
@@ -2456,7 +2515,9 @@ class MPCController(LQRController):
         ## Model
         # Set up Acados model
         model = AcadosModel()
-        model.name = self.name
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        model.name = f"{self.name}_{timestamp}"
+
 
         # Define model: x_dot = f(x, u)
         model.x = self.dynamics.states
@@ -2469,7 +2530,7 @@ class MPCController(LQRController):
         # Set up Acados OCP
         ocp = AcadosOcp()
         ocp.model = model # link to the model (class: AcadosModel)
-        ocp.solver_options.N_horizon = self.N
+        ocp.dims.N = self.N  # prediction horizon
         ocp.solver_options.tf = self.N * self.dt  # total prediction time
         ocp.solver_options.qp_solver = "FULL_CONDENSING_HPIPM" # Partially condensing interior-point method
         ocp.solver_options.integrator_type = "ERK" # explicit Runge-Kutta
@@ -2668,7 +2729,8 @@ class TrackingMPCController(LQRController):
         ## Model
         # Set up Acados model
         model = AcadosModel()
-        model.name = self.name
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        model.name = f"{self.name}_{timestamp}"
 
         # Define model: x_dot = f(x, u)
         model.x = self.dynamics.states
@@ -2681,7 +2743,7 @@ class TrackingMPCController(LQRController):
         # Set up Acados OCP
         ocp = AcadosOcp()
         ocp.model = model # link to the model (class: AcadosModel)
-        ocp.solver_options.N_horizon = self.N
+        ocp.dims.N = self.N  # prediction horizon
         ocp.solver_options.tf = self.N * self.dt  # total prediction time
         ocp.solver_options.qp_solver = "FULL_CONDENSING_HPIPM" # Partially condensing interior-point method
         ocp.solver_options.integrator_type = "ERK" # explicit Runge-Kutta
@@ -2976,7 +3038,8 @@ class LinearRMPCController(LQRController):
         ## Model
         # Set up Acados model
         model = AcadosModel()
-        model.name = self.name
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        model.name = f"{self.name}_{timestamp}"
 
         # Define model: x_dot = f(x, u)
         model.x = self.dynamics.states
@@ -2988,7 +3051,7 @@ class LinearRMPCController(LQRController):
         # Set up Acados OCP
         ocp = AcadosOcp()
         ocp.model = model # link to the model (class: AcadosModel)
-        ocp.solver_options.N_horizon = self.N
+        ocp.dims.N = self.N  # prediction horizon
         ocp.solver_options.tf = self.N * self.dt  # total prediction time
         ocp.solver_options.qp_solver = "FULL_CONDENSING_HPIPM" # Partially condensing interior-point method
         ocp.solver_options.integrator_type = "ERK" # explicit Runge-Kutta
@@ -3089,38 +3152,63 @@ class LinearRMPCController(LQRController):
 
         return u_real, x_pred, u_pred, u_nominal
     
-    def plot_robust_invariant_set(self):
+    def plot_robust_invariant_set(self, lbz, ubz, tol=1e-4, max_iter=10):
+        
         """
-        Plot the 2D invariant set (Ω) and its axis-aligned bounding box.
-        Assumes 2D state space.
+        Plot the 2D invariant set (Ω). Assumes 2D state space.
         """
-        Omega_vertices = self.Omega_tube.V
-        assert Omega_vertices.shape[1] == 2, "Only 2D invariant sets are supported."
-
-        # Convex hull of the Omega polytope
-        hull = ConvexHull(Omega_vertices)
-        hull_pts = Omega_vertices[hull.vertices]
-
-        # Compute axis-aligned bounding box
-        min_bounds = np.min(Omega_vertices, axis=0)
-        max_bounds = np.max(Omega_vertices, axis=0)
-        bounding_box = np.array([
-            [min_bounds[0], min_bounds[1]],
-            [min_bounds[0], max_bounds[1]],
-            [max_bounds[0], max_bounds[1]],
-            [max_bounds[0], min_bounds[1]],
-            [min_bounds[0], min_bounds[1]]
-        ])
 
         # Plot
         plt.figure(figsize=(6, 6))
-        plt.fill(hull_pts[:, 0], hull_pts[:, 1], color='skyblue', alpha=0.5, label='Ω (Invariant Set)')
-        plt.plot(hull_pts[:, 0], hull_pts[:, 1], 'b-', linewidth=2)
-        plt.plot(bounding_box[:, 0], bounding_box[:, 1], 'r--', linewidth=2, label='Bounding Box')
 
-        plt.title("Invariant Set Ω and Bounding Box")
-        plt.xlabel("State x₁")
-        plt.ylabel("State x₂")
+        def plot_polytope(Omega: pt.Polytope, label=None):
+            Omega_vertices = Omega.V
+            assert Omega_vertices.shape[1] == 2, "Only 2D invariant sets are supported."
+
+            # Convex hull of the Omega polytope
+            hull = ConvexHull(Omega_vertices)
+            hull_pts = Omega_vertices[hull.vertices]
+            hull_pts = np.vstack([hull_pts, hull_pts[0]])
+
+            plt.fill(hull_pts[:, 0], hull_pts[:, 1], color='red', alpha=0.1, label=label)
+            plt.plot(hull_pts[:, 0], hull_pts[:, 1], color='red', linewidth=2)
+
+        # Step 1: Define initial disturbance set D (box)
+        dim = len(ubz)
+
+        # H-representation: H x ≤ h
+        H_box = np.vstack([np.eye(dim), -np.eye(dim)])
+        h_box = np.hstack([ubz, -lbz])
+
+        # Create polytope with both H-rep and V-rep
+        D = pt.Polytope(H_box, h_box)
+
+        # Step 2: Initialize Omega := D
+        Omega = D
+        plot_polytope(Omega, label = "Ω")
+
+        A_cl = self.A + self.B @ self.K_feedback
+
+        for i in range(max_iter):
+            # Step 3: Apply affine map A_cl to Omega: A_cl * Omega
+            A_Omega = self.affine_map(Omega, A_cl)
+
+            # Step 4: Minkowski sum: Omega_next = A_Omega ⊕ D
+            Omega_next = A_Omega + D
+
+            # Step 5: Check convergence via bounding box approximation
+            bounds_old = self.estimate_bounds_from_polytope(Omega)
+            bounds_new = self.estimate_bounds_from_polytope(Omega_next)
+
+            if np.allclose(bounds_old, bounds_new, atol=tol):
+                return Omega_next  # Return as vertices
+
+            Omega = Omega_next
+            plot_polytope(Omega)
+
+        plt.title("Robust Invariant Set Ω")
+        plt.xlabel("Position p")
+        plt.ylabel("Velocity v")
         plt.axis('equal')
         plt.grid(True)
         plt.legend()
@@ -3173,7 +3261,7 @@ class GPIController(BaseController):
                  max_ite_pe: int = 50,
                  max_ite_pi: int = 100,
                  name: str = 'GPI', 
-                 type: str = 'GPI', 
+                 type: str = 'RL', 
                  verbose: bool = True
                  ) -> None:
         
@@ -3351,10 +3439,10 @@ class QLearningController(BaseController):
                  epsilon_min: float = 0.01,
                  learning_rate: float = 0.2, 
                  gamma: float = 0.95,
-                 max_iterations: int = 1000, 
-                 max_steps_per_episode: int = 100, 
+                 max_iterations: int = 5000, 
+                 max_steps_per_episode: int = 500, 
                  name: str = 'Q-Learning', 
-                 type: str = 'Q-Learning', 
+                 type: str = 'RL', 
                  verbose: bool = True
                  ) -> None:
         
@@ -3367,239 +3455,6 @@ class QLearningController(BaseController):
         self.gamma = gamma
         self.max_iterations = max_iterations
         self.max_steps_per_episode = max_steps_per_episode
-
-        self.mdp = mdp
-
-        self.dim_states = self.mdp.num_states
-        self.dim_inputs = self.mdp.num_actions
-
-        self.init_state = self.env.init_state
-        self.target_state = self.env.target_state
-
-        # Initialize Q table with all 0s
-        self.Q = np.zeros((self.dim_states, self.dim_inputs)) 
-        
-        # Initialize policy as None
-        self.policy = np.zeros((self.dim_states)) 
-        self.value_function = np.zeros((self.dim_states)) 
-
-        # For training curve plotting
-        self.residual_rewards = []
-        self.epsilon_list = []
-        self.SR_100epoch = [] # Successful rounds
-        self.F_100epoch = [] # Failure rounds
-        self.TO_100epoch = [] # Time out rounds
-
-    def _get_action_probabilities(self, state_index: int) -> np.ndarray:
-        """Calculate the action probabilities using epsilon-soft policy."""
-
-        probabilities = np.ones(self.dim_inputs) * (self.epsilon / self.dim_inputs)
-        best_action = np.argmax(self.Q[state_index])
-        probabilities[best_action] += (1.0 - self.epsilon)
-
-        return probabilities
-
-    def setup(self) -> None:
-
-        for iteration in range(self.max_iterations):
-
-            total_reward = 0  # To accumulate rewards for this episode
-
-            if iteration % 100 == 0:
-
-                if iteration != 0:
-                    # Record the SR_100epoch, F_100epoch, TO_100epoch
-                    self.SR_100epoch.append(SR_100epoch)
-                    self.F_100epoch.append(F_100epoch)
-                    self.TO_100epoch.append(TO_100epoch)
-                
-                SR_100epoch = 0
-                F_100epoch = 0
-                TO_100epoch = 0
-
-            # Ramdomly choose a state to start
-            current_state_index = np.random.choice(self.dim_states)
-            current_state = self.mdp.state_space[:, current_state_index]
-
-            for step in range(self.max_steps_per_episode):
-
-                # Choose action based on epsilon-soft policy
-                action_probabilities = self._get_action_probabilities(current_state_index)
-                action_index = np.random.choice(np.arange(self.dim_inputs), p=action_probabilities)
-                current_input = self.mdp.input_space[action_index]
-
-                # Take action and observe the next state and reward
-                next_state, reward = self.mdp.one_step_forward(current_state, current_input)
-                next_state_index = self.mdp.nearest_state_index_lookup(next_state)
-                total_reward += reward  # Accumulate total reward
-                
-                if self.verbose:
-                    print(f"reward: {reward}")
-                    print(f"total_reward: {total_reward}")
-                    print(f"current_state: {current_state}, current_input: {current_input}, next_state: {next_state}, next_state_render: {self.mdp.state_space[:, next_state_index]}, reward: {reward}")
-
-                # Check if the episode is finished
-                terminate_condition_1 = False #next_state[0]==self.mdp.pos_partitions[-1]
-                terminate_condition_2 = False #next_state[0]==self.mdp.pos_partitions[0]
-                terminate_condition_3 = np.all(self.mdp.state_space[:, next_state_index]==self.target_state)
-
-                if terminate_condition_1 or terminate_condition_2 or terminate_condition_3:
-
-                    if terminate_condition_3:
-                        SR_100epoch += 1
-                    else:
-                        F_100epoch += 1
-
-                    if self.verbose:
-                        print(f"Iteration {iteration + 1}/{self.max_iterations}: finished successfully! epsilon: {self.epsilon:.4f}, residual reward: {total_reward:.2f}")
-                    
-                    break
-
-                else:
-                    # Update Q table
-                    q_update = reward + self.gamma * np.max(self.Q[next_state_index, :])
-                    self.Q[current_state_index, action_index] += self.learning_rate * (
-                        q_update - self.Q[current_state_index, action_index]
-                    )
-                    
-                    # Move to the next state
-                    current_state_index = next_state_index
-                    current_state = self.mdp.state_space[:, current_state_index]
-                
-                if step == self.max_steps_per_episode-1:
-                    TO_100epoch +=1
-                    if self.verbose:
-                        print(f"Iteration {iteration + 1}/{self.max_iterations}: time out! epsilon: {self.epsilon:.4f}, residual reward: {total_reward:.2f}")
-                    
-
-            # Decrease epsilon
-            self.epsilon *= self.k_epsilon
-            self.epsilon = max(self.epsilon, self.epsilon_min)
-            self.epsilon_list.append(self.epsilon)
-
-            # Record the residual reward
-            self.residual_rewards.append(total_reward)
-        
-        # Return the deterministic policy and value function
-        self.policy = np.argmax(self.Q, axis=1)
-        self.value_function = np.max(self.Q, axis=1)
-        
-        if self.verbose:
-            print("Training finished！")
-
-    @check_input_constraints
-    def compute_action(self, current_state: np.ndarray, current_time) -> np.ndarray:
-        """
-        Use the optimal policy to compute the action for the given state.
-        """
-        # Find the nearest discrete state index
-        state_index = self.mdp.nearest_state_index_lookup(current_state)
-        
-        # Get the optimal action from the policy
-        action_index = self.policy[state_index]
-        action = self.mdp.input_space[action_index]
-
-        return np.array([action])
-
-    def plot_heatmaps(self):
-        """
-        Visualize the policy and cost as a 2D state-value map.
-        """
-        value_map = self.value_function.reshape(self.mdp.num_pos, self.mdp.num_vel)
-        policy_map = self.policy.reshape(self.mdp.num_pos, self.mdp.num_vel)
-
-        fig, axs = plt.subplots(1, 2, figsize=(12, 4))
-
-        # Plot policy (U)
-        im1 = axs[0].imshow(policy_map, extent=[
-            self.mdp.pos_partitions[0], self.mdp.pos_partitions[-1],
-            self.mdp.vel_partitions[0], self.mdp.vel_partitions[-1]
-        ], origin='lower', aspect='auto', cmap='viridis')
-        axs[0].set_title('Optimal Policy')
-        axs[0].set_xlabel('Car Position')
-        axs[0].set_ylabel('Car Velocity')
-        fig.colorbar(im1, ax=axs[0], orientation='vertical')
-
-        # Plot cost-to-go (J)
-        im2 = axs[1].imshow(value_map, extent=[
-            self.mdp.pos_partitions[0], self.mdp.pos_partitions[-1],
-            self.mdp.vel_partitions[0], self.mdp.vel_partitions[-1]
-        ], origin='lower', aspect='auto', cmap='viridis')
-        axs[1].set_title('Optimal Cost')
-        axs[1].set_xlabel('Car Position')
-        axs[1].set_ylabel('Car Velocity')
-        fig.colorbar(im2, ax=axs[1], orientation='vertical')
-
-        plt.tight_layout()
-        plt.show()
-
-    def plot_training_curve(self):
-        """
-        Visualize the training curve of residual rewards and holdsignal for sr_100epoch in 2 figure.
-        """
-
-        self.SR_100epoch = np.repeat(self.SR_100epoch, 100)
-        self.F_100epoch = np.repeat(self.F_100epoch, 100)
-        self.TO_100epoch = np.repeat(self.TO_100epoch, 100)
-        
-        fig, axs = plt.subplots(1, 3, figsize=(12, 3))
-
-        # Plot residual rewards
-        axs[0].plot(self.residual_rewards)
-        axs[0].set_title('Total Rewards')
-        axs[0].set_xlabel('Iteration')
-        axs[0].set_ylabel('Total Reward')
-
-        # Plot epsilon
-        axs[1].plot(self.epsilon_list)
-        axs[1].set_title('Epsilon')
-        axs[1].set_xlabel('Iteration')
-        axs[1].set_ylabel('Epsilon')
-        axs[1].set_ylim(0, 1)
-
-        # Plot SR_100epoch, F_100epoch, TO_100epoch
-        axs[2].plot(self.SR_100epoch, label='Success rounds / 100Epoch')
-        axs[2].plot(self.F_100epoch, label='Fail rounds / 100Epoch')
-        axs[2].plot(self.TO_100epoch, label='Time out / 100Epoch')
-        axs[2].set_title('Statictics / 100 Epoch')
-        axs[2].set_xlabel('Iteration')
-        axs[2].set_ylabel('Number of rounds')
-        axs[2].set_ylim(0, 100)
-        axs[2].legend()
-
-
-        plt.tight_layout()
-        plt.show()
-
-
-# Derived class for RL Controller, solved by MCRL
-class MCRLController(BaseController):
-    def __init__(self, 
-                 mdp: Env_rl_d, 
-                 freq: float, 
-                 epsilon: float = 0.3, 
-                 k_epsilon: float = 0.99, 
-                 epsilon_min: float = 0.01,
-                 learning_rate: float = 0.2, 
-                 gamma: float = 0.95,
-                 max_iterations: int = 1000, 
-                 max_steps_per_episode: int = 100, 
-                 name: str = 'MCRL', 
-                 type: str = 'MCRL', 
-                 verbose: bool = True
-                 ) -> None:
-        
-        super().__init__(mdp, mdp.dynamics, freq, name, type, verbose)
-
-        self.epsilon = epsilon  # exploration rate
-        self.k_epsilon = k_epsilon  # decay factor for exploration rate
-        self.epsilon_min = epsilon_min
-        self.learning_rate = learning_rate
-        self.gamma = gamma
-        self.max_iterations = max_iterations
-        self.max_steps_per_episode = max_steps_per_episode
-
-        self.mode = "every_visit"  # "first_visit" or "every_visit"
 
         self.mdp = mdp
 
@@ -3619,10 +3474,12 @@ class MCRLController(BaseController):
 
         # For training curve plotting
         self.residual_rewards = []
+        self.residual_rewards_smoothed = None
+        self.step_list = []
         self.epsilon_list = []
-        self.SR_100epoch = [] # Successful rounds
-        self.F_100epoch = [] # Failure rounds
-        self.TO_100epoch = [] # Time out rounds
+        self.SR_100epsd = [] # Successful rounds
+        self.F_100epsd = [] # Failure rounds
+        self.TO_100epsd = [] # Time out rounds
 
     def _get_action_probabilities(self, state_index: int) -> np.ndarray:
         """Calculate the action probabilities using epsilon-soft policy."""
@@ -3637,27 +3494,36 @@ class MCRLController(BaseController):
 
         for iteration in range(self.max_iterations):
 
-            episode = []  # storage state, action and reward for current episode
-            total_reward = 0  # total reward for current episode
+            total_reward = 0  # To accumulate rewards for this episode
+            total_steps = 0  # To count total steps in this episode
 
             if iteration % 100 == 0:
 
                 if iteration != 0:
-                    # Record the SR_100epoch, F_100epoch, TO_100epoch
-                    self.SR_100epoch.append(SR_100epoch)
-                    self.F_100epoch.append(F_100epoch)
-                    self.TO_100epoch.append(TO_100epoch)
+                    # Record the SR_100epsd, F_100epsd, TO_100epsd
+                    self.SR_100epsd.append(SR_100epsd)
+                    self.F_100epsd.append(F_100epsd)
+                    self.TO_100epsd.append(TO_100epsd)
                 
-                SR_100epoch = 0
-                F_100epoch = 0
-                TO_100epoch = 0
+                SR_100epsd = 0
+                F_100epsd = 0
+                TO_100epsd = 0
 
+            # Start from init state
+            # Note: Here we restrict initial state distribution to boost the training but one can also 
+            #       randomly initialize state given sufficient interaction to improve the generalization.
+            current_state = self.mdp.init_state
+            current_state_index = self.mdp.nearest_state_index_lookup(current_state)
             # Randomly choose a state to start
-            current_state_index = np.random.choice(self.dim_states)
-            current_state = self.mdp.state_space[:, current_state_index]
-            
-            # Generate an episode
+            #current_state_index = np.random.choice(self.dim_states)
+            #current_state = self.mdp.state_space[:, current_state_index]
+            # Randomly choose a position with 0 vel to start
+            #current_pos_index = np.random.choice(self.mdp.num_pos)
+            #current_state = np.array([self.mdp.pos_partitions[current_pos_index], 0.0])
+            #current_state_index = self.mdp.nearest_state_index_lookup(current_state)
+
             for step in range(self.max_steps_per_episode):
+
                 # Choose action based on epsilon-soft policy
                 action_probabilities = self._get_action_probabilities(current_state_index)
                 action_index = np.random.choice(np.arange(self.dim_inputs), p=action_probabilities)
@@ -3666,69 +3532,66 @@ class MCRLController(BaseController):
                 # Take action and observe the next state and reward
                 next_state, reward = self.mdp.one_step_forward(current_state, current_input)
                 next_state_index = self.mdp.nearest_state_index_lookup(next_state)
-                total_reward += reward
+                total_reward += reward  # Accumulate total reward
+                total_steps += 1  # Increment step count
+                
+                # Update Q table and compute TD error
+                td_error = reward + self.gamma * np.max(self.Q[next_state_index, :]) - self.Q[current_state_index, action_index]
 
-                # Store the state, action and reward for this step
-                episode.append((current_state_index, action_index, reward))
+                # Factor in recursive estimation
+                self.state_action_counts[current_state_index, action_index] += 1
+                alpha = self.learning_rate
+                #alpha = 1.0 / self.state_action_counts[current_state_index, action_index]
 
+                # Update Q table and log TD error
+                self.Q[current_state_index, action_index] += alpha * td_error
+                
                 # Check if the episode is finished
-                terminate_condition_1 = False#next_state[0]==self.mdp.pos_partitions[-1]
-                terminate_condition_2 = False#next_state[0]==self.mdp.pos_partitions[0]
+                terminate_condition_1 = next_state[0]>self.mdp.pos_partitions[-1]
+                terminate_condition_2 = next_state[0]<self.mdp.pos_partitions[0]
                 terminate_condition_3 = np.all(self.mdp.state_space[:, next_state_index]==self.target_state)
 
                 if terminate_condition_1 or terminate_condition_2 or terminate_condition_3:
-
                     if terminate_condition_3:
-                        SR_100epoch += 1
+                        SR_100epsd += 1
+                        if self.verbose:
+                            print(f"Iteration {iteration + 1}/{self.max_iterations}: finished successfully at step {step}! epsilon: {self.epsilon:.4f}, residual reward: {total_reward:.2f}")
                     else:
-                        F_100epoch += 1
-
-                    if self.verbose:
-                        print(f"Iteration {iteration + 1}/{self.max_iterations}: finished successfully! epsilon: {self.epsilon:.4f}, residual reward: {total_reward:.2f}")
-                    
+                        F_100epsd += 1
+                        if self.verbose:
+                            print(f"Iteration {iteration + 1}/{self.max_iterations}: episode failed at step {step}! epsilon: {self.epsilon:.4f}, residual reward: {total_reward:.2f}")
                     break
 
-                if step == self.max_steps_per_episode-1:
-                    TO_100epoch +=1
-                    if self.verbose:
-                        print(f"Iteration {iteration + 1}/{self.max_iterations}: time out! epsilon: {self.epsilon:.4f}, residual reward: {total_reward:.2f}")
+                else:
                     
-                # Move to the next state
-                current_state_index = next_state_index
-                current_state = self.mdp.state_space[:, current_state_index]
-
-            # Update Q table using Monte Carlo method
-            G = 0  # Return
-            if self.mode == "first_visit":
-                visited = set()
-
-            for state_index, action_index, reward in reversed(episode):
-                G = reward + self.gamma * G
+                    # Move to the next state
+                    current_state_index = next_state_index
+                    current_state = self.mdp.state_space[:, current_state_index]
                 
-                 # update Q table
-                if self.mode == "first_visit" and (state_index, action_index) not in visited:
-                    visited.add((state_index, action_index))
-                    self.state_action_counts[state_index, action_index] += 1
-                    alpha = 1.0 / self.state_action_counts[state_index, action_index]
-                    self.Q[state_index, action_index] += alpha * (G - self.Q[state_index, action_index])
-
-                elif self.mode == "every_visit":
-                    self.state_action_counts[state_index, action_index] += 1
-                    alpha = 1.0 / self.state_action_counts[state_index, action_index]
-                    self.Q[state_index, action_index] += alpha * (G - self.Q[state_index, action_index])
+                if step == self.max_steps_per_episode-1:
+                    TO_100epsd +=1
+                    if self.verbose:
+                        print(f"Iteration {iteration + 1}/{self.max_iterations}: time out (step: {step})! epsilon: {self.epsilon:.4f}, residual reward: {total_reward:.2f}")
+                    
 
             # Decrease epsilon
             self.epsilon *= self.k_epsilon
             self.epsilon = max(self.epsilon, self.epsilon_min)
             self.epsilon_list.append(self.epsilon)
 
-            # Record the residual reward
+            # Record the residual reward and loss
             self.residual_rewards.append(total_reward)
-
+            self.step_list.append(total_steps)
+        
         # Return the deterministic policy and value function
         self.policy = np.argmax(self.Q, axis=1)
         self.value_function = np.max(self.Q, axis=1)
 
+        # Repeat success/failure stats for plotting
+        self.SR_100epsd = np.repeat(self.SR_100epsd, 100)/100
+        self.F_100epsd = np.repeat(self.F_100epsd, 100)/100
+        self.TO_100epsd = np.repeat(self.TO_100epsd, 100)/100
+        
         if self.verbose:
             print("Training finished！")
 
@@ -3746,75 +3609,445 @@ class MCRLController(BaseController):
 
         return np.array([action])
 
-    def plot_heatmaps(self):
-        """
-        Visualize the policy and cost as a 2D state-value map.
-        """
-        value_map = self.value_function.reshape(self.mdp.num_pos, self.mdp.num_vel)
-        policy_map = self.policy.reshape(self.mdp.num_pos, self.mdp.num_vel)
+    def postprocessing(self, window=20):
 
-        fig, axs = plt.subplots(1, 2, figsize=(12, 4))
-
-        # Plot policy (U)
-        im1 = axs[0].imshow(policy_map, extent=[
-            self.mdp.pos_partitions[0], self.mdp.pos_partitions[-1],
-            self.mdp.vel_partitions[0], self.mdp.vel_partitions[-1]
-        ], origin='lower', aspect='auto', cmap='viridis')
-        axs[0].set_title('Optimal Policy')
-        axs[0].set_xlabel('Car Position')
-        axs[0].set_ylabel('Car Velocity')
-        fig.colorbar(im1, ax=axs[0], orientation='vertical')
-
-        # Plot cost-to-go (J)
-        im2 = axs[1].imshow(value_map, extent=[
-            self.mdp.pos_partitions[0], self.mdp.pos_partitions[-1],
-            self.mdp.vel_partitions[0], self.mdp.vel_partitions[-1]
-        ], origin='lower', aspect='auto', cmap='viridis')
-        axs[1].set_title('Optimal Cost')
-        axs[1].set_xlabel('Car Position')
-        axs[1].set_ylabel('Car Velocity')
-        fig.colorbar(im2, ax=axs[1], orientation='vertical')
-
-        plt.tight_layout()
-        plt.show()
-
-    def plot_training_curve(self):
-        """
-        Visualize the training curve of residual rewards and holdsignal for sr_100epoch in 2 figure.
-        """
-
-        self.SR_100epoch = np.repeat(self.SR_100epoch, 100)
-        self.F_100epoch = np.repeat(self.F_100epoch, 100)
-        self.TO_100epoch = np.repeat(self.TO_100epoch, 100)
+        def moving_average(data, window=20):
+            """Return moving average and std of a 1D array"""
+            data = np.array(data)
+            if window <= 1:
+                return data.copy()
+            
+            kernel = np.ones(window)
+            z = np.ones(len(data))        
+            smoothed = np.convolve(data, kernel, mode='same') / np.convolve(z, kernel, mode='same')
+            return smoothed
         
+        # Smooth reward curve
+        self.residual_rewards_smoothed = moving_average(self.residual_rewards, window)
+
+        return self.residual_rewards_smoothed, self.SR_100epsd
+        
+    def plot_training_curve(self, title = None):
+        """
+        Visualize the training curve of residual rewards with smoothed version and confidence band,
+        and holdsignal for sr_100epsd in 2 other figures.
+        """
+
         fig, axs = plt.subplots(1, 3, figsize=(12, 3))
 
-        # Plot residual rewards
-        axs[0].plot(self.residual_rewards)
+        # Plot residual rewards + smooth + confidence band
+        if self.residual_rewards_smoothed is not None and len(self.residual_rewards_smoothed):
+            axs[0].plot(self.residual_rewards, alpha=0.3, label="Raw reward")
+            axs[0].plot(self.residual_rewards_smoothed, label="Smoothed", color="C0")
+        else:
+            axs[0].plot(self.residual_rewards, label="Raw reward")
         axs[0].set_title('Total Rewards')
-        axs[0].set_xlabel('Iteration')
+        axs[0].set_xlabel('Episode')
         axs[0].set_ylabel('Total Reward')
+        axs[0].legend()
+
+        # Plot success/fail/time-out rounds
+        axs[1].plot(self.SR_100epsd, label='Success rounds')
+        axs[1].plot(self.F_100epsd, label='Fail rounds')
+        axs[1].plot(self.TO_100epsd, label='Time out')
+        axs[1].set_title('Statistics per 100 Episodes')
+        axs[1].set_xlabel('Episode')
+        axs[1].set_ylabel('Percentage of Trails')
+        axs[1].set_ylim(0, 1)
+        axs[1].legend()
 
         # Plot epsilon
-        axs[1].plot(self.epsilon_list)
-        axs[1].set_title('Epsilon')
-        axs[1].set_xlabel('Iteration')
-        axs[1].set_ylabel('Epsilon')
+        axs[-1].plot(self.epsilon_list)
+        axs[-1].set_title('Epsilon')
+        axs[-1].set_xlabel('Episode')
+        axs[-1].set_ylabel('Epsilon')
+        axs[-1].set_ylim(0, 1)
+
+        if title is not None:
+            fig.suptitle(title, fontsize=12, fontweight='bold', y=1.05)
+        plt.tight_layout()
+        plt.show()
+
+
+
+# Derived class for RL Controller, solved by MCRL
+class MCRLController(BaseController):
+    def __init__(self, 
+                 mdp: Env_rl_d, 
+                 freq: float, 
+                 epsilon: float = 0.3, 
+                 k_epsilon: float = 0.99, 
+                 epsilon_min: float = 0.01,
+                 learning_rate: float = 0.2, 
+                 gamma: float = 0.95,
+                 max_iterations: int = 5000, 
+                 max_steps_per_episode: int = 500, 
+                 name: str = 'MCRL', 
+                 type: str = 'RL', 
+                 verbose: bool = True
+                 ) -> None:
+        
+        super().__init__(mdp, mdp.dynamics, freq, name, type, verbose)
+
+        self.epsilon = epsilon  # exploration rate
+        self.k_epsilon = k_epsilon  # decay factor for exploration rate
+        self.epsilon_min = epsilon_min
+        self.learning_rate = learning_rate
+        self.gamma = gamma
+        self.max_iterations = max_iterations
+        self.max_steps_per_episode = max_steps_per_episode
+
+        self.mdp = mdp
+
+        self.dim_states = self.mdp.num_states
+        self.dim_inputs = self.mdp.num_actions
+
+        self.init_state = self.env.init_state
+        self.target_state = self.env.target_state
+
+        # Initialize Q table with all 0s
+        self.Q = np.zeros((self.dim_states, self.dim_inputs)) 
+        self.state_action_counts = np.zeros((self.dim_states, self.dim_inputs))
+        
+        # Initialize policy as None
+        self.policy = np.zeros((self.dim_states)) 
+        self.value_function = np.zeros((self.dim_states)) 
+
+        # For training curve plotting
+        self.residual_rewards = []
+        self.residual_rewards_smoothed = None
+        self.step_list = []
+        self.epsilon_list = []
+        self.SR_100epsd = [] # Successful rounds
+        self.F_100epsd = [] # Failure rounds
+        self.TO_100epsd = [] # Time out rounds
+
+    def _get_action_probabilities(self, state_index: int) -> np.ndarray:
+        """Calculate the action probabilities using epsilon-soft policy."""
+
+        probabilities = np.ones(self.dim_inputs) * (self.epsilon / self.dim_inputs)
+        best_action = np.argmax(self.Q[state_index, :])
+        probabilities[best_action] += (1.0 - self.epsilon)
+
+        return probabilities
+
+    def setup(self) -> None:
+
+        for iteration in range(self.max_iterations):
+
+            episode = []  # storage state, action and reward for current episode
+            total_reward = 0  # total reward for current episode
+            total_steps = 0  # total steps for current episode
+
+            if iteration % 100 == 0:
+
+                if iteration != 0:
+                    # Record the SR_100epsd, F_100epsd, TO_100epsd
+                    self.SR_100epsd.append(SR_100epsd)
+                    self.F_100epsd.append(F_100epsd)
+                    self.TO_100epsd.append(TO_100epsd)
+                
+                SR_100epsd = 0
+                F_100epsd = 0
+                TO_100epsd = 0
+
+            # Start from init state
+            # Note: Here we restrict initial state distribution to boost the training but one can also 
+            #       randomly initialize state given sufficient interaction to improve the generalization.
+            current_state = self.mdp.init_state
+            current_state_index = self.mdp.nearest_state_index_lookup(current_state)
+            # Randomly choose a state to start
+            #current_state_index = np.random.choice(self.dim_states)
+            #current_state = self.mdp.state_space[:, current_state_index]
+            # Randomly choose a position with 0 vel to start
+            #current_pos_index = np.random.choice(self.mdp.num_pos)
+            #current_state = np.array([self.mdp.pos_partitions[current_pos_index], 0.0])
+            #current_state_index = self.mdp.nearest_state_index_lookup(current_state)
+            
+            # Generate an episode
+            for step in range(self.max_steps_per_episode):
+                # Choose action based on epsilon-soft policy
+                action_probabilities = self._get_action_probabilities(current_state_index)
+                action_index = np.random.choice(np.arange(self.dim_inputs), p=action_probabilities)
+                current_input = self.mdp.input_space[action_index]
+
+                # Take action and observe the next state and reward
+                next_state, reward = self.mdp.one_step_forward(current_state, current_input)
+                next_state_index = self.mdp.nearest_state_index_lookup(next_state)
+                total_reward += reward
+                total_steps += 1 
+
+                # Store the state, action and reward for this step
+                episode.append((current_state_index, action_index, reward))
+
+                # Check if the episode is finished
+                terminate_condition_1 = next_state[0]>self.mdp.pos_partitions[-1]
+                terminate_condition_2 = next_state[0]<self.mdp.pos_partitions[0]
+                terminate_condition_3 = np.all(self.mdp.state_space[:, next_state_index]==self.target_state)
+                
+                if terminate_condition_1 or terminate_condition_2 or terminate_condition_3:
+                    if terminate_condition_3:
+                        SR_100epsd += 1
+                        if self.verbose:
+                            print(f"Iteration {iteration + 1}/{self.max_iterations}: finished successfully at step {step}! epsilon: {self.epsilon:.4f}, residual reward: {total_reward:.2f}")
+                    else:
+                        F_100epsd += 1
+                        if self.verbose:
+                            print(f"Iteration {iteration + 1}/{self.max_iterations}: episode failed at step {step}! epsilon: {self.epsilon:.4f}, residual reward: {total_reward:.2f}")
+                    break
+
+                if step == self.max_steps_per_episode-1:
+                    TO_100epsd +=1
+                    if self.verbose:
+                        print(f"Iteration {iteration + 1}/{self.max_iterations}: time out (step: {step})! epsilon: {self.epsilon:.4f}, residual reward: {total_reward:.2f}")
+                    
+                # Move to the next state
+                current_state_index = next_state_index
+                current_state = self.mdp.state_space[:, current_state_index]
+
+            # Update Q table using Monte Carlo method
+            G = 0  # Return
+            for state_index, action_index, reward in reversed(episode):
+                # Cumulative return
+                G = reward + self.gamma * G
+                
+                # Factor in recursive estimation
+                self.state_action_counts[state_index, action_index] += 1
+                alpha = self.learning_rate
+                #alpha = 1.0 / self.state_action_counts[state_index, action_index]
+
+                # Update Q using MC and log TD error
+                td_error = G - self.Q[state_index, action_index]
+                self.Q[state_index, action_index] += alpha * td_error
+
+            # Decrease epsilon
+            self.epsilon *= self.k_epsilon
+            self.epsilon = max(self.epsilon, self.epsilon_min)
+            self.epsilon_list.append(self.epsilon)
+
+            # Record the residual reward and loss
+            self.residual_rewards.append(total_reward)
+            self.step_list.append(total_steps)
+
+        # Return the deterministic policy and value function
+        self.policy = np.argmax(self.Q, axis=1)
+        self.value_function = np.max(self.Q, axis=1)
+
+        # Repeat success/failure stats for plotting
+        self.SR_100epsd = np.repeat(self.SR_100epsd, 100)/100
+        self.F_100epsd = np.repeat(self.F_100epsd, 100)/100
+        self.TO_100epsd = np.repeat(self.TO_100epsd, 100)/100
+
+        if self.verbose:
+            print("Training finished！")
+
+    @check_input_constraints
+    def compute_action(self, current_state: np.ndarray, current_time) -> np.ndarray:
+        """
+        Use the optimal policy to compute the action for the given state.
+        """
+        # Find the nearest discrete state index
+        state_index = self.mdp.nearest_state_index_lookup(current_state)
+        
+        # Get the optimal action from the policy
+        action_index = self.policy[state_index]
+        action = self.mdp.input_space[action_index]
+
+        return np.array([action])
+    
+    def postprocessing(self, window=20):
+
+        def moving_average(data, window=20):
+            """Return moving average and std of a 1D array"""
+            data = np.array(data)
+            if window <= 1:
+                return data.copy()
+            
+            kernel = np.ones(window)
+            z = np.ones(len(data))        
+            smoothed = np.convolve(data, kernel, mode='same') / np.convolve(z, kernel, mode='same')
+            return smoothed
+        
+        # Smooth reward curve
+        self.residual_rewards_smoothed = moving_average(self.residual_rewards, window)
+
+        return self.residual_rewards_smoothed, self.SR_100epsd
+        
+    def plot_training_curve(self, title=None):
+        """
+        Visualize the training curve of residual rewards with smoothed version and confidence band,
+        and holdsignal for sr_100epsd in 2 other figures.
+        """
+
+        fig, axs = plt.subplots(1, 3, figsize=(12, 3))
+
+        # Plot residual rewards + smooth + confidence band
+        if self.residual_rewards_smoothed is not None and len(self.residual_rewards_smoothed):
+            axs[0].plot(self.residual_rewards, alpha=0.3, label="Raw reward")
+            axs[0].plot(self.residual_rewards_smoothed, label="Smoothed", color="C0")
+        else:
+            axs[0].plot(self.residual_rewards, label="Raw reward")
+        axs[0].set_title('Total Rewards')
+        axs[0].set_xlabel('Episode')
+        axs[0].set_ylabel('Total Reward')
+        axs[0].legend()
+
+        # Plot success/fail/time-out rounds
+        axs[1].plot(self.SR_100epsd, label='Success rounds')
+        axs[1].plot(self.F_100epsd, label='Fail rounds')
+        axs[1].plot(self.TO_100epsd, label='Time out')
+        axs[1].set_title('Statistics per 100 Episodes')
+        axs[1].set_xlabel('Episode')
+        axs[1].set_ylabel('Percentage of Trails')
         axs[1].set_ylim(0, 1)
+        axs[1].legend()
 
-        # Plot SR_100epoch, F_100epoch, TO_100epoch
-        axs[2].plot(self.SR_100epoch, label='Success rounds / 100Epoch')
-        axs[2].plot(self.F_100epoch, label='Fail rounds / 100Epoch')
-        axs[2].plot(self.TO_100epoch, label='Time out / 100Epoch')
-        axs[2].set_title('Statictics / 100 Epoch')
-        axs[2].set_xlabel('Iteration')
-        axs[2].set_ylabel('Number of rounds')
-        axs[2].set_ylim(0, 100)
-        axs[2].legend()
+        # Plot epsilon
+        axs[-1].plot(self.epsilon_list)
+        axs[-1].set_title('Epsilon')
+        axs[-1].set_xlabel('Episode')
+        axs[-1].set_ylabel('Epsilon')
+        axs[-1].set_ylim(0, 1)
 
+        if title is not None:
+            fig.suptitle(title, fontsize=12, fontweight='bold', y=1.05)
+        plt.tight_layout()
+        plt.show()
+
+    
+
+
+class RLExperimentRunner:
+    def __init__(self, controller_instances, seed_list, save_dir):
+        """
+        controller_instances: dict mapping controller name to a single controller instance (template)
+        seed_list: list of seeds to use for all controllers
+        save_dir: directory to save results
+        """
+        self.controller_instances = controller_instances  # e.g., {"mcrl": controller_obj, ...}
+        self.seed_list = seed_list
+        self.save_dir = save_dir
+        os.makedirs(save_dir, exist_ok=True)
+
+    def run_all(self):
+        for name, controller_template in self.controller_instances.items():
+            for seed in self.seed_list:
+                save_path = os.path.join(self.save_dir, f"{name}_seed{seed}.npz")
+                if os.path.exists(save_path):
+                    print(f"[Skipped] {save_path} already exists.")
+                    continue
+
+                np.random.seed(seed)
+                controller_copy = copy.deepcopy(controller_template)
+                controller_copy.setup()
+                reward,  SR = controller_copy.postprocessing(window=50)
+
+                np.savez(save_path, reward=reward, success_rate=SR, policy=controller_copy.policy)
+                print(f"[Saved] {save_path}")
+
+    def load_results(self):
+        result_dict = {}
+        for name in self.controller_instances.keys():
+            all_rewards = []
+            all_success_rates = []
+            for seed in self.seed_list:
+                file_path = os.path.join(self.save_dir, f"{name}_seed{seed}.npz")
+                if not os.path.exists(file_path):
+                    print(f"[Warning] Missing file: {file_path}, skipping.")
+                    continue
+                data = np.load(file_path)
+                all_rewards.append(data['reward'])
+                all_success_rates.append(data['success_rate'])
+            result_dict[name] = {
+                'reward': np.vstack(all_rewards),
+                'success_rate': np.vstack(all_success_rates)
+            }
+        return result_dict
+    
+    def get_trained_controller(self, name: str, seed: int):
+        """
+        Return a deepcopy of the template controller whose .policy has been
+        replaced by the stored one for (name, seed). If the file is absent,
+        raise FileNotFoundError.
+        """
+        f = os.path.join(self.save_dir, f"{name}_seed{seed}.npz")
+        if not os.path.exists(f):
+            raise FileNotFoundError(f"No saved data for {name}, seed {seed}")
+
+        data = np.load(f, allow_pickle=True)
+        policy_np = data["policy"]
+
+        ctrl = copy.deepcopy(self.controller_instances[name])
+        ctrl.policy = policy_np
+        return ctrl
+
+    def compute_statistics(self):
+        results = self.load_results()
+        stats = {}
+        for name, data in results.items():
+            reward = data['reward']
+            success = data['success_rate']
+            stats[name] = {
+                'reward_mean': np.mean(reward, axis=0),
+                'reward_std': np.std(reward, axis=0),
+                'reward_mean_min': np.min(reward, axis=0),
+                'reward_mean_max': np.max(reward, axis=0),
+                'success_mean': np.mean(success, axis=0),
+                'success_std': np.std(success, axis=0),
+                'success_mean_min': np.min(success, axis=0),
+                'success_mean_max': np.max(success, axis=0)
+            }
+        return stats
+
+    def plot(self, title=None):
+        stats = self.compute_statistics()
+        # x‑axes per metric can differ in length – compute individually later
+        fig, (ax_r, ax_sr) = plt.subplots(1, 2, figsize=(14, 5))
+
+        # ------- Reward subplot --------
+        for name, val in stats.items():
+            x_r = np.arange(len(val['reward_mean']))
+            ax_r.plot(x_r, val['reward_mean'], label=f"{name} Reward")
+            if len(self.seed_list) > 1:
+                ax_r.fill_between(x_r,
+                                val['reward_mean'] - 3 * val['reward_std'],
+                                val['reward_mean'] + 3 * val['reward_std'], alpha=0.3)
+                                #val['reward_mean_min'],
+                                #val['reward_mean_max'], alpha=0.3)
+        if len(self.seed_list) > 1:
+            ax_r.set_title("Reward Curve: Mean ± 3 * Std")
+        else:
+            ax_r.set_title("Reward Curve")
+        ax_r.set_xlabel("Episode")
+        ax_r.set_ylabel("Reward")
+        ax_r.grid(True)
+        ax_r.legend()
+
+        # ------- Success‑rate subplot --------
+        for name, val in stats.items():
+            x_sr = np.arange(len(val['success_mean']))
+            ax_sr.plot(x_sr, val['success_mean'], label=f"{name} Success Rate")
+            if len(self.seed_list) > 1:
+                ax_sr.fill_between(x_sr,
+                                val['success_mean'] - 3 * val['success_std'],
+                                val['success_mean'] + 3 * val['success_std'], alpha=0.3)
+                                #val['success_mean_min'],
+                                #val['success_mean_max'], alpha=0.3)
+        if len(self.seed_list) > 1:
+            ax_sr.set_title("Success Rate: Mean ± 3 * Std")
+        else:
+            ax_sr.set_title("Success Rate")
+        ax_sr.set_xlabel("Episode")
+        ax_sr.set_ylabel("Success Rate")
+        ax_sr.grid(True)
+        ax_sr.legend()
+
+        if title is not None:
+            fig.suptitle(title, fontsize=20, fontweight='bold', y=1.05)
 
         plt.tight_layout()
         plt.show()
+
 
 
 
@@ -3826,8 +4059,6 @@ class Simulator:
         env: Env = None,
         dt: float = None,
         t_terminal: float = None,
-        type: str = 'ideal', # 'ideal' OR 'identified'
-        param_id: np.array = None,
         verbose: bool = False
     ) -> None:
         
@@ -3835,17 +4066,7 @@ class Simulator:
         self.controller = controller
         self.env = env
 
-        self.type = type  # 'ideal' or 'identified'
-
         self.verbose = verbose
-
-        if self.type == 'ideal':
-            self.input_dynamics = None
-        elif self.type == 'identified' and param_id is not None:
-            self.input_dynamics = InputDynamics(param_id)
-        elif self.type == 'identified' and param_id == None:
-            raise ValueError("Error: choose to use the identified input model but no identified parameters are given!")
-            
 
         # Initialize attributes only if 'env' is provided
         if env is not None:
@@ -3889,35 +4110,35 @@ class Simulator:
         current_state = self.init_state
         self.state_traj.append(current_state)
 
-        if self.type == 'identified':
-            current_input_old = 0
-
         for current_time in self.t_eval[:-1]:
 
-            # Get current state, and call controller to calculate input
-            if self.controller.type == 'MPC':
-                input_cmd, state_pred, input_pred = self.controller.compute_action(current_state, self.counter)
-                # Log the predictions
-                self.state_pred_traj.append(state_pred)
-                self.input_pred_traj.append(input_pred)
-            elif self.controller.type == 'RMPC':
-                input_cmd, state_pred, input_pred, nominal_input = self.controller.compute_action(current_state, self.counter)
-                # Log the predictions
-                self.state_pred_traj.append(state_pred)
-                self.input_pred_traj.append(input_pred)
+            # In RL case, once the target is reached, stop the car at target position forever
+            if self.controller.type == 'RL':
+                pos_bin = (self.controller.mdp.pos_ubs-self.controller.mdp.pos_lbs)/self.controller.mdp.num_pos
+                if np.linalg.norm(current_state[0]-self.env.target_position) < pos_bin/2:
+                    current_input = 0.0
+                    current_state = self.env.target_state
+                else:
+                    input_cmd = self.controller.compute_action(current_state, self.counter)
+                    current_input = input_cmd
+                    current_state = self.dynamics.one_step_forward(current_state, current_input, self.dt)
             else:
-                input_cmd = self.controller.compute_action(current_state, self.counter)
+                # Get current state, and call controller to calculate input
+                if self.controller.type == 'MPC':
+                    input_cmd, state_pred, input_pred = self.controller.compute_action(current_state, self.counter)
+                    # Log the predictions
+                    self.state_pred_traj.append(state_pred)
+                    self.input_pred_traj.append(input_pred)
+                elif self.controller.type == 'RMPC':
+                    input_cmd, state_pred, input_pred, nominal_input = self.controller.compute_action(current_state, self.counter)
+                    # Log the predictions
+                    self.state_pred_traj.append(state_pred)
+                    self.input_pred_traj.append(input_pred)
+                else:
+                    input_cmd = self.controller.compute_action(current_state, self.counter)
 
-            # Do one-step simulation
-            if self.type == 'ideal':
                 current_input = input_cmd
-            elif self.type == 'identified' and self.input_dynamics is not None:
-                current_input = self.input_dynamics.one_step_forward(current_input_old, input_cmd, self.dt)
-                current_input_old = current_input
-            else:
-                raise NotImplementedError("Simulation type not implemented or input dynamics not provided!")
-                
-            current_state = self.dynamics.one_step_forward(current_state, current_input, self.dt)
+                current_state = self.dynamics.one_step_forward(current_state, current_input, self.dt)
             #print(f"sim_state:{current_state}")
 
             # Log the results
@@ -3925,7 +4146,6 @@ class Simulator:
             self.input_traj.append(np.array(current_input).flatten())
             if self.controller.type == 'RMPC':
                 self.nominal_input_traj.append(np.array(nominal_input).flatten())
-            # TODO: also log input_cmd curve for identified case
 
             # Update timer
             self.counter += 1
@@ -4157,7 +4377,7 @@ class Visualizer:
         plt.tight_layout()
         plt.show()
 
-    def display_contrast_plots(self, *simulators: Simulator, title=None) -> None:
+    def display_contrast_plots(self, title, *simulators: Simulator, if_gray:bool=False) -> None:
 
         color_index = 0
 
@@ -4184,7 +4404,7 @@ class Visualizer:
 
         # Plot the reference and evaluated trajectories for each simulator
         for simulator_ref in simulators:
-            if not simulator_ref.state_traj:
+            if simulator_ref.state_traj is None or len(simulator_ref.state_traj) == 0:
                 raise ValueError(f"Failed to get trajectory from simulator {simulator_ref.controller_name}. State trajectory list is void; please run 'run_simulation' first.")
 
             # Get reference trajectories from simulator_ref
@@ -4195,17 +4415,22 @@ class Visualizer:
             velocity_ref = state_traj_ref[:, 1]
             acceleration_ref = input_traj_ref
 
-            # Plot position over time
-            ax1.plot(self.t_eval, position_ref, linestyle="--", label=f"{simulator_ref.controller_name}", color=self.color_list[color_index])
+            if if_gray:
+                # Plot position over time
+                ax1.plot(simulator_ref.t_eval, position_ref, linestyle="--", label=f"{simulator_ref.controller_name}", color='gray')
+                # Plot velocity over time
+                ax2.plot(simulator_ref.t_eval, velocity_ref, linestyle="--", label=f"{simulator_ref.controller_name}", color='gray')
+                # Plot acceleration over time
+                ax3.step(simulator_ref.t_eval, np.append(acceleration_ref, acceleration_ref[-1]), where='post', linestyle="--", label=f"{simulator_ref.controller_name}", color='gray')
+            else:
+                # Plot position over time
+                ax1.plot(simulator_ref.t_eval, position_ref, linestyle="--", label=f"{simulator_ref.controller_name}", color=self.color_list[color_index])
+                # Plot velocity over time
+                ax2.plot(simulator_ref.t_eval, velocity_ref, linestyle="--", label=f"{simulator_ref.controller_name}", color=self.color_list[color_index])
+                # Plot acceleration over time
+                ax3.step(simulator_ref.t_eval, np.append(acceleration_ref, acceleration_ref[-1]), where='post', linestyle="--", label=f"{simulator_ref.controller_name}", color=self.color_list[color_index])
 
-            # Plot velocity over time
-            ax2.plot(self.t_eval, velocity_ref, linestyle="--", label=f"{simulator_ref.controller_name}", color=self.color_list[color_index])
-
-            # Plot acceleration over time
-            #ax3.plot(self.t_eval[:-1], acceleration_ref, linestyle="--", label=f"{simulator_ref.controller_name}", color=self.color_list[color_index])
-            ax3.step(self.t_eval, np.append(acceleration_ref, acceleration_ref[-1]), where='post', linestyle="--", label=f"{simulator_ref.controller_name}", color=self.color_list[color_index])
-
-            color_index += 1
+                color_index += 1
             
         # Plot shadowed zone for state bounds
         if self.env.state_lbs is not None:
@@ -4288,7 +4513,7 @@ class Visualizer:
                 raise ValueError(f"Failed to get trajectory from simulator {simulator_ref.controller_name}. State trajectory list is void; please run 'run_simulation' first.")
 
             # Plot cost over time
-            ax[0].plot(self.t_eval, np.append(simulator_ref.cost2go_arr, simulator_ref.cost2go_arr[-1]), linestyle="--", label=f"{simulator_ref.controller_name}", color=self.color_list[color_index])
+            ax[0].plot(simulator_ref.t_eval, np.append(simulator_ref.cost2go_arr, simulator_ref.cost2go_arr[-1]), linestyle="--", label=f"{simulator_ref.controller_name}", color=self.color_list[color_index])
 
             color_index += 1
         
@@ -4564,7 +4789,8 @@ class Visualizer:
             car_self.angle = np.degrees(current_theta)  # rad to deg
 
             for sim, car in car_objects.items():
-                current_position = sim.get_trajectories()[0][:, 0][frame]
+                frame_ref = int(frame*self.dt/sim.dt)  # Adjust frame index for each simulator
+                current_position = sim.get_trajectories()[0][:, 0][frame_ref]
                 current_theta = float(sim.env.theta(current_position).full().flatten()[0])
                 car.set_xy((current_position - self.car_length / 2, float(sim.env.h(current_position - self.car_length / 2).full().flatten()[0])))
                 car.angle = np.degrees(current_theta)  # rad to deg
@@ -4576,7 +4802,7 @@ class Visualizer:
 
         return HTML(anim.to_jshtml())
     
-    def display_contrast_animation_same(self, *simulators) -> HTML:
+    def display_contrast_animation_same(self, *simulators, if_gray:bool = False) -> HTML:
         import matplotlib.patches as mpatches
 
         custom_handles = []
@@ -4627,8 +4853,10 @@ class Visualizer:
 
         # Simulators' cars
         for sim, color in zip(simulators, colors[1:]):
-            car = Rectangle((0, 0), self.car_length, car_height,
-                            edgecolor=color, facecolor='none', linewidth=2)
+            if if_gray:
+                car = Rectangle((0, 0), self.car_length, car_height, edgecolor='gray', facecolor='none', linewidth=2)
+            else:
+                car = Rectangle((0, 0), self.car_length, car_height, edgecolor=color, facecolor='none', linewidth=2)
             ax.add_patch(car)
             car_objects[sim] = car
 
@@ -4644,9 +4872,10 @@ class Visualizer:
             mpatches.Patch(edgecolor=self.color, facecolor='none', linewidth=2, label=self.simulator.controller_name)
         ]
         for sim, color in zip(simulators, colors[1:]):
-            car_legend_handles.append(
-                mpatches.Patch(edgecolor=color, facecolor='none', linewidth=2, label=sim.controller_name)
-            )
+            if if_gray:
+                car_legend_handles.append(mpatches.Patch(edgecolor='gray', facecolor='none', linewidth=2, label=sim.controller_name))
+            else:
+                car_legend_handles.append(mpatches.Patch(edgecolor=color, facecolor='none', linewidth=2, label=sim.controller_name))
 
         ax.legend(handles=custom_handles + car_legend_handles, loc='best')
 
@@ -4663,7 +4892,8 @@ class Visualizer:
             for sim, car in car_objects.items():
                 if sim is self:
                     continue
-                current_position = sim.get_trajectories()[0][:, 0][frame]
+                frame_ref = int(frame*self.dt/sim.dt)  # Adjust frame index for each simulator
+                current_position = sim.get_trajectories()[0][:, 0][frame_ref]
                 current_theta = float(sim.env.theta(current_position).full().flatten()[0])
                 y_base = float(sim.env.h(current_position - self.car_length / 2).full().flatten()[0])
                 car.set_xy((current_position - self.car_length / 2, y_base))
