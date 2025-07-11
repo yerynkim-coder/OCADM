@@ -3429,7 +3429,7 @@ class GPIController(BaseController):
         plt.show()
 
 
-# Derived class for RL Controller, solved by Q-Learning
+# Derived class for RL Controller, solved by Q-learning
 class QLearningController(BaseController):
     def __init__(self, 
                  mdp: Env_rl_d, 
@@ -3441,7 +3441,7 @@ class QLearningController(BaseController):
                  gamma: float = 0.95,
                  max_iterations: int = 5000, 
                  max_steps_per_episode: int = 500, 
-                 name: str = 'Q-Learning', 
+                 name: str = 'Q-learning', 
                  type: str = 'RL', 
                  verbose: bool = True
                  ) -> None:
@@ -4007,7 +4007,7 @@ class RLExperimentRunner:
         # ------- Reward subplot --------
         for name, val in stats.items():
             x_r = np.arange(len(val['reward_mean']))
-            ax_r.plot(x_r, val['reward_mean'], label=f"{name} Reward")
+            ax_r.plot(x_r, val['reward_mean'], label=f"{name}")
             if len(self.seed_list) > 1:
                 ax_r.fill_between(x_r,
                                 val['reward_mean'] - 3 * val['reward_std'],
@@ -4026,7 +4026,7 @@ class RLExperimentRunner:
         # ------- Success‑rate subplot --------
         for name, val in stats.items():
             x_sr = np.arange(len(val['success_mean']))
-            ax_sr.plot(x_sr, val['success_mean'], label=f"{name} Success Rate")
+            ax_sr.plot(x_sr, val['success_mean'], label=f"{name}")
             if len(self.seed_list) > 1:
                 ax_sr.fill_between(x_sr,
                                 val['success_mean'] - 3 * val['success_std'],
