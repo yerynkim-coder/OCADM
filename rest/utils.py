@@ -5,9 +5,11 @@ import casadi as ca
 import scipy.linalg
 import copy
 import time
+import os
 from scipy.integrate import solve_ivp
 from scipy.optimize import minimize
 import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
 from abc import ABC, abstractmethod
 from typing import List, Callable, Union, Optional, Tuple, Any
 from functools import wraps
@@ -20,10 +22,26 @@ from IPython.display import display, HTML
 from scipy.interpolate import interp2d
 from cvxopt import matrix, solvers
 import pytope as pt
+<<<<<<< HEAD
 from scipy.spatial import ConvexHull, QhullError
+=======
+from scipy.spatial import ConvexHull, QhullError, cKDTree
+>>>>>>> origin/model-based-rl
 
 # Add a tutorial to show how to install acados and set interface to python
 from acados_template import AcadosOcp, AcadosOcpSolver, AcadosModel
+
+
+
+def timing(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        start = time.perf_counter()
+        result = func(*args, **kwargs)
+        end = time.perf_counter()
+        print(f"{func.__qualname__} took {end - start:.6f} seconds")
+        return result
+    return wrapper
 
 
 
@@ -518,8 +536,40 @@ class InputDynamics:
         new_input = np.array(solution.y)[:, -1]
 
         return new_input
+<<<<<<< HEAD
 
 
+=======
+    
+
+
+def linspace_include_target(target, lb, ub, num):
+    assert target >= lb and target <= ub, "Target is out of bounds"
+    # Create the original linspace
+    linspace_array = np.linspace(lb, ub, num)
+
+    # Find the closest index to target
+    closest_idx = np.argmin(np.abs(linspace_array - target))
+
+    # Calculate the difference and shift the entire array
+    difference = target - linspace_array[closest_idx]
+    linspace_array += difference
+
+    return linspace_array
+
+def plot_discrete_state_space(pos_partitions, vel_partitions, target_state=None):
+
+    fig, ax = plt.subplots(1, 1, figsize=(5, 5))
+
+    pos_grid, vel_grid = np.meshgrid(pos_partitions, vel_partitions)
+    ax.plot(pos_grid.flatten(), vel_grid.flatten(), 'o', label='Discrete States')
+    if target_state is not None:
+        ax.plot(target_state[0], target_state[1], 'r*', label='Target State')
+    ax.set_xlabel('Position')
+    ax.set_ylabel('Velocity')
+    ax.legend()
+    plt.show()
+>>>>>>> origin/model-based-rl
 
 
 
@@ -530,7 +580,12 @@ class Env_rl_d(Env):
             dynamics: Dynamics = None,
             num_states: np.array = np.array([20, 20]),
             num_actions: int = 10,
-            dt: float = 0.1
+            dt: float = 0.1,
+            use_nn: bool = True,
+            num_samples: int = 100,
+            state_noise_levels: np.array = np.array([1e-2, 1e-3]),
+            input_noise_levels: np.array = np.array([1e-3]),
+            build_stochastic_mdp = True
         ) -> None:
 
         self.env = env
@@ -547,9 +602,20 @@ class Env_rl_d(Env):
             raise ValueError("Constraints on states and input must been fully specified!")
 
         # Partitions over state space and input space
-        self.pos_partitions = np.linspace(self.pos_lbs, self.pos_ubs, self.num_pos)
-        self.vel_partitions = np.linspace(self.vel_lbs, self.vel_ubs, self.num_vel)
-        self.acc_partitions = np.linspace(self.input_lbs, self.input_ubs, self.num_acc)
+        # self.pos_partitions = np.linspace(self.pos_lbs, self.pos_ubs, self.num_pos)
+        # self.vel_partitions = np.linspace(self.vel_lbs, self.vel_ubs, self.num_vel)
+        # self.acc_partitions = np.linspace(self.input_lbs, self.input_ubs, self.num_acc)
+        self.pos_partitions = linspace_include_target(self.env.target_state[0], self.pos_lbs, self.pos_ubs, self.num_pos)
+        self.vel_partitions = linspace_include_target(self.env.target_state[1], self.vel_lbs, self.vel_ubs, self.num_vel)
+        self.acc_partitions = linspace_include_target(0.0, self.input_lbs, self.input_ubs, self.num_acc)
+
+        # Create kdtrees for state space and input space
+        self.kdtree_pos = cKDTree(self.pos_partitions.reshape(-1, 1))
+        self.kdtree_vel = cKDTree(self.vel_partitions.reshape(-1, 1))
+        self.kdtree_acc = cKDTree(self.acc_partitions.reshape(-1, 1))
+
+        # Look up closest state index for the target state
+        self.target_state_index = self.nearest_state_index_lookup_kdtree(self.env.target_state)
 
         # Generate state space (position, velocity combinations)
         POS, VEL = np.meshgrid(self.pos_partitions, self.vel_partitions)
@@ -569,7 +635,17 @@ class Env_rl_d(Env):
         self.R = [None] * self.num_actions  # Shape: list (1, num_actions) -> array (num_states, num_states)
         
         # Build MDP 
-        self.build_stochastic_mdp()
+        if build_stochastic_mdp: 
+            self.use_nn = use_nn
+            if self.use_nn:
+                self.num_samples = num_samples
+                self.state_noise_levels = state_noise_levels
+                self.input_noise_levels = input_noise_levels
+            else:
+                self.num_samples = 1
+                self.state_noise_levels = np.array([0.0, 0.0])
+                self.input_noise_levels = np.array([0.0])
+            self.build_stochastic_mdp()
 
     def one_step_forward(self, cur_state, cur_input):
         
@@ -581,19 +657,18 @@ class Env_rl_d(Env):
         
         # Propagate the state
         next_state = self.dynamics.one_step_forward(cur_state, cur_input, self.dt)  
-        next_state_raw = next_state
 
         # Check whether next state is within the state space
         next_pos = max(min(next_state[0], self.pos_ubs), self.pos_lbs)
         next_vel = max(min(next_state[1], self.vel_ubs), self.vel_lbs)
-        next_state = np.array([next_pos, next_vel])
+        next_state_filtered = np.array([next_pos, next_vel])
         
         # Get reward
-        next_state_index = self.nearest_state_index_lookup(next_state)
-        if np.all(self.state_space[:, next_state_index] == self.env.target_state):
+        next_state_index = self.nearest_state_index_lookup_kdtree(next_state)
+        if next_state_index == self.target_state_index:
             reward = 10
-        elif np.any(next_state_raw != next_state):
-            reward = -1
+        elif np.any(next_state != next_state_filtered):
+            reward = -10
         else:
             reward = -1
         
@@ -606,14 +681,19 @@ class Env_rl_d(Env):
         distances = np.linalg.norm(self.state_space.T - np.array(state), axis=1)
         return np.argmin(distances)
     
-    def build_stochastic_mdp(self):
+    def nearest_state_index_lookup_kdtree(self, state):
+        """
+        Find the nearest state index in the discrete state space for a given state.
+        """
+        nearest_pos_idx = self.kdtree_pos.query(state[0])[1]
+        nearest_vel_idx = self.kdtree_vel.query(state[1])[1]
+
+        return nearest_pos_idx + nearest_vel_idx * self.num_pos
+    
+    def build_stochastic_mdp(self, verbose=False):
         """
         Construct transition probability (T) and reward (R) matrices for the MDP.
         """
-        # Unique values for position and velocity
-        unique_pos = self.pos_partitions
-        unique_vel = self.vel_partitions
-
         # Iterate over all states
         for state_index in range(self.num_states):
             cur_state = self.state_space[:, state_index]
@@ -623,46 +703,15 @@ class Env_rl_d(Env):
             for action_index in range(self.num_actions):
                 action = self.input_space[action_index]
 
-                print(f"cur_state: {cur_state}")
-                print(f"action: {action}")
+                if verbose:
+                    print(f"cur_state: {cur_state}")
+                    print(f"action: {action}")
 
-                # Propagate forward to get next state and reward
-                next_state, reward = self.one_step_forward(cur_state, action)
+                if self.use_nn:
+                    probs, nodes, rewards = self.nearest_neighbor_approach(cur_state, action, verbose)
 
-                print(f"next_state: {next_state}")
-
-                # Find the two closest discretized values for position and velocity
-                pos_indices = np.argsort(np.abs(unique_pos - next_state[0]))[:2]
-                vel_indices = np.argsort(np.abs(unique_vel - next_state[1]))[:2]
-
-                pos_bounds = [unique_pos[pos_indices[0]], unique_pos[pos_indices[1]]]
-                vel_bounds = [unique_vel[vel_indices[0]], unique_vel[vel_indices[1]]]
-
-                print(f"pos_bounds: {pos_bounds}")
-                print(f"vel_bounds: {vel_bounds}")
-
-                # Normalize next state within bounds
-                x_norm = (next_state[0] - min(pos_bounds)) / (max(pos_bounds) - min(pos_bounds))
-                y_norm = (next_state[1] - min(vel_bounds)) / (max(vel_bounds) - min(vel_bounds))
-
-                print(f"x_norm: {x_norm}")
-                print(f"y_norm: {y_norm}")
-
-                # Calculate bilinear interpolation probabilities
-                probs = [
-                    (1 - x_norm) * (1 - y_norm),  # bottom-left
-                    x_norm * (1 - y_norm),        # bottom-right
-                    x_norm * y_norm,              # top-right
-                    (1 - x_norm) * y_norm         # top-left
-                ]
-
-                # Four vertices of the enclosing box
-                nodes = [
-                    [min(pos_bounds), min(vel_bounds)],  # bottom-left
-                    [max(pos_bounds), min(vel_bounds)],  # bottom-right
-                    [max(pos_bounds), max(vel_bounds)],  # top-right
-                    [min(pos_bounds), max(vel_bounds)]   # top-left
-                ]
+                else:
+                    probs, nodes, rewards = self.linear_interpolation_approach(cur_state, action, verbose)
 
                 # Initialize T and R matrices if not already done
                 if self.T[action_index] is None:
@@ -672,9 +721,80 @@ class Env_rl_d(Env):
 
                 # Update transition and reward matrices
                 for i, node in enumerate(nodes):
-                    node_index = self.nearest_state_index_lookup(node)
-                    self.T[action_index][state_index, node_index] += probs[i]
-                    self.R[action_index][state_index, node_index] += reward
+                    # node_index = self.nearest_state_index_lookup(node)
+                    node_index = self.nearest_state_index_lookup_kdtree(node)
+                    
+                    self.T[action_index][state_index, node_index] += probs[i] / self.num_samples
+                    self.R[action_index][state_index, node_index] += rewards[i] / self.num_samples
+
+    def nearest_neighbor_approach(self, cur_state, action, verbose=False):
+        probs = [1.0] * self.num_samples
+        nodes = []
+        rewards = []
+        for i in range(self.num_samples):
+            # Sample noise
+            state_noise = np.random.normal(0, 1.0, size=cur_state.shape) * self.state_noise_levels
+            input_noise = np.random.normal(0, 1.0, size=1) * self.input_noise_levels
+
+            if verbose:
+                print(f"state_noise: {state_noise}")
+                print(f"input_noise: {input_noise}")
+
+            # Propagate forward to get next state and reward
+            next_state, reward = self.one_step_forward(cur_state + state_noise, action + input_noise)
+
+            if verbose:
+                print(f"next_state: {next_state}")
+
+            nodes.append(next_state)
+            rewards.append(reward)
+
+        return probs, nodes, rewards
+    
+    def linear_interpolation_approach(self, cur_state, action, verbose=False):
+        # Propagate forward to get next state and reward
+        next_state, reward = self.one_step_forward(cur_state, action)
+
+        if verbose:
+            print(f"next_state: {next_state}")
+
+        pos_indices = self.kdtree_pos.query(next_state[0], k=2)[1]
+        vel_indices = self.kdtree_vel.query(next_state[1], k=2)[1]
+
+        pos_bounds = [self.pos_partitions[pos_indices[0]], self.pos_partitions[pos_indices[1]]]
+        vel_bounds = [self.vel_partitions[vel_indices[0]], self.vel_partitions[vel_indices[1]]]
+
+        if verbose:
+            print(f"pos_bounds: {pos_bounds}")
+            print(f"vel_bounds: {vel_bounds}")
+
+        # Normalize next state within bounds
+        x_norm = (next_state[0] - min(pos_bounds)) / (max(pos_bounds) - min(pos_bounds))
+        y_norm = (next_state[1] - min(vel_bounds)) / (max(vel_bounds) - min(vel_bounds))
+
+        if verbose:
+            print(f"x_norm: {x_norm}")
+            print(f"y_norm: {y_norm}")
+
+        # Calculate bilinear interpolation probabilities
+        probs = [
+            (1 - x_norm) * (1 - y_norm),  # bottom-left
+            x_norm * (1 - y_norm),        # bottom-right
+            x_norm * y_norm,              # top-right
+            (1 - x_norm) * y_norm         # top-left
+        ]
+
+        # Four vertices of the enclosing box
+        nodes = [
+            [min(pos_bounds), min(vel_bounds)],  # bottom-left
+            [max(pos_bounds), min(vel_bounds)],  # bottom-right
+            [max(pos_bounds), max(vel_bounds)],  # top-right
+            [min(pos_bounds), max(vel_bounds)]   # top-left
+        ]
+
+        rewards = [reward] * len(nodes)
+
+        return probs, nodes, rewards
 
     # plot t for all states
     def plot_t(self):
@@ -745,34 +865,28 @@ class Env_rl_c(Env):
             done = False
             reward = np.exp( - 1.0 * np.linalg.norm(next_pos-self.env.target_state[0]))
 
-
-        
-        
         return done, next_state, reward
-
-
-
 
 def is_square(matrix: np.ndarray) -> bool:
     if matrix.shape[0] != matrix.shape[1]:
-        raise ValueError("Warning: must be a square matrix!")
+        raise ValueError(f"Warning: must be a square matrix! ({matrix})")
     return True
 
 def is_symmetric(matrix: np.ndarray) -> bool:
     if not np.allclose(matrix, matrix.T):
-        raise ValueError("Warning: must be a symmetric matrix!")
+        raise ValueError(f"Warning: must be a symmetric matrix! ({matrix})")
     return True
 
 def is_positive_semi_definite(matrix: np.ndarray) -> bool:
     eigvals = np.linalg.eigvals(matrix)
     if not np.all(np.greater_equal(eigvals, 0)):
-        raise ValueError("Warning: must be a positive semi-definite matrix!")
+        raise ValueError(f"Warning: must be a positive semi-definite matrix! ({matrix})")
     return True
 
 def is_positive_definite(matrix: np.ndarray) -> bool:
     eigvals = np.linalg.eigvals(matrix)
     if not np.all(np.greater(eigvals, 0)):
-        raise ValueError("Warning: must be a positive definite matrix!")
+        raise ValueError(f"Warning: must be a positive definite matrix! ({matrix})")
     return True
 
 def check_input_constraints(compute_action, mode='clipping'):
@@ -2209,6 +2323,167 @@ class LinearOCPInfNormController:
 # Class for linear MPC Controller with 2-norm cost
 class LinearMPCController:
     def __init__(self, 
+<<<<<<< HEAD
+            env: Env, 
+            dynamics: Dynamics, 
+            Q: np.ndarray, 
+            R: np.ndarray, 
+            Qf: np.ndarray, 
+            freq: float, 
+            N: int, 
+            name: str = 'LMPC', 
+            type: str = 'MPC', 
+            verbose: bool = False
+        ) -> None:
+
+        self.env = env
+        self.dynamics = dynamics
+
+        self.Q = Q
+        self.R = R
+        self.Qf = Qf
+
+        self.N = N
+
+        self.name = name
+        self.type = type
+
+        self.freq = freq
+        self.dt = 1.0 / freq
+        
+        self.verbose = verbose
+
+        self.dim_states = dynamics.dim_states
+        self.dim_inputs = dynamics.dim_inputs
+
+        self.x_pred = None
+        self.u_pred = None
+    
+    @check_input_constraints
+    def compute_action(self, current_state, current_time=None):
+
+        x0 = current_state.reshape(-1, 1)
+        u0 = np.zeros((self.dim_inputs, 1))
+
+        A_d, B_d = self.dynamics.get_linearized_AB_discrete(x0, u0, self.dt)
+
+        n_vars = self.dim_states * (self.N + 1) + self.dim_inputs * self.N
+
+        # Cost
+        H = np.zeros((n_vars, n_vars))
+        f = np.zeros((n_vars, 1))
+
+        x_ref = self.env.target_state.reshape(-1, 1)  # assumed constant
+        u_ref = np.array(self.dynamics.get_equilibrium_input(x_ref)).reshape(-1, 1)        # assumed constant
+
+        for k in range(self.N):
+            idx_x = slice(k * self.dim_states, (k + 1) * self.dim_states)
+            idx_u = slice((self.N + 1) * self.dim_states + k * self.dim_inputs,
+                          (self.N + 1) * self.dim_states + (k + 1) * self.dim_inputs)
+
+            Qk = self.Q
+            H[idx_x, idx_x] = Qk
+            H[idx_u, idx_u] = self.R
+
+            f[idx_x] = -Qk @ x_ref
+            f[idx_u] = -self.R @ u_ref
+
+        # Terminal cost
+        idx_x_terminal = slice(self.N * self.dim_states, (self.N + 1) * self.dim_states)
+        H[idx_x_terminal, idx_x_terminal] = self.Qf
+        f[idx_x_terminal] = -self.Qf @ x_ref
+
+        # Dynamics constraints
+        Aeq = []
+        beq = []
+
+        for k in range(self.N):
+            row = np.zeros((self.dim_states, n_vars))
+            idx_xk = slice(k * self.dim_states, (k + 1) * self.dim_states)
+            idx_xk_next = slice((k + 1) * self.dim_states, (k + 2) * self.dim_states)
+            idx_uk = slice((self.N + 1) * self.dim_states + k * self.dim_inputs,
+                           (self.N + 1) * self.dim_states + (k + 1) * self.dim_inputs)
+            row[:, idx_xk_next] = -np.eye(self.dim_states)
+            row[:, idx_xk] = A_d
+            row[:, idx_uk] = B_d
+            Aeq.append(row)
+            beq.append(np.zeros((self.dim_states, 1)))
+
+        # Add x0 = current_state as hard equality constraint
+        row0 = np.zeros((self.dim_states, n_vars))
+        row0[:, :self.dim_states] = np.eye(self.dim_states)
+        Aeq.insert(0, row0)
+        beq.insert(0, x0)
+
+        Aeq = np.vstack(Aeq)
+        beq = np.vstack(beq)
+
+        # Inequality constraints
+        G_list = []
+        h_list = []
+
+        for k in range(self.N + 1):
+            # State constraints
+            if self.env.state_lbs is not None:
+                Gx_l = np.zeros((self.dim_states, n_vars))
+                Gx_l[:, k * self.dim_states:(k + 1) * self.dim_states] = -np.eye(self.dim_states)
+                G_list.append(Gx_l)
+                h_list.append(-np.array(self.env.state_lbs).reshape(-1, 1))
+            if self.env.state_ubs is not None:
+                Gx_u = np.zeros((self.dim_states, n_vars))
+                Gx_u[:, k * self.dim_states:(k + 1) * self.dim_states] = np.eye(self.dim_states)
+                G_list.append(Gx_u)
+                h_list.append(np.array(self.env.state_ubs).reshape(-1, 1))
+
+        for k in range(self.N):
+            # Input constraints
+            if self.env.input_lbs is not None:
+                Gu_l = np.zeros((self.dim_inputs, n_vars))
+                Gu_l[:, (self.N + 1) * self.dim_states + k * self.dim_inputs:
+                          (self.N + 1) * self.dim_states + (k + 1) * self.dim_inputs] = -np.eye(self.dim_inputs)
+                G_list.append(Gu_l)
+                h_list.append(-np.array(self.env.input_lbs).reshape(-1, 1))
+            if self.env.input_ubs is not None:
+                Gu_u = np.zeros((self.dim_inputs, n_vars))
+                Gu_u[:, (self.N + 1) * self.dim_states + k * self.dim_inputs:
+                          (self.N + 1) * self.dim_states + (k + 1) * self.dim_inputs] = np.eye(self.dim_inputs)
+                G_list.append(Gu_u)
+                h_list.append(np.array(self.env.input_ubs).reshape(-1, 1))
+
+        # Check if there are any constraints
+        if len(G_list) > 0:
+            G = np.vstack(G_list)
+            h = np.vstack(h_list)
+        else:
+            G = np.zeros((1, n_vars))
+            h = np.array([[1e10]])
+
+        # Solve the QP
+        solvers.options['show_progress'] = False
+        sol = solvers.qp(matrix(H), matrix(f), matrix(G), matrix(h), matrix(Aeq), matrix(beq))
+        z_opt = np.array(sol['x']).flatten()
+
+        x_opt = z_opt[: (self.N + 1) * self.dim_states].reshape(self.N + 1, self.dim_states).T
+        u_opt = z_opt[(self.N + 1) * self.dim_states:].reshape(self.N, self.dim_inputs).T
+
+        if self.verbose:
+            print(f"Optimal control action: {u_opt[:, 0]}")
+            print(f"Predicted x: {x_opt}")
+            print(f"Predicted u: {u_opt}")
+
+        self.x_pred = x_opt
+        self.u_pred = u_opt
+
+        return u_opt[:, 0].flatten()+u_ref, x_opt.T, u_opt
+
+
+
+# Derived class for MPC Controller
+class MPCController(LQRController):
+    def __init__(
+            self, 
+=======
+>>>>>>> origin/model-based-rl
             env: Env, 
             dynamics: Dynamics, 
             Q: np.ndarray, 
@@ -2410,15 +2685,25 @@ class MPCController(LQRController):
         ## Model
         # Set up Acados model
         model = AcadosModel()
-        model.name = self.name
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        model.name = f"{self.name}_{timestamp}"
 
+<<<<<<< HEAD
+=======
+
+>>>>>>> origin/model-based-rl
         # Define model: x_dot = f(x, u)
         model.x = self.dynamics.states
         model.u = self.dynamics.inputs
         model.f_expl_expr = ca.vertcat(self.dynamics.dynamics_function(self.dynamics.states, self.dynamics.inputs))
         model.f_impl_expr = None # no needed, we already have the explicit model
+<<<<<<< HEAD
 
 
+=======
+
+
+>>>>>>> origin/model-based-rl
         ## Optimal control problem
         # Set up Acados OCP
         ocp = AcadosOcp()
@@ -2470,6 +2755,8 @@ class MPCController(LQRController):
         ocp.constraints.x0 = self.init_state  # Initial state
 
         # State constraints
+<<<<<<< HEAD
+=======
         ocp.constraints.idxbx = np.arange(self.dim_states)
         ocp.constraints.idxbx_e = np.arange(self.dim_states)
         if self.env.state_lbs is None and self.env.state_ubs is None:
@@ -2573,6 +2860,584 @@ class MPCController(LQRController):
         return u_optimal, x_pred, u_pred
 
 
+
+class TrackingMPCController(LQRController):
+    def __init__(
+            self, 
+            env: Env, 
+            dynamics: Dynamics, 
+            Q: np.ndarray, 
+            R: np.ndarray, 
+            Qf: np.ndarray, 
+            freq: float, 
+            N: int, 
+            traj_ref: np.ndarray = None,
+            name: str = 'MPC', 
+            type: str = 'MPC', 
+            verbose: bool = True
+        ) -> None:
+
+        """
+        Initialize the MPC Controller with Acados.
+
+        Args:
+        - env: The environment providing initial and target states.
+        - dynamics: The system dynamics.
+        - Q: State cost matrix.
+        - R: Control cost matrix.
+        - Qf: Terminal state cost matrix.
+        - freq: Control frequency.
+        - N: Prediction horizon.
+        - verbose: Print debug information if True.
+        """
+
+        self.Qf = Qf
+
+        self.N = N  # Prediction horizon
+
+        self.ocp = None
+        self.solver = None
+        self.traj_ref = traj_ref
+
+        super().__init__(env, dynamics, Q, R, freq, name, type, verbose)
+
+    def setup(self) -> None:
+        """
+        Define the MPC optimization problem using Acados.
+        """
+        
+        ## Model
+        # Set up Acados model
+        model = AcadosModel()
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        model.name = f"{self.name}_{timestamp}"
+
+        # Define model: x_dot = f(x, u)
+        model.x = self.dynamics.states
+        model.u = self.dynamics.inputs
+        model.f_expl_expr = ca.vertcat(self.dynamics.dynamics_function(self.dynamics.states, self.dynamics.inputs))
+        model.f_impl_expr = None # no needed, we already have the explicit model
+
+
+        ## Optimal control problem
+        # Set up Acados OCP
+        ocp = AcadosOcp()
+        ocp.model = model # link to the model (class: AcadosModel)
+        ocp.dims.N = self.N  # prediction horizon
+        ocp.solver_options.tf = self.N * self.dt  # total prediction time
+        ocp.solver_options.qp_solver = "FULL_CONDENSING_HPIPM" # Partially condensing interior-point method
+        ocp.solver_options.integrator_type = "ERK" # explicit Runge-Kutta
+        ocp.solver_options.nlp_solver_type = "SQP" # sequential quadratic programming
+
+        # Set up other hyperparameters in SQP solving
+        ocp.solver_options.nlp_solver_max_iter = 100
+        ocp.solver_options.nlp_solver_tol_stat = 1E-6
+        ocp.solver_options.nlp_solver_tol_eq = 1E-6
+        ocp.solver_options.nlp_solver_tol_ineq = 1E-6
+        ocp.solver_options.nlp_solver_tol_comp = 1E-6
+        
+        # For debugging
+        #ocp.solver_options.print_level = 2
+
+        # Set up cost function
+        ocp.cost.cost_type = "LINEAR_LS"
+        ocp.cost.cost_type_e = "LINEAR_LS"
+        ocp.cost.W = np.block([
+            [self.Q, np.zeros((self.dim_states, self.dim_inputs))],
+            [np.zeros((self.dim_inputs, self.dim_states)), self.R],
+        ])
+        ocp.cost.W_e = self.Qf
+
+        # Set up mapping from QP to OCP
+        # Define output matrix for non-terminal state
+        ocp.cost.Vx = np.block([
+            [np.eye(self.dim_states)],
+            [np.zeros((self.dim_inputs, self.dim_states))]
+        ])
+        # Define breakthrough matrix for non-terminal state
+        ocp.cost.Vu = np.block([
+            [np.zeros((self.dim_states, self.dim_inputs))],
+            [np.eye(self.dim_inputs)]
+        ])
+        # Define output matrix for terminal state
+        ocp.cost.Vx_e = np.eye(self.dim_states)
+
+        # Initialize reference of task (stabilization)
+        ocp.cost.yref = np.zeros(self.dim_states + self.dim_inputs) 
+        ocp.cost.yref_e = np.zeros(self.dim_states) 
+
+        # Define constraints
+        ocp.constraints.x0 = self.init_state  # Initial state
+
+        # State constraints
+>>>>>>> origin/model-based-rl
+        ocp.constraints.idxbx = np.arange(self.dim_states)
+        ocp.constraints.idxbx_e = np.arange(self.dim_states)
+        if self.env.state_lbs is None and self.env.state_ubs is None:
+            ocp.constraints.lbx_0 = np.full(self.dim_states, -1e6)
+            ocp.constraints.ubx_0 = np.full(self.dim_states, 1e6)
+            ocp.constraints.lbx = np.full(self.dim_states, -1e6)
+            ocp.constraints.ubx = np.full(self.dim_states, 1e6)
+            ocp.constraints.lbx_e = np.full(self.dim_states, -1e6)
+            ocp.constraints.ubx_e = np.full(self.dim_states, 1e6)
+        elif self.env.state_lbs is not None and self.env.state_ubs is None:
+            ocp.constraints.lbx_0 = np.array(self.env.state_lbs)
+            ocp.constraints.ubx_0 = np.full(self.dim_states, 1e6)
+            ocp.constraints.lbx = np.array(self.env.state_lbs)
+            ocp.constraints.ubx = np.full(self.dim_states, 1e6)
+            ocp.constraints.lbx_e = np.array(self.env.state_lbs)
+            ocp.constraints.ubx_e = np.full(self.dim_states, 1e6)
+        elif self.env.state_lbs is None and self.env.state_ubs is not None:
+            ocp.constraints.lbx_0 = np.full(self.dim_states, -1e6)
+            ocp.constraints.ubx_0 = np.array(self.env.state_ubs)
+            ocp.constraints.lbx = np.full(self.dim_states, -1e6)
+            ocp.constraints.ubx = np.array(self.env.state_ubs)
+            ocp.constraints.lbx_e = np.full(self.dim_states, -1e6)
+            ocp.constraints.ubx_e = np.array(self.env.state_ubs)
+        else:
+            ocp.constraints.lbx_0 = np.array(self.env.state_lbs)
+            ocp.constraints.ubx_0 = np.array(self.env.state_ubs)
+            ocp.constraints.lbx = np.array(self.env.state_lbs)
+            ocp.constraints.ubx = np.array(self.env.state_ubs)
+            ocp.constraints.lbx_e = np.array(self.env.state_lbs)
+            ocp.constraints.ubx_e = np.array(self.env.state_ubs)
+        
+        # Input constraints
+        ocp.constraints.idxbu = np.arange(self.dim_inputs)
+        if self.env.input_lbs is None and self.env.input_ubs is None:
+            ocp.constraints.lbu = np.full(self.dim_inputs, -1e6)
+            ocp.constraints.ubu = np.full(self.dim_inputs, 1e6)
+        elif self.env.input_lbs is not None and self.env.input_ubs is None:
+            ocp.constraints.lbu = np.array(self.env.input_lbs)
+            ocp.constraints.ubu = np.full(self.dim_inputs, 1e6)
+        elif self.env.input_lbs is None and self.env.input_ubs is not None:
+            ocp.constraints.lbu = np.full(self.dim_inputs, -1e6)
+            ocp.constraints.ubu = np.array(self.env.input_ubs)
+        else:
+            ocp.constraints.lbu = np.array(self.env.input_lbs)
+            ocp.constraints.ubu = np.array(self.env.input_ubs)
+
+
+        ## Ocp Solver
+        # Set up Acados solver
+        self.ocp = ocp
+        self.solver = AcadosOcpSolver(ocp, json_file=f"{model.name}.json")
+
+        if self.verbose:
+            print("MPC setup with Acados completed.")
+
+    @check_input_constraints
+    def compute_action(self, current_state: np.ndarray, current_time) -> np.ndarray:
+        """
+        Solve the MPC problem and compute the optimal control action.
+
+        Args:
+        - current_state: The current state of the system.
+        - current_time: The current time (not used in this time-invariant case).
+
+        Returns:
+        - Optimal control action.
+        """
+
+        # Update initial state in the solver
+        self.solver.set(0, "lbx", current_state)
+        self.solver.set(0, "ubx", current_state)
+
+        # Update reference trajectory for all prediction steps
+        input_ref = np.zeros(self.dim_inputs)
+        ref_length = self.traj_ref.shape[0]
+
+        for i in range(self.N):
+            index = min(current_time + i, ref_length - 1)
+            state_ref = self.traj_ref[index, :self.dim_states]
+            self.solver.set(i, "yref", np.concatenate((state_ref, input_ref)))
+        index = min(current_time + self.N, ref_length - 1)
+        terminal_state_ref = self.traj_ref[index, :self.dim_states]
+        self.solver.set(self.N, "yref", terminal_state_ref)
+
+        # Solve the MPC problem
+        status = self.solver.solve()
+        #if status != 0:
+        #    raise ValueError(f"Acados solver failed with status {status}")
+
+        # Extract the first control action
+        u_optimal = self.solver.get(0, "u")
+
+        # Extract the predictions
+        x_pred = np.zeros((self.N + 1, self.dim_states))
+        u_pred = np.zeros((self.N, self.dim_inputs))
+        for i in range(self.N + 1):
+            x_pred[i, :] = self.solver.get(i, "x")
+            if i < self.N:
+                u_pred[i, :] = self.solver.get(i, "u")
+
+        if self.verbose:
+            print(f"Optimal control action: {u_optimal}")
+            print(f"x_pred: {x_pred}")
+            print(f"u_pred: {u_pred}")
+
+        return u_optimal, x_pred, u_pred
+    
+
+
+# Derived class for Tube-based Robust MPC Controller
+class LinearRMPCController(LQRController):
+    def __init__(
+            self, 
+            env: Env, 
+            dynamics: Dynamics, 
+            Q: np.ndarray, 
+            R: np.ndarray, 
+            Qf: np.ndarray, 
+            freq: float, 
+            N: int, 
+            K_feedback: Optional[np.ndarray] = None,  # Feedback gain for tube
+            disturbance_bounds: Optional[Tuple[np.ndarray, np.ndarray]] = None,  # (lbz, ubz) of D
+            max_iter: int = 10,  # Max iterations for invariant set computation
+            name: str = 'RMPC', 
+            type: str = 'RMPC', 
+            verbose: bool = True
+        ) -> None:
+
+        self.Qf = Qf
+
+        self.N = N  # Prediction horizon
+
+        self.ocp = None
+        self.solver = None
+
+        super().__init__(env, dynamics, Q, R, freq, name, type, verbose)
+
+        x0 = np.zeros(self.dynamics.dim_states)
+        u0 = np.zeros(self.dynamics.dim_inputs)
+        self.A, self.B = self.dynamics.get_linearized_AB_discrete(x0, u0, self.dt)
+
+        # Automatically solve DARE if no K provided
+        if K_feedback is None:
+            from scipy.linalg import solve_discrete_are
+            P = solve_discrete_are(self.A, self.B, Q, R)
+            self.K_feedback = -np.linalg.inv(R + self.B.T @ P @ self.B) @ self.B.T @ P @ self.A
+        else:
+            self.K_feedback = K_feedback
+
+        # Compute Omega_tube from disturbance box D 
+        if disturbance_bounds is not None:
+
+            disturbance_lbs = disturbance_bounds[0]
+            disturbance_ubs = disturbance_bounds[1]
+
+        elif self.env.disturbance_lbs is not None and self.env.disturbance_ubs is not None:
+
+            disturbance_lbs = self.env.disturbance_lbs
+            disturbance_ubs = self.env.disturbance_ubs
+            
+        else:
+            raise ValueError("No bounds of additive disturbances provided, can not initialize RMPC")
+        
+        disturbance_lbs /= freq
+        disturbance_ubs /= freq
+        
+        self.Omega_tube = self.compute_invariant_tube(self.A + self.B @ self.K_feedback, disturbance_lbs, disturbance_ubs, max_iter=max_iter)
+
+        # Create polytope for tighten state constraints
+        dim = len(self.env.state_lbs)
+        H_box = np.vstack([np.eye(dim), -np.eye(dim)])
+        h_box = np.hstack([self.env.state_ubs, -self.env.state_lbs])
+        self.X = pt.Polytope(H_box, h_box)
+        self.X_tighten = self.X - self.Omega_tube
+
+        # Create polytope for tighten input constraints
+        u_lbs_tighten = self.env.input_lbs + np.max(self.affine_map(self.Omega_tube, self.K_feedback).V, axis=0)
+        u_ubs_tighten = self.env.input_ubs + np.min(self.affine_map(self.Omega_tube, self.K_feedback).V, axis=0)
+        self.U_tighten = np.array([u_lbs_tighten, u_ubs_tighten])
+
+        self.tube_bounds_x = self.estimate_bounds_from_polytope(self.Omega_tube)
+        self.tube_bounds_u = np.abs(self.K_feedback @ self.tube_bounds_x)
+
+        if self.verbose:
+            print(f"Tighten state set X-Ω: {self.X_tighten.V}")
+            print(f"Tube size x: {self.tube_bounds_x}")
+            print(f"Tube size u: {self.tube_bounds_u}")
+
+        self.setup()
+    
+    def affine_map(self, poly: pt.Polytope, A: np.ndarray) -> pt.Polytope:
+        """Compute the affine image of a polytope under x ↦ A x"""
+
+        assert poly.V is not None, "No poly.V in Polytope! Can not apply affine map."
+
+        V = poly.V  # vertices
+        V_new = (A @ V.T).T
+
+        return pt.Polytope(V_new)
+        
+    def compute_invariant_tube(self, A_cl, lbz, ubz, tol=1e-4, max_iter=10) -> pt.Polytope:
+        """
+        Compute the robust positive invariant set Omega_tube using Minkowski recursion.
+
+        This implementation uses the `polytope` library's Minkowski sum and affine map.
+        """
+
+        # Step 1: Define initial disturbance set D (box)
+        dim = len(lbz)
+
+        # H-representation: H x ≤ h
+        H_box = np.vstack([np.eye(dim), -np.eye(dim)])
+        h_box = np.hstack([ubz, -lbz])
+
+        # Create polytope with both H-rep and V-rep
+        D = pt.Polytope(H_box, h_box)
+
+        # Step 2: Initialize Omega := D
+        Omega = D
+
+        for i in range(max_iter):
+            # Step 3: Apply affine map A_cl to Omega: A_cl * Omega
+            A_Omega = self.affine_map(Omega, A_cl)
+
+            # Step 4: Minkowski sum: Omega_next = A_Omega ⊕ D
+            Omega_next = A_Omega + D
+
+            # Step 5: Check convergence via bounding box approximation
+            bounds_old = self.estimate_bounds_from_polytope(Omega)
+            bounds_new = self.estimate_bounds_from_polytope(Omega_next)
+
+            if np.allclose(bounds_old, bounds_new, atol=tol):
+                return Omega_next  # Return as vertices
+
+            Omega = Omega_next
+
+        return Omega  # Max iteration reached, return current estimate
+
+    def estimate_bounds_from_polytope(self, poly: pt.Polytope):
+        """Estimate box bounds from polytope vertices (axis-aligned)."""
+        vertices = poly.V
+        return np.max(np.abs(vertices), axis=0)
+
+    def setup(self) -> None:
+
+        ## Model
+        # Set up Acados model
+        model = AcadosModel()
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        model.name = f"{self.name}_{timestamp}"
+
+        # Define model: x_dot = f(x, u)
+        model.x = self.dynamics.states
+        model.u = self.dynamics.inputs
+        model.f_expl_expr = ca.vertcat(self.dynamics.dynamics_function(self.dynamics.states, self.dynamics.inputs))
+        model.f_impl_expr = None # no needed, we already have the explicit model
+
+        ## Optimal control problem
+        # Set up Acados OCP
+        ocp = AcadosOcp()
+        ocp.model = model # link to the model (class: AcadosModel)
+        ocp.dims.N = self.N  # prediction horizon
+        ocp.solver_options.tf = self.N * self.dt  # total prediction time
+        ocp.solver_options.qp_solver = "FULL_CONDENSING_HPIPM" # Partially condensing interior-point method
+        ocp.solver_options.integrator_type = "ERK" # explicit Runge-Kutta
+        ocp.solver_options.nlp_solver_type = "SQP" # sequential quadratic programming
+
+        # Set up cost function
+        ocp.cost.cost_type = "LINEAR_LS"
+        ocp.cost.cost_type_e = "LINEAR_LS"
+        ocp.cost.W = np.block([
+            [self.Q, np.zeros((self.dim_states, self.dim_inputs))],
+            [np.zeros((self.dim_inputs, self.dim_states)), self.R],
+        ])
+        ocp.cost.W_e = self.Qf
+
+        # Set up mapping from QP to OCP
+        # Define output matrix for non-terminal state
+        ocp.cost.Vx = np.block([
+            [np.eye(self.dim_states)],
+            [np.zeros((self.dim_inputs, self.dim_states))]
+        ])
+        # Define breakthrough matrix for non-terminal state
+        ocp.cost.Vu = np.block([
+            [np.zeros((self.dim_states, self.dim_inputs))],
+            [np.eye(self.dim_inputs)]
+        ])
+        # Define output matrix for terminal state
+        ocp.cost.Vx_e = np.eye(self.dim_states)
+
+        # Initialize reference of task (stabilization)
+        ocp.cost.yref = np.concatenate((self.target_state, np.zeros(self.dim_inputs)))
+        ocp.cost.yref_e = self.target_state
+
+        # Input constraints
+        ocp.constraints.idxbu = np.arange(self.dim_inputs)
+
+        if self.env.input_lbs is None:
+            ocp.constraints.lbu = np.full(self.dim_inputs, -1e6)
+        else:
+            ocp.constraints.lbu = self.U_tighten[0]
+
+        if self.env.input_ubs is None:
+            ocp.constraints.ubu = np.full(self.dim_inputs, 1e6)
+        else:
+            ocp.constraints.ubu = self.U_tighten[1]
+
+        # Expand initial state constraints (not here, do online)
+        # Add Omega constraints on initial state x0: A x0 <= b
+        ocp.dims.nh_0 = self.Omega_tube.A.shape[0]
+        ocp.model.con_h_expr_0 = ca.mtimes(self.Omega_tube.A, ocp.model.x)
+        ocp.constraints.lh_0 = -1e6 * np.ones(self.Omega_tube.A.shape[0])
+        ocp.constraints.uh_0 = 1e6 * np.ones(self.Omega_tube.A.shape[0])  # placeholder
+
+        # Expand tighten state constraints 
+        ocp.dims.nh = self.X_tighten.A.shape[0]
+        ocp.dims.nh_e = self.X_tighten.A.shape[0]
+        ocp.model.con_h_expr = ca.mtimes(self.X_tighten.A, ocp.model.x)
+        ocp.model.con_h_expr_e = ca.mtimes(self.X_tighten.A, ocp.model.x)
+        ocp.constraints.lh = -1e6 * np.ones(self.X_tighten.A.shape[0])
+        ocp.constraints.lh_e = -1e6 * np.ones(self.X_tighten.A.shape[0])
+        ocp.constraints.uh = self.X_tighten.b.flatten()
+        ocp.constraints.uh_e = self.X_tighten.b.flatten()
+
+        # Recreate solver with tightened constraints
+        self.ocp = ocp
+        self.solver = AcadosOcpSolver(self.ocp, json_file=f"{self.name}.json", generate=True)
+        
+        if self.verbose:
+            print("Tube-based MPC setup with constraint tightening completed.")
+
+    @check_input_constraints
+    def compute_action(self, current_state: np.ndarray, current_time) -> np.ndarray:
+
+        # Set upper limit of convex set equality constraint on target step to be 0
+        lh_dynamic = self.Omega_tube.A @ current_state + self.Omega_tube.b.flatten()
+        self.solver.constraints_set(0, "uh", lh_dynamic)
+
+        status = self.solver.solve()
+
+        x_nominal = self.solver.get(0, "x")
+        u_nominal = self.solver.get(0, "u")
+
+        # Apply tube feedback control
+        u_real = u_nominal + self.K_feedback @ (current_state - x_nominal)
+
+        if self.verbose:
+            print("Current state:", current_state)
+            print("Nominal state:", x_nominal)
+            print("Nominal input:", u_nominal)
+            print("Tube-corrected input:", u_real)
+
+        # Also return nominal predictions
+        x_pred = np.zeros((self.N + 1, self.dim_states))
+        u_pred = np.zeros((self.N, self.dim_inputs))
+        for i in range(self.N + 1):
+            x_pred[i, :] = self.solver.get(i, "x")
+            if i < self.N:
+                u_pred[i, :] = self.solver.get(i, "u")
+
+        return u_real, x_pred, u_pred, u_nominal
+    
+    def plot_robust_invariant_set(self, lbz, ubz, tol=1e-4, max_iter=10):
+        
+        """
+        Plot the 2D invariant set (Ω). Assumes 2D state space.
+        """
+
+        # Plot
+        plt.figure(figsize=(6, 6))
+
+        def plot_polytope(Omega: pt.Polytope, label=None):
+            Omega_vertices = Omega.V
+            assert Omega_vertices.shape[1] == 2, "Only 2D invariant sets are supported."
+
+            # Convex hull of the Omega polytope
+            hull = ConvexHull(Omega_vertices)
+            hull_pts = Omega_vertices[hull.vertices]
+            hull_pts = np.vstack([hull_pts, hull_pts[0]])
+
+            plt.fill(hull_pts[:, 0], hull_pts[:, 1], color='red', alpha=0.1, label=label)
+            plt.plot(hull_pts[:, 0], hull_pts[:, 1], color='red', linewidth=2)
+
+        # Step 1: Define initial disturbance set D (box)
+        dim = len(ubz)
+
+        # H-representation: H x ≤ h
+        H_box = np.vstack([np.eye(dim), -np.eye(dim)])
+        h_box = np.hstack([ubz, -lbz])
+
+        # Create polytope with both H-rep and V-rep
+        D = pt.Polytope(H_box, h_box)
+
+        # Step 2: Initialize Omega := D
+        Omega = D
+        plot_polytope(Omega, label = "Ω")
+
+        A_cl = self.A + self.B @ self.K_feedback
+
+        for i in range(max_iter):
+            # Step 3: Apply affine map A_cl to Omega: A_cl * Omega
+            A_Omega = self.affine_map(Omega, A_cl)
+
+            # Step 4: Minkowski sum: Omega_next = A_Omega ⊕ D
+            Omega_next = A_Omega + D
+
+            # Step 5: Check convergence via bounding box approximation
+            bounds_old = self.estimate_bounds_from_polytope(Omega)
+            bounds_new = self.estimate_bounds_from_polytope(Omega_next)
+
+<<<<<<< HEAD
+        # Update initial state in the solver
+        self.solver.set(0, "lbx", current_state)
+        self.solver.set(0, "ubx", current_state)
+=======
+            if np.allclose(bounds_old, bounds_new, atol=tol):
+                return Omega_next  # Return as vertices
+
+            Omega = Omega_next
+            plot_polytope(Omega)
+
+        plt.title("Robust Invariant Set Ω")
+        plt.xlabel("Position p")
+        plt.ylabel("Velocity v")
+        plt.axis('equal')
+        plt.grid(True)
+        plt.legend()
+        plt.show()
+>>>>>>> origin/model-based-rl
+
+    def plot_tighten_state_set(self):
+       
+        X_tighten_vertices = self.X_tighten.V
+
+        assert X_tighten_vertices.shape[1] == 2, "Only 2D tighten sets are supported."
+
+        # Convex hull of the Omega polytope
+        hull = ConvexHull(X_tighten_vertices)
+        hull_pts = X_tighten_vertices[hull.vertices]
+
+        # Plot the original state constraints
+        X = np.array([
+            [self.env.state_lbs[0], self.env.state_lbs[1]],
+            [self.env.state_lbs[0], self.env.state_ubs[1]],
+            [self.env.state_ubs[0], self.env.state_ubs[1]],
+            [self.env.state_ubs[0], self.env.state_lbs[1]],
+            [self.env.state_lbs[0], self.env.state_lbs[1]]
+        ])
+
+        # Plot
+        plt.figure(figsize=(6, 6))
+        plt.fill(hull_pts[:, 0], hull_pts[:, 1], color='skyblue', alpha=0.5, label='X-Ω')
+        plt.plot(hull_pts[:, 0], hull_pts[:, 1], 'b-', linewidth=2)
+        plt.plot(X[:, 0], X[:, 1], 'r--', linewidth=2, label='X')
+
+        plt.title("Tighten state Set X-Ω and Original set X")
+        plt.xlabel("State x₁")
+        plt.ylabel("State x₂")
+        plt.axis('equal')
+        plt.grid(True)
+        plt.legend()
+        plt.show()
+
+    
+
+
+<<<<<<< HEAD
 
 class TrackingMPCController(LQRController):
     def __init__(
@@ -3141,6 +4006,8 @@ class LinearRMPCController(LQRController):
     
 
 
+=======
+>>>>>>> origin/model-based-rl
 # Derived class for RL Controller, solved by General Policy Iteration
 class GPIController(BaseController):
     def __init__(self, 
@@ -3152,7 +4019,11 @@ class GPIController(BaseController):
                  max_ite_pe: int = 50,
                  max_ite_pi: int = 100,
                  name: str = 'GPI', 
+<<<<<<< HEAD
                  type: str = 'GPI', 
+=======
+                 type: str = 'RL', 
+>>>>>>> origin/model-based-rl
                  verbose: bool = True
                  ) -> None:
         
@@ -3177,7 +4048,11 @@ class GPIController(BaseController):
         # Initialize policy and value function
         self.policy = np.zeros(self.dim_states, dtype=int)  # Initial policy: choose action 0 for all states
         self.value_function = np.zeros(self.dim_states)  # Initial value function
+
+        self.num_pe_iterations = 0
+        self.num_pi_iterations = 0
     
+    @timing
     def setup(self) -> None:
         """Perform GPI to compute the optimal policy."""
 
@@ -3186,56 +4061,10 @@ class GPIController(BaseController):
         for pi_iteration in range(self.max_ite_pi):
 
             # Policy Evaluation
-            for pe_iteration in range(self.max_ite_pe):
+            new_value_function, pe_iteration = self.policy_evaluation(new_value_function)
 
-                self.value_function = copy.copy(new_value_function)
-
-                new_value_function = np.zeros_like(self.value_function)
-                
-                for state_index in range(self.dim_states):
-
-                    action_index = self.policy[state_index]
-
-                    for next_state_index in range(self.dim_states):
-
-                        new_value_function[state_index] += self.mdp.T[action_index][state_index, next_state_index] * (
-                            self.mdp.R[action_index][state_index, next_state_index] + self.gamma * self.value_function[next_state_index]
-                        )
-
-                print(f"self.value_function: {self.value_function}")
-                print(f"new_value_function: {new_value_function}")
-
-                # Check for convergence in policy evaluation
-                if np.max(np.abs(new_value_function - self.value_function)) < self.precision_pe:
-                    if self.verbose:
-                        print(f"Policy evaluation converged after {pe_iteration + 1} iterations, max error: {np.max(np.abs(new_value_function - self.value_function))}.")
-                    break
-                elif self.verbose:
-                    print(f"Policy evaluation iteration {pe_iteration + 1}, max error: {np.max(np.abs(new_value_function - self.value_function))}")
-            
-            self.value_function = copy.copy(new_value_function)
-            
             # Policy Improvement
-            policy_stable = True
-            old_policy = copy.copy(self.policy)
-            for state_index in range(self.dim_states):
-                
-                q_values = np.zeros(self.dim_inputs)
-
-                # Compute Q-values for all actions
-                for action_index in range(self.dim_inputs):
-                    for next_state_index in range(self.dim_states):
-
-                        q_values[action_index] += self.mdp.T[action_index][state_index, next_state_index] * (
-                            self.mdp.R[action_index][state_index, next_state_index] + self.gamma * self.value_function[next_state_index]
-                        )
-
-                # Update policy greedily
-                self.policy[state_index] = np.argmax(q_values)
-
-                # Check for convergence in policy improvement
-                if old_policy[state_index] != self.policy[state_index]:
-                    policy_stable = False
+            policy_stable, old_policy = self.policy_improvement()
 
             # Check for convergence in policy improvement
             if policy_stable and np.max(np.abs(new_value_function - self.value_function)) < self.precision_pi:
@@ -3247,6 +4076,71 @@ class GPIController(BaseController):
                 print(f"Policy improvement iteration {pi_iteration + 1}, still not converged, keep running.")
                 print(f"Last Policy: {old_policy}")
                 print(f"Current Policy: {self.policy}")
+
+            self.num_pi_iterations += 1
+
+        print(f"Total policy evaluation iterations: {self.num_pe_iterations}")
+        print(f"Total policy improvement iterations: {self.num_pi_iterations}")
+
+    def policy_evaluation(self, new_value_function):
+        # Policy Evaluation
+        for pe_iteration in range(self.max_ite_pe):
+
+            self.value_function = copy.copy(new_value_function)
+
+            new_value_function = np.zeros_like(self.value_function)
+            
+            for state_index in range(self.dim_states):
+
+                action_index = self.policy[state_index]
+
+                for next_state_index in range(self.dim_states):
+
+                    new_value_function[state_index] += self.mdp.T[action_index][state_index, next_state_index] * (
+                        self.mdp.R[action_index][state_index, next_state_index] + self.gamma * self.value_function[next_state_index]
+                    )
+
+            print(f"self.value_function: {self.value_function}")
+            print(f"new_value_function: {new_value_function}")
+
+            self.num_pe_iterations += 1
+
+            # Check for convergence in policy evaluation
+            if np.max(np.abs(new_value_function - self.value_function)) < self.precision_pe:
+                if self.verbose:
+                    print(f"Policy evaluation converged after {pe_iteration + 1} iterations, max error: {np.max(np.abs(new_value_function - self.value_function))}.")
+                break
+            elif self.verbose:
+                print(f"Policy evaluation iteration {pe_iteration + 1}, max error: {np.max(np.abs(new_value_function - self.value_function))}")
+        
+        self.value_function = copy.copy(new_value_function)
+
+        return new_value_function, pe_iteration
+
+    def policy_improvement(self):
+        # Policy Improvement
+        policy_stable = True
+        old_policy = copy.copy(self.policy)
+        for state_index in range(self.dim_states):
+            
+            q_values = np.zeros(self.dim_inputs)
+
+            # Compute Q-values for all actions
+            for action_index in range(self.dim_inputs):
+                for next_state_index in range(self.dim_states):
+
+                    q_values[action_index] += self.mdp.T[action_index][state_index, next_state_index] * (
+                        self.mdp.R[action_index][state_index, next_state_index] + self.gamma * self.value_function[next_state_index]
+                    )
+
+            # Update policy greedily
+            self.policy[state_index] = np.argmax(q_values)
+
+            # Check for convergence in policy improvement
+            if old_policy[state_index] != self.policy[state_index]:
+                policy_stable = False
+
+        return policy_stable, old_policy
 
     @check_input_constraints
     def compute_action(self, current_state: np.ndarray, current_time) -> np.ndarray:
@@ -3268,11 +4162,13 @@ class GPIController(BaseController):
         """
         value_map = self.value_function.reshape(self.mdp.num_pos, self.mdp.num_vel)
         policy_map = self.policy.reshape(self.mdp.num_pos, self.mdp.num_vel)
+        # turn policy map into input map
+        input_map = self.mdp.input_space[self.policy].reshape(self.mdp.num_pos, self.mdp.num_vel)
 
         fig, axs = plt.subplots(1, 2, figsize=(12, 4))
 
         # Plot policy (U)
-        im1 = axs[0].imshow(policy_map, extent=[
+        im1 = axs[0].imshow(input_map, extent=[
             self.mdp.pos_partitions[0], self.mdp.pos_partitions[-1],
             self.mdp.vel_partitions[0], self.mdp.vel_partitions[-1]
         ], origin='lower', aspect='auto', cmap='viridis')
@@ -3305,10 +4201,10 @@ class QLearningController(BaseController):
                  epsilon_min: float = 0.01,
                  learning_rate: float = 0.2, 
                  gamma: float = 0.95,
-                 max_iterations: int = 1000, 
-                 max_steps_per_episode: int = 100, 
+                 max_iterations: int = 5000, 
+                 max_steps_per_episode: int = 500, 
                  name: str = 'Q-Learning', 
-                 type: str = 'Q-Learning', 
+                 type: str = 'RL', 
                  verbose: bool = True
                  ) -> None:
         
@@ -3321,239 +4217,6 @@ class QLearningController(BaseController):
         self.gamma = gamma
         self.max_iterations = max_iterations
         self.max_steps_per_episode = max_steps_per_episode
-
-        self.mdp = mdp
-
-        self.dim_states = self.mdp.num_states
-        self.dim_inputs = self.mdp.num_actions
-
-        self.init_state = self.env.init_state
-        self.target_state = self.env.target_state
-
-        # Initialize Q table with all 0s
-        self.Q = np.zeros((self.dim_states, self.dim_inputs)) 
-        
-        # Initialize policy as None
-        self.policy = np.zeros((self.dim_states)) 
-        self.value_function = np.zeros((self.dim_states)) 
-
-        # For training curve plotting
-        self.residual_rewards = []
-        self.epsilon_list = []
-        self.SR_100epoch = [] # Successful rounds
-        self.F_100epoch = [] # Failure rounds
-        self.TO_100epoch = [] # Time out rounds
-
-    def _get_action_probabilities(self, state_index: int) -> np.ndarray:
-        """Calculate the action probabilities using epsilon-soft policy."""
-
-        probabilities = np.ones(self.dim_inputs) * (self.epsilon / self.dim_inputs)
-        best_action = np.argmax(self.Q[state_index])
-        probabilities[best_action] += (1.0 - self.epsilon)
-
-        return probabilities
-
-    def setup(self) -> None:
-
-        for iteration in range(self.max_iterations):
-
-            total_reward = 0  # To accumulate rewards for this episode
-
-            if iteration % 100 == 0:
-
-                if iteration != 0:
-                    # Record the SR_100epoch, F_100epoch, TO_100epoch
-                    self.SR_100epoch.append(SR_100epoch)
-                    self.F_100epoch.append(F_100epoch)
-                    self.TO_100epoch.append(TO_100epoch)
-                
-                SR_100epoch = 0
-                F_100epoch = 0
-                TO_100epoch = 0
-
-            # Ramdomly choose a state to start
-            current_state_index = np.random.choice(self.dim_states)
-            current_state = self.mdp.state_space[:, current_state_index]
-
-            for step in range(self.max_steps_per_episode):
-
-                # Choose action based on epsilon-soft policy
-                action_probabilities = self._get_action_probabilities(current_state_index)
-                action_index = np.random.choice(np.arange(self.dim_inputs), p=action_probabilities)
-                current_input = self.mdp.input_space[action_index]
-
-                # Take action and observe the next state and reward
-                next_state, reward = self.mdp.one_step_forward(current_state, current_input)
-                next_state_index = self.mdp.nearest_state_index_lookup(next_state)
-                total_reward += reward  # Accumulate total reward
-                
-                if self.verbose:
-                    print(f"reward: {reward}")
-                    print(f"total_reward: {total_reward}")
-                    print(f"current_state: {current_state}, current_input: {current_input}, next_state: {next_state}, next_state_render: {self.mdp.state_space[:, next_state_index]}, reward: {reward}")
-
-                # Check if the episode is finished
-                terminate_condition_1 = False #next_state[0]==self.mdp.pos_partitions[-1]
-                terminate_condition_2 = False #next_state[0]==self.mdp.pos_partitions[0]
-                terminate_condition_3 = np.all(self.mdp.state_space[:, next_state_index]==self.target_state)
-
-                if terminate_condition_1 or terminate_condition_2 or terminate_condition_3:
-
-                    if terminate_condition_3:
-                        SR_100epoch += 1
-                    else:
-                        F_100epoch += 1
-
-                    if self.verbose:
-                        print(f"Iteration {iteration + 1}/{self.max_iterations}: finished successfully! epsilon: {self.epsilon:.4f}, residual reward: {total_reward:.2f}")
-                    
-                    break
-
-                else:
-                    # Update Q table
-                    q_update = reward + self.gamma * np.max(self.Q[next_state_index, :])
-                    self.Q[current_state_index, action_index] += self.learning_rate * (
-                        q_update - self.Q[current_state_index, action_index]
-                    )
-                    
-                    # Move to the next state
-                    current_state_index = next_state_index
-                    current_state = self.mdp.state_space[:, current_state_index]
-                
-                if step == self.max_steps_per_episode-1:
-                    TO_100epoch +=1
-                    if self.verbose:
-                        print(f"Iteration {iteration + 1}/{self.max_iterations}: time out! epsilon: {self.epsilon:.4f}, residual reward: {total_reward:.2f}")
-                    
-
-            # Decrease epsilon
-            self.epsilon *= self.k_epsilon
-            self.epsilon = max(self.epsilon, self.epsilon_min)
-            self.epsilon_list.append(self.epsilon)
-
-            # Record the residual reward
-            self.residual_rewards.append(total_reward)
-        
-        # Return the deterministic policy and value function
-        self.policy = np.argmax(self.Q, axis=1)
-        self.value_function = np.max(self.Q, axis=1)
-        
-        if self.verbose:
-            print("Training finished！")
-
-    @check_input_constraints
-    def compute_action(self, current_state: np.ndarray, current_time) -> np.ndarray:
-        """
-        Use the optimal policy to compute the action for the given state.
-        """
-        # Find the nearest discrete state index
-        state_index = self.mdp.nearest_state_index_lookup(current_state)
-        
-        # Get the optimal action from the policy
-        action_index = self.policy[state_index]
-        action = self.mdp.input_space[action_index]
-
-        return np.array([action])
-
-    def plot_heatmaps(self):
-        """
-        Visualize the policy and cost as a 2D state-value map.
-        """
-        value_map = self.value_function.reshape(self.mdp.num_pos, self.mdp.num_vel)
-        policy_map = self.policy.reshape(self.mdp.num_pos, self.mdp.num_vel)
-
-        fig, axs = plt.subplots(1, 2, figsize=(12, 4))
-
-        # Plot policy (U)
-        im1 = axs[0].imshow(policy_map, extent=[
-            self.mdp.pos_partitions[0], self.mdp.pos_partitions[-1],
-            self.mdp.vel_partitions[0], self.mdp.vel_partitions[-1]
-        ], origin='lower', aspect='auto', cmap='viridis')
-        axs[0].set_title('Optimal Policy')
-        axs[0].set_xlabel('Car Position')
-        axs[0].set_ylabel('Car Velocity')
-        fig.colorbar(im1, ax=axs[0], orientation='vertical')
-
-        # Plot cost-to-go (J)
-        im2 = axs[1].imshow(value_map, extent=[
-            self.mdp.pos_partitions[0], self.mdp.pos_partitions[-1],
-            self.mdp.vel_partitions[0], self.mdp.vel_partitions[-1]
-        ], origin='lower', aspect='auto', cmap='viridis')
-        axs[1].set_title('Optimal Cost')
-        axs[1].set_xlabel('Car Position')
-        axs[1].set_ylabel('Car Velocity')
-        fig.colorbar(im2, ax=axs[1], orientation='vertical')
-
-        plt.tight_layout()
-        plt.show()
-
-    def plot_training_curve(self):
-        """
-        Visualize the training curve of residual rewards and holdsignal for sr_100epoch in 2 figure.
-        """
-
-        self.SR_100epoch = np.repeat(self.SR_100epoch, 100)
-        self.F_100epoch = np.repeat(self.F_100epoch, 100)
-        self.TO_100epoch = np.repeat(self.TO_100epoch, 100)
-        
-        fig, axs = plt.subplots(1, 3, figsize=(12, 3))
-
-        # Plot residual rewards
-        axs[0].plot(self.residual_rewards)
-        axs[0].set_title('Total Rewards')
-        axs[0].set_xlabel('Iteration')
-        axs[0].set_ylabel('Total Reward')
-
-        # Plot epsilon
-        axs[1].plot(self.epsilon_list)
-        axs[1].set_title('Epsilon')
-        axs[1].set_xlabel('Iteration')
-        axs[1].set_ylabel('Epsilon')
-        axs[1].set_ylim(0, 1)
-
-        # Plot SR_100epoch, F_100epoch, TO_100epoch
-        axs[2].plot(self.SR_100epoch, label='Success rounds / 100Epoch')
-        axs[2].plot(self.F_100epoch, label='Fail rounds / 100Epoch')
-        axs[2].plot(self.TO_100epoch, label='Time out / 100Epoch')
-        axs[2].set_title('Statictics / 100 Epoch')
-        axs[2].set_xlabel('Iteration')
-        axs[2].set_ylabel('Number of rounds')
-        axs[2].set_ylim(0, 100)
-        axs[2].legend()
-
-
-        plt.tight_layout()
-        plt.show()
-
-
-# Derived class for RL Controller, solved by MCRL
-class MCRLController(BaseController):
-    def __init__(self, 
-                 mdp: Env_rl_d, 
-                 freq: float, 
-                 epsilon: float = 0.3, 
-                 k_epsilon: float = 0.99, 
-                 epsilon_min: float = 0.01,
-                 learning_rate: float = 0.2, 
-                 gamma: float = 0.95,
-                 max_iterations: int = 1000, 
-                 max_steps_per_episode: int = 100, 
-                 name: str = 'MCRL', 
-                 type: str = 'MCRL', 
-                 verbose: bool = True
-                 ) -> None:
-        
-        super().__init__(mdp, mdp.dynamics, freq, name, type, verbose)
-
-        self.epsilon = epsilon  # exploration rate
-        self.k_epsilon = k_epsilon  # decay factor for exploration rate
-        self.epsilon_min = epsilon_min
-        self.learning_rate = learning_rate
-        self.gamma = gamma
-        self.max_iterations = max_iterations
-        self.max_steps_per_episode = max_steps_per_episode
-
-        self.mode = "every_visit"  # "first_visit" or "every_visit"
 
         self.mdp = mdp
 
@@ -3573,10 +4236,12 @@ class MCRLController(BaseController):
 
         # For training curve plotting
         self.residual_rewards = []
+        self.residual_rewards_smoothed = None
+        self.step_list = []
         self.epsilon_list = []
-        self.SR_100epoch = [] # Successful rounds
-        self.F_100epoch = [] # Failure rounds
-        self.TO_100epoch = [] # Time out rounds
+        self.SR_100epsd = [] # Successful rounds
+        self.F_100epsd = [] # Failure rounds
+        self.TO_100epsd = [] # Time out rounds
 
     def _get_action_probabilities(self, state_index: int) -> np.ndarray:
         """Calculate the action probabilities using epsilon-soft policy."""
@@ -3591,27 +4256,36 @@ class MCRLController(BaseController):
 
         for iteration in range(self.max_iterations):
 
-            episode = []  # storage state, action and reward for current episode
-            total_reward = 0  # total reward for current episode
+            total_reward = 0  # To accumulate rewards for this episode
+            total_steps = 0  # To count total steps in this episode
 
             if iteration % 100 == 0:
 
                 if iteration != 0:
-                    # Record the SR_100epoch, F_100epoch, TO_100epoch
-                    self.SR_100epoch.append(SR_100epoch)
-                    self.F_100epoch.append(F_100epoch)
-                    self.TO_100epoch.append(TO_100epoch)
+                    # Record the SR_100epsd, F_100epsd, TO_100epsd
+                    self.SR_100epsd.append(SR_100epsd)
+                    self.F_100epsd.append(F_100epsd)
+                    self.TO_100epsd.append(TO_100epsd)
                 
-                SR_100epoch = 0
-                F_100epoch = 0
-                TO_100epoch = 0
+                SR_100epsd = 0
+                F_100epsd = 0
+                TO_100epsd = 0
 
+            # Start from init state
+            # Note: Here we restrict initial state distribution to boost the training but one can also 
+            #       randomly initialize state given sufficient interaction to improve the generalization.
+            current_state = self.mdp.init_state
+            current_state_index = self.mdp.nearest_state_index_lookup(current_state)
             # Randomly choose a state to start
-            current_state_index = np.random.choice(self.dim_states)
-            current_state = self.mdp.state_space[:, current_state_index]
-            
-            # Generate an episode
+            #current_state_index = np.random.choice(self.dim_states)
+            #current_state = self.mdp.state_space[:, current_state_index]
+            # Randomly choose a position with 0 vel to start
+            #current_pos_index = np.random.choice(self.mdp.num_pos)
+            #current_state = np.array([self.mdp.pos_partitions[current_pos_index], 0.0])
+            #current_state_index = self.mdp.nearest_state_index_lookup(current_state)
+
             for step in range(self.max_steps_per_episode):
+
                 # Choose action based on epsilon-soft policy
                 action_probabilities = self._get_action_probabilities(current_state_index)
                 action_index = np.random.choice(np.arange(self.dim_inputs), p=action_probabilities)
@@ -3620,69 +4294,71 @@ class MCRLController(BaseController):
                 # Take action and observe the next state and reward
                 next_state, reward = self.mdp.one_step_forward(current_state, current_input)
                 next_state_index = self.mdp.nearest_state_index_lookup(next_state)
-                total_reward += reward
+                total_reward += reward  # Accumulate total reward
+                total_steps += 1  # Increment step count
+                
+                # Update Q table and compute TD error
+                td_error = reward + self.gamma * np.max(self.Q[next_state_index, :]) - self.Q[current_state_index, action_index]
 
-                # Store the state, action and reward for this step
-                episode.append((current_state_index, action_index, reward))
+                # Factor in recursive estimation
+                self.state_action_counts[current_state_index, action_index] += 1
+                alpha = self.learning_rate
+                #alpha = 1.0 / self.state_action_counts[current_state_index, action_index]
 
+                # Update Q table and log TD error
+                self.Q[current_state_index, action_index] += alpha * td_error
+                
                 # Check if the episode is finished
-                terminate_condition_1 = False#next_state[0]==self.mdp.pos_partitions[-1]
-                terminate_condition_2 = False#next_state[0]==self.mdp.pos_partitions[0]
+<<<<<<< HEAD
+                terminate_condition_1 = False #next_state[0]==self.mdp.pos_partitions[-1]
+                terminate_condition_2 = False #next_state[0]==self.mdp.pos_partitions[0]
+=======
+                terminate_condition_1 = next_state[0]>self.mdp.pos_partitions[-1]
+                terminate_condition_2 = next_state[0]<self.mdp.pos_partitions[0]
+>>>>>>> origin/model-based-rl
                 terminate_condition_3 = np.all(self.mdp.state_space[:, next_state_index]==self.target_state)
 
                 if terminate_condition_1 or terminate_condition_2 or terminate_condition_3:
-
                     if terminate_condition_3:
-                        SR_100epoch += 1
+                        SR_100epsd += 1
+                        if self.verbose:
+                            print(f"Iteration {iteration + 1}/{self.max_iterations}: finished successfully at step {step}! epsilon: {self.epsilon:.4f}, residual reward: {total_reward:.2f}")
                     else:
-                        F_100epoch += 1
-
-                    if self.verbose:
-                        print(f"Iteration {iteration + 1}/{self.max_iterations}: finished successfully! epsilon: {self.epsilon:.4f}, residual reward: {total_reward:.2f}")
-                    
+                        F_100epsd += 1
+                        if self.verbose:
+                            print(f"Iteration {iteration + 1}/{self.max_iterations}: episode failed at step {step}! epsilon: {self.epsilon:.4f}, residual reward: {total_reward:.2f}")
                     break
 
-                if step == self.max_steps_per_episode-1:
-                    TO_100epoch +=1
-                    if self.verbose:
-                        print(f"Iteration {iteration + 1}/{self.max_iterations}: time out! epsilon: {self.epsilon:.4f}, residual reward: {total_reward:.2f}")
+                else:
                     
-                # Move to the next state
-                current_state_index = next_state_index
-                current_state = self.mdp.state_space[:, current_state_index]
-
-            # Update Q table using Monte Carlo method
-            G = 0  # Return
-            if self.mode == "first_visit":
-                visited = set()
-
-            for state_index, action_index, reward in reversed(episode):
-                G = reward + self.gamma * G
+                    # Move to the next state
+                    current_state_index = next_state_index
+                    current_state = self.mdp.state_space[:, current_state_index]
                 
-                 # update Q table
-                if self.mode == "first_visit" and (state_index, action_index) not in visited:
-                    visited.add((state_index, action_index))
-                    self.state_action_counts[state_index, action_index] += 1
-                    alpha = 1.0 / self.state_action_counts[state_index, action_index]
-                    self.Q[state_index, action_index] += alpha * (G - self.Q[state_index, action_index])
-
-                elif self.mode == "every_visit":
-                    self.state_action_counts[state_index, action_index] += 1
-                    alpha = 1.0 / self.state_action_counts[state_index, action_index]
-                    self.Q[state_index, action_index] += alpha * (G - self.Q[state_index, action_index])
+                if step == self.max_steps_per_episode-1:
+                    TO_100epsd +=1
+                    if self.verbose:
+                        print(f"Iteration {iteration + 1}/{self.max_iterations}: time out (step: {step})! epsilon: {self.epsilon:.4f}, residual reward: {total_reward:.2f}")
+                    
 
             # Decrease epsilon
             self.epsilon *= self.k_epsilon
             self.epsilon = max(self.epsilon, self.epsilon_min)
             self.epsilon_list.append(self.epsilon)
 
-            # Record the residual reward
+            # Record the residual reward and loss
             self.residual_rewards.append(total_reward)
-
+            self.step_list.append(total_steps)
+        
         # Return the deterministic policy and value function
         self.policy = np.argmax(self.Q, axis=1)
         self.value_function = np.max(self.Q, axis=1)
 
+        # Repeat success/failure stats for plotting
+        self.SR_100epsd = np.repeat(self.SR_100epsd, 100)/100
+        self.F_100epsd = np.repeat(self.F_100epsd, 100)/100
+        self.TO_100epsd = np.repeat(self.TO_100epsd, 100)/100
+        
         if self.verbose:
             print("Training finished！")
 
@@ -3700,78 +4376,451 @@ class MCRLController(BaseController):
 
         return np.array([action])
 
-    def plot_heatmaps(self):
-        """
-        Visualize the policy and cost as a 2D state-value map.
-        """
-        value_map = self.value_function.reshape(self.mdp.num_pos, self.mdp.num_vel)
-        policy_map = self.policy.reshape(self.mdp.num_pos, self.mdp.num_vel)
+    def postprocessing(self, window=20):
 
-        fig, axs = plt.subplots(1, 2, figsize=(12, 4))
-
-        # Plot policy (U)
-        im1 = axs[0].imshow(policy_map, extent=[
-            self.mdp.pos_partitions[0], self.mdp.pos_partitions[-1],
-            self.mdp.vel_partitions[0], self.mdp.vel_partitions[-1]
-        ], origin='lower', aspect='auto', cmap='viridis')
-        axs[0].set_title('Optimal Policy')
-        axs[0].set_xlabel('Car Position')
-        axs[0].set_ylabel('Car Velocity')
-        fig.colorbar(im1, ax=axs[0], orientation='vertical')
-
-        # Plot cost-to-go (J)
-        im2 = axs[1].imshow(value_map, extent=[
-            self.mdp.pos_partitions[0], self.mdp.pos_partitions[-1],
-            self.mdp.vel_partitions[0], self.mdp.vel_partitions[-1]
-        ], origin='lower', aspect='auto', cmap='viridis')
-        axs[1].set_title('Optimal Cost')
-        axs[1].set_xlabel('Car Position')
-        axs[1].set_ylabel('Car Velocity')
-        fig.colorbar(im2, ax=axs[1], orientation='vertical')
-
-        plt.tight_layout()
-        plt.show()
-
-    def plot_training_curve(self):
-        """
-        Visualize the training curve of residual rewards and holdsignal for sr_100epoch in 2 figure.
-        """
-
-        self.SR_100epoch = np.repeat(self.SR_100epoch, 100)
-        self.F_100epoch = np.repeat(self.F_100epoch, 100)
-        self.TO_100epoch = np.repeat(self.TO_100epoch, 100)
+        def moving_average(data, window=20):
+            """Return moving average and std of a 1D array"""
+            data = np.array(data)
+            if window <= 1:
+                return data.copy()
+            
+            kernel = np.ones(window)
+            z = np.ones(len(data))        
+            smoothed = np.convolve(data, kernel, mode='same') / np.convolve(z, kernel, mode='same')
+            return smoothed
         
+        # Smooth reward curve
+        self.residual_rewards_smoothed = moving_average(self.residual_rewards, window)
+
+        return self.residual_rewards_smoothed, self.SR_100epsd
+        
+    def plot_training_curve(self, title = None):
+        """
+        Visualize the training curve of residual rewards with smoothed version and confidence band,
+        and holdsignal for sr_100epsd in 2 other figures.
+        """
+
         fig, axs = plt.subplots(1, 3, figsize=(12, 3))
 
-        # Plot residual rewards
-        axs[0].plot(self.residual_rewards)
+        # Plot residual rewards + smooth + confidence band
+        if self.residual_rewards_smoothed is not None and len(self.residual_rewards_smoothed):
+            axs[0].plot(self.residual_rewards, alpha=0.3, label="Raw reward")
+            axs[0].plot(self.residual_rewards_smoothed, label="Smoothed", color="C0")
+        else:
+            axs[0].plot(self.residual_rewards, label="Raw reward")
         axs[0].set_title('Total Rewards')
-        axs[0].set_xlabel('Iteration')
+        axs[0].set_xlabel('Episode')
         axs[0].set_ylabel('Total Reward')
+        axs[0].legend()
+
+        # Plot success/fail/time-out rounds
+        axs[1].plot(self.SR_100epsd, label='Success rounds')
+        axs[1].plot(self.F_100epsd, label='Fail rounds')
+        axs[1].plot(self.TO_100epsd, label='Time out')
+        axs[1].set_title('Statistics per 100 Episodes')
+        axs[1].set_xlabel('Episode')
+        axs[1].set_ylabel('Percentage of Trails')
+        axs[1].set_ylim(0, 1)
+        axs[1].legend()
 
         # Plot epsilon
-        axs[1].plot(self.epsilon_list)
-        axs[1].set_title('Epsilon')
-        axs[1].set_xlabel('Iteration')
-        axs[1].set_ylabel('Epsilon')
+        axs[-1].plot(self.epsilon_list)
+        axs[-1].set_title('Epsilon')
+        axs[-1].set_xlabel('Episode')
+        axs[-1].set_ylabel('Epsilon')
+        axs[-1].set_ylim(0, 1)
+
+        if title is not None:
+            fig.suptitle(title, fontsize=12, fontweight='bold', y=1.05)
+        plt.tight_layout()
+        plt.show()
+
+
+
+# Derived class for RL Controller, solved by MCRL
+class MCRLController(BaseController):
+    def __init__(self, 
+                 mdp: Env_rl_d, 
+                 freq: float, 
+                 epsilon: float = 0.3, 
+                 k_epsilon: float = 0.99, 
+                 epsilon_min: float = 0.01,
+                 learning_rate: float = 0.2, 
+                 gamma: float = 0.95,
+                 max_iterations: int = 5000, 
+                 max_steps_per_episode: int = 500, 
+                 name: str = 'MCRL', 
+                 type: str = 'RL', 
+                 verbose: bool = True
+                 ) -> None:
+        
+        super().__init__(mdp, mdp.dynamics, freq, name, type, verbose)
+
+        self.epsilon = epsilon  # exploration rate
+        self.k_epsilon = k_epsilon  # decay factor for exploration rate
+        self.epsilon_min = epsilon_min
+        self.learning_rate = learning_rate
+        self.gamma = gamma
+        self.max_iterations = max_iterations
+        self.max_steps_per_episode = max_steps_per_episode
+
+        self.mdp = mdp
+
+        self.dim_states = self.mdp.num_states
+        self.dim_inputs = self.mdp.num_actions
+
+        self.init_state = self.env.init_state
+        self.target_state = self.env.target_state
+
+        # Initialize Q table with all 0s
+        self.Q = np.zeros((self.dim_states, self.dim_inputs)) 
+        self.state_action_counts = np.zeros((self.dim_states, self.dim_inputs))
+        
+        # Initialize policy as None
+        self.policy = np.zeros((self.dim_states)) 
+        self.value_function = np.zeros((self.dim_states)) 
+
+        # For training curve plotting
+        self.residual_rewards = []
+        self.residual_rewards_smoothed = None
+        self.step_list = []
+        self.epsilon_list = []
+        self.SR_100epsd = [] # Successful rounds
+        self.F_100epsd = [] # Failure rounds
+        self.TO_100epsd = [] # Time out rounds
+
+    def _get_action_probabilities(self, state_index: int) -> np.ndarray:
+        """Calculate the action probabilities using epsilon-soft policy."""
+
+        probabilities = np.ones(self.dim_inputs) * (self.epsilon / self.dim_inputs)
+        best_action = np.argmax(self.Q[state_index, :])
+        probabilities[best_action] += (1.0 - self.epsilon)
+
+        return probabilities
+
+    def setup(self) -> None:
+
+        for iteration in range(self.max_iterations):
+
+            episode = []  # storage state, action and reward for current episode
+            total_reward = 0  # total reward for current episode
+            total_steps = 0  # total steps for current episode
+
+            if iteration % 100 == 0:
+
+                if iteration != 0:
+                    # Record the SR_100epsd, F_100epsd, TO_100epsd
+                    self.SR_100epsd.append(SR_100epsd)
+                    self.F_100epsd.append(F_100epsd)
+                    self.TO_100epsd.append(TO_100epsd)
+                
+                SR_100epsd = 0
+                F_100epsd = 0
+                TO_100epsd = 0
+
+            # Start from init state
+            # Note: Here we restrict initial state distribution to boost the training but one can also 
+            #       randomly initialize state given sufficient interaction to improve the generalization.
+            current_state = self.mdp.init_state
+            current_state_index = self.mdp.nearest_state_index_lookup(current_state)
+            # Randomly choose a state to start
+            #current_state_index = np.random.choice(self.dim_states)
+            #current_state = self.mdp.state_space[:, current_state_index]
+            # Randomly choose a position with 0 vel to start
+            #current_pos_index = np.random.choice(self.mdp.num_pos)
+            #current_state = np.array([self.mdp.pos_partitions[current_pos_index], 0.0])
+            #current_state_index = self.mdp.nearest_state_index_lookup(current_state)
+            
+            # Generate an episode
+            for step in range(self.max_steps_per_episode):
+                # Choose action based on epsilon-soft policy
+                action_probabilities = self._get_action_probabilities(current_state_index)
+                action_index = np.random.choice(np.arange(self.dim_inputs), p=action_probabilities)
+                current_input = self.mdp.input_space[action_index]
+
+                # Take action and observe the next state and reward
+                next_state, reward = self.mdp.one_step_forward(current_state, current_input)
+                next_state_index = self.mdp.nearest_state_index_lookup(next_state)
+                total_reward += reward
+                total_steps += 1 
+
+                # Store the state, action and reward for this step
+                episode.append((current_state_index, action_index, reward))
+
+                # Check if the episode is finished
+                terminate_condition_1 = next_state[0]>self.mdp.pos_partitions[-1]
+                terminate_condition_2 = next_state[0]<self.mdp.pos_partitions[0]
+                terminate_condition_3 = np.all(self.mdp.state_space[:, next_state_index]==self.target_state)
+                
+                if terminate_condition_1 or terminate_condition_2 or terminate_condition_3:
+                    if terminate_condition_3:
+                        SR_100epsd += 1
+                        if self.verbose:
+                            print(f"Iteration {iteration + 1}/{self.max_iterations}: finished successfully at step {step}! epsilon: {self.epsilon:.4f}, residual reward: {total_reward:.2f}")
+                    else:
+                        F_100epsd += 1
+                        if self.verbose:
+                            print(f"Iteration {iteration + 1}/{self.max_iterations}: episode failed at step {step}! epsilon: {self.epsilon:.4f}, residual reward: {total_reward:.2f}")
+                    break
+
+                if step == self.max_steps_per_episode-1:
+                    TO_100epsd +=1
+                    if self.verbose:
+                        print(f"Iteration {iteration + 1}/{self.max_iterations}: time out (step: {step})! epsilon: {self.epsilon:.4f}, residual reward: {total_reward:.2f}")
+                    
+                # Move to the next state
+                current_state_index = next_state_index
+                current_state = self.mdp.state_space[:, current_state_index]
+
+            # Update Q table using Monte Carlo method
+            G = 0  # Return
+            for state_index, action_index, reward in reversed(episode):
+                # Cumulative return
+                G = reward + self.gamma * G
+                
+                # Factor in recursive estimation
+                self.state_action_counts[state_index, action_index] += 1
+                alpha = self.learning_rate
+                #alpha = 1.0 / self.state_action_counts[state_index, action_index]
+
+                # Update Q using MC and log TD error
+                td_error = G - self.Q[state_index, action_index]
+                self.Q[state_index, action_index] += alpha * td_error
+
+            # Decrease epsilon
+            self.epsilon *= self.k_epsilon
+            self.epsilon = max(self.epsilon, self.epsilon_min)
+            self.epsilon_list.append(self.epsilon)
+
+            # Record the residual reward and loss
+            self.residual_rewards.append(total_reward)
+            self.step_list.append(total_steps)
+
+        # Return the deterministic policy and value function
+        self.policy = np.argmax(self.Q, axis=1)
+        self.value_function = np.max(self.Q, axis=1)
+
+        # Repeat success/failure stats for plotting
+        self.SR_100epsd = np.repeat(self.SR_100epsd, 100)/100
+        self.F_100epsd = np.repeat(self.F_100epsd, 100)/100
+        self.TO_100epsd = np.repeat(self.TO_100epsd, 100)/100
+
+        if self.verbose:
+            print("Training finished！")
+
+    @check_input_constraints
+    def compute_action(self, current_state: np.ndarray, current_time) -> np.ndarray:
+        """
+        Use the optimal policy to compute the action for the given state.
+        """
+        # Find the nearest discrete state index
+        state_index = self.mdp.nearest_state_index_lookup(current_state)
+        
+        # Get the optimal action from the policy
+        action_index = self.policy[state_index]
+        action = self.mdp.input_space[action_index]
+
+        return np.array([action])
+    
+    def postprocessing(self, window=20):
+
+        def moving_average(data, window=20):
+            """Return moving average and std of a 1D array"""
+            data = np.array(data)
+            if window <= 1:
+                return data.copy()
+            
+            kernel = np.ones(window)
+            z = np.ones(len(data))        
+            smoothed = np.convolve(data, kernel, mode='same') / np.convolve(z, kernel, mode='same')
+            return smoothed
+        
+        # Smooth reward curve
+        self.residual_rewards_smoothed = moving_average(self.residual_rewards, window)
+
+        return self.residual_rewards_smoothed, self.SR_100epsd
+        
+    def plot_training_curve(self, title=None):
+        """
+        Visualize the training curve of residual rewards with smoothed version and confidence band,
+        and holdsignal for sr_100epsd in 2 other figures.
+        """
+
+        fig, axs = plt.subplots(1, 3, figsize=(12, 3))
+
+        # Plot residual rewards + smooth + confidence band
+        if self.residual_rewards_smoothed is not None and len(self.residual_rewards_smoothed):
+            axs[0].plot(self.residual_rewards, alpha=0.3, label="Raw reward")
+            axs[0].plot(self.residual_rewards_smoothed, label="Smoothed", color="C0")
+        else:
+            axs[0].plot(self.residual_rewards, label="Raw reward")
+        axs[0].set_title('Total Rewards')
+        axs[0].set_xlabel('Episode')
+        axs[0].set_ylabel('Total Reward')
+        axs[0].legend()
+
+        # Plot success/fail/time-out rounds
+        axs[1].plot(self.SR_100epsd, label='Success rounds')
+        axs[1].plot(self.F_100epsd, label='Fail rounds')
+        axs[1].plot(self.TO_100epsd, label='Time out')
+        axs[1].set_title('Statistics per 100 Episodes')
+        axs[1].set_xlabel('Episode')
+        axs[1].set_ylabel('Percentage of Trails')
         axs[1].set_ylim(0, 1)
+        axs[1].legend()
 
-        # Plot SR_100epoch, F_100epoch, TO_100epoch
-        axs[2].plot(self.SR_100epoch, label='Success rounds / 100Epoch')
-        axs[2].plot(self.F_100epoch, label='Fail rounds / 100Epoch')
-        axs[2].plot(self.TO_100epoch, label='Time out / 100Epoch')
-        axs[2].set_title('Statictics / 100 Epoch')
-        axs[2].set_xlabel('Iteration')
-        axs[2].set_ylabel('Number of rounds')
-        axs[2].set_ylim(0, 100)
-        axs[2].legend()
+        # Plot epsilon
+        axs[-1].plot(self.epsilon_list)
+        axs[-1].set_title('Epsilon')
+        axs[-1].set_xlabel('Episode')
+        axs[-1].set_ylabel('Epsilon')
+        axs[-1].set_ylim(0, 1)
 
+        if title is not None:
+            fig.suptitle(title, fontsize=12, fontweight='bold', y=1.05)
+        plt.tight_layout()
+        plt.show()
+
+    
+
+
+<<<<<<< HEAD
+=======
+class RLExperimentRunner:
+    def __init__(self, controller_instances, seed_list, save_dir):
+        """
+        controller_instances: dict mapping controller name to a single controller instance (template)
+        seed_list: list of seeds to use for all controllers
+        save_dir: directory to save results
+        """
+        self.controller_instances = controller_instances  # e.g., {"mcrl": controller_obj, ...}
+        self.seed_list = seed_list
+        self.save_dir = save_dir
+        os.makedirs(save_dir, exist_ok=True)
+
+    def run_all(self):
+        for name, controller_template in self.controller_instances.items():
+            for seed in self.seed_list:
+                save_path = os.path.join(self.save_dir, f"{name}_seed{seed}.npz")
+                if os.path.exists(save_path):
+                    print(f"[Skipped] {save_path} already exists.")
+                    continue
+
+                np.random.seed(seed)
+                controller_copy = copy.deepcopy(controller_template)
+                controller_copy.setup()
+                reward,  SR = controller_copy.postprocessing(window=50)
+
+                np.savez(save_path, reward=reward, success_rate=SR, policy=controller_copy.policy)
+                print(f"[Saved] {save_path}")
+
+    def load_results(self):
+        result_dict = {}
+        for name in self.controller_instances.keys():
+            all_rewards = []
+            all_success_rates = []
+            for seed in self.seed_list:
+                file_path = os.path.join(self.save_dir, f"{name}_seed{seed}.npz")
+                if not os.path.exists(file_path):
+                    print(f"[Warning] Missing file: {file_path}, skipping.")
+                    continue
+                data = np.load(file_path)
+                all_rewards.append(data['reward'])
+                all_success_rates.append(data['success_rate'])
+            result_dict[name] = {
+                'reward': np.vstack(all_rewards),
+                'success_rate': np.vstack(all_success_rates)
+            }
+        return result_dict
+    
+    def get_trained_controller(self, name: str, seed: int):
+        """
+        Return a deepcopy of the template controller whose .policy has been
+        replaced by the stored one for (name, seed). If the file is absent,
+        raise FileNotFoundError.
+        """
+        f = os.path.join(self.save_dir, f"{name}_seed{seed}.npz")
+        if not os.path.exists(f):
+            raise FileNotFoundError(f"No saved data for {name}, seed {seed}")
+
+        data = np.load(f, allow_pickle=True)
+        policy_np = data["policy"]
+
+        ctrl = copy.deepcopy(self.controller_instances[name])
+        ctrl.policy = policy_np
+        return ctrl
+
+    def compute_statistics(self):
+        results = self.load_results()
+        stats = {}
+        for name, data in results.items():
+            reward = data['reward']
+            success = data['success_rate']
+            stats[name] = {
+                'reward_mean': np.mean(reward, axis=0),
+                'reward_std': np.std(reward, axis=0),
+                'reward_mean_min': np.min(reward, axis=0),
+                'reward_mean_max': np.max(reward, axis=0),
+                'success_mean': np.mean(success, axis=0),
+                'success_std': np.std(success, axis=0),
+                'success_mean_min': np.min(success, axis=0),
+                'success_mean_max': np.max(success, axis=0)
+            }
+        return stats
+
+    def plot(self, title=None):
+        stats = self.compute_statistics()
+        # x‑axes per metric can differ in length – compute individually later
+        fig, (ax_r, ax_sr) = plt.subplots(1, 2, figsize=(14, 5))
+
+        # ------- Reward subplot --------
+        for name, val in stats.items():
+            x_r = np.arange(len(val['reward_mean']))
+            ax_r.plot(x_r, val['reward_mean'], label=f"{name} Reward")
+            if len(self.seed_list) > 1:
+                ax_r.fill_between(x_r,
+                                val['reward_mean'] - 3 * val['reward_std'],
+                                val['reward_mean'] + 3 * val['reward_std'], alpha=0.3)
+                                #val['reward_mean_min'],
+                                #val['reward_mean_max'], alpha=0.3)
+        if len(self.seed_list) > 1:
+            ax_r.set_title("Reward Curve: Mean ± 3 * Std")
+        else:
+            ax_r.set_title("Reward Curve")
+        ax_r.set_xlabel("Episode")
+        ax_r.set_ylabel("Reward")
+        ax_r.grid(True)
+        ax_r.legend()
+
+        # ------- Success‑rate subplot --------
+        for name, val in stats.items():
+            x_sr = np.arange(len(val['success_mean']))
+            ax_sr.plot(x_sr, val['success_mean'], label=f"{name} Success Rate")
+            if len(self.seed_list) > 1:
+                ax_sr.fill_between(x_sr,
+                                val['success_mean'] - 3 * val['success_std'],
+                                val['success_mean'] + 3 * val['success_std'], alpha=0.3)
+                                #val['success_mean_min'],
+                                #val['success_mean_max'], alpha=0.3)
+        if len(self.seed_list) > 1:
+            ax_sr.set_title("Success Rate: Mean ± 3 * Std")
+        else:
+            ax_sr.set_title("Success Rate")
+        ax_sr.set_xlabel("Episode")
+        ax_sr.set_ylabel("Success Rate")
+        ax_sr.grid(True)
+        ax_sr.legend()
+
+        if title is not None:
+            fig.suptitle(title, fontsize=20, fontweight='bold', y=1.05)
 
         plt.tight_layout()
         plt.show()
 
 
 
+
+>>>>>>> origin/model-based-rl
 class Simulator:
     def __init__(
         self,
@@ -3833,6 +4882,7 @@ class Simulator:
 
         for current_time in self.t_eval[:-1]:
 
+<<<<<<< HEAD
             # Get current state, and call controller to calculate input
             if self.controller.type == 'MPC':
                 input_cmd, state_pred, input_pred = self.controller.compute_action(current_state, self.counter)
@@ -3850,6 +4900,35 @@ class Simulator:
             current_input = input_cmd
                 
             current_state = self.dynamics.one_step_forward(current_state, current_input, self.dt)
+=======
+            # In RL case, once the target is reached, stop the car at target position forever
+            if self.controller.type == 'RL':
+                pos_bin = (self.controller.mdp.pos_ubs-self.controller.mdp.pos_lbs)/self.controller.mdp.num_pos
+                if np.linalg.norm(current_state[0]-self.env.target_position) < pos_bin/2:
+                    current_input = 0.0
+                    current_state = self.env.target_state
+                else:
+                    input_cmd = self.controller.compute_action(current_state, self.counter)
+                    current_input = input_cmd
+                    current_state = self.dynamics.one_step_forward(current_state, current_input, self.dt)
+            else:
+                # Get current state, and call controller to calculate input
+                if self.controller.type == 'MPC':
+                    input_cmd, state_pred, input_pred = self.controller.compute_action(current_state, self.counter)
+                    # Log the predictions
+                    self.state_pred_traj.append(state_pred)
+                    self.input_pred_traj.append(input_pred)
+                elif self.controller.type == 'RMPC':
+                    input_cmd, state_pred, input_pred, nominal_input = self.controller.compute_action(current_state, self.counter)
+                    # Log the predictions
+                    self.state_pred_traj.append(state_pred)
+                    self.input_pred_traj.append(input_pred)
+                else:
+                    input_cmd = self.controller.compute_action(current_state, self.counter)
+
+                current_input = input_cmd
+                current_state = self.dynamics.one_step_forward(current_state, current_input, self.dt)
+>>>>>>> origin/model-based-rl
             #print(f"sim_state:{current_state}")
 
             # Log the results
@@ -3857,7 +4936,10 @@ class Simulator:
             self.input_traj.append(np.array(current_input).flatten())
             if self.controller.type == 'RMPC':
                 self.nominal_input_traj.append(np.array(nominal_input).flatten())
+<<<<<<< HEAD
             # TODO: also log input_cmd curve for identified case
+=======
+>>>>>>> origin/model-based-rl
 
             # Update timer
             self.counter += 1
@@ -4089,7 +5171,11 @@ class Visualizer:
         plt.tight_layout()
         plt.show()
 
+<<<<<<< HEAD
     def display_contrast_plots(self, title, *simulators: Simulator) -> None:
+=======
+    def display_contrast_plots(self, title, *simulators: Simulator, if_gray:bool=False) -> None:
+>>>>>>> origin/model-based-rl
 
         color_index = 0
 
@@ -4100,6 +5186,7 @@ class Visualizer:
 
         # Plot current object's trajectories
         ax1.plot(self.t_eval, self.position, label=f"{self.simulator.controller_name}", color=self.color)
+<<<<<<< HEAD
 
         # Plot reference if have
         if hasattr(self.simulator.controller, 'traj_ref'):
@@ -4107,6 +5194,15 @@ class Visualizer:
 
         ax2.plot(self.t_eval, self.velocity, label=f"{self.simulator.controller_name}", color=self.color)
 
+=======
+
+        # Plot reference if have
+        if hasattr(self.simulator.controller, 'traj_ref'):
+            ax1.plot(self.t_eval, self.simulator.controller.traj_ref[:, 0], color='gray', marker='.', linestyle='-', label='Reference Trajectory')
+
+        ax2.plot(self.t_eval, self.velocity, label=f"{self.simulator.controller_name}", color=self.color)
+
+>>>>>>> origin/model-based-rl
         # Plot reference if have
         if hasattr(self.simulator.controller, 'traj_ref'):
             ax2.plot(self.t_eval, self.simulator.controller.traj_ref[:, 1], color='gray', marker='.', linestyle='-', label='Reference Trajectory')
@@ -4127,6 +5223,7 @@ class Visualizer:
             velocity_ref = state_traj_ref[:, 1]
             acceleration_ref = input_traj_ref
 
+<<<<<<< HEAD
             # Plot position over time
             ax1.plot(self.t_eval, position_ref, linestyle="--", label=f"{simulator_ref.controller_name}", color=self.color_list[color_index])
 
@@ -4138,6 +5235,24 @@ class Visualizer:
             ax3.step(self.t_eval, np.append(acceleration_ref, acceleration_ref[-1]), where='post', linestyle="--", label=f"{simulator_ref.controller_name}", color=self.color_list[color_index])
 
             color_index += 1
+=======
+            if if_gray:
+                # Plot position over time
+                ax1.plot(simulator_ref.t_eval, position_ref, linestyle="--", label=f"{simulator_ref.controller_name}", color='gray')
+                # Plot velocity over time
+                ax2.plot(simulator_ref.t_eval, velocity_ref, linestyle="--", label=f"{simulator_ref.controller_name}", color='gray')
+                # Plot acceleration over time
+                ax3.step(simulator_ref.t_eval, np.append(acceleration_ref, acceleration_ref[-1]), where='post', linestyle="--", label=f"{simulator_ref.controller_name}", color='gray')
+            else:
+                # Plot position over time
+                ax1.plot(simulator_ref.t_eval, position_ref, linestyle="--", label=f"{simulator_ref.controller_name}", color=self.color_list[color_index])
+                # Plot velocity over time
+                ax2.plot(simulator_ref.t_eval, velocity_ref, linestyle="--", label=f"{simulator_ref.controller_name}", color=self.color_list[color_index])
+                # Plot acceleration over time
+                ax3.step(simulator_ref.t_eval, np.append(acceleration_ref, acceleration_ref[-1]), where='post', linestyle="--", label=f"{simulator_ref.controller_name}", color=self.color_list[color_index])
+
+                color_index += 1
+>>>>>>> origin/model-based-rl
             
         # Plot shadowed zone for state bounds
         if self.env.state_lbs is not None:
@@ -4220,7 +5335,11 @@ class Visualizer:
                 raise ValueError(f"Failed to get trajectory from simulator {simulator_ref.controller_name}. State trajectory list is void; please run 'run_simulation' first.")
 
             # Plot cost over time
+<<<<<<< HEAD
             ax[0].plot(self.t_eval, np.append(simulator_ref.cost2go_arr, simulator_ref.cost2go_arr[-1]), linestyle="--", label=f"{simulator_ref.controller_name}", color=self.color_list[color_index])
+=======
+            ax[0].plot(simulator_ref.t_eval, np.append(simulator_ref.cost2go_arr, simulator_ref.cost2go_arr[-1]), linestyle="--", label=f"{simulator_ref.controller_name}", color=self.color_list[color_index])
+>>>>>>> origin/model-based-rl
 
             color_index += 1
         
@@ -4496,7 +5615,8 @@ class Visualizer:
             car_self.angle = np.degrees(current_theta)  # rad to deg
 
             for sim, car in car_objects.items():
-                current_position = sim.get_trajectories()[0][:, 0][frame]
+                frame_ref = int(frame*self.dt/sim.dt)  # Adjust frame index for each simulator
+                current_position = sim.get_trajectories()[0][:, 0][frame_ref]
                 current_theta = float(sim.env.theta(current_position).full().flatten()[0])
                 car.set_xy((current_position - self.car_length / 2, float(sim.env.h(current_position - self.car_length / 2).full().flatten()[0])))
                 car.angle = np.degrees(current_theta)  # rad to deg
@@ -4508,7 +5628,7 @@ class Visualizer:
 
         return HTML(anim.to_jshtml())
     
-    def display_contrast_animation_same(self, *simulators) -> HTML:
+    def display_contrast_animation_same(self, *simulators, if_gray:bool = False) -> HTML:
         import matplotlib.patches as mpatches
 
         custom_handles = []
@@ -4559,8 +5679,10 @@ class Visualizer:
 
         # Simulators' cars
         for sim, color in zip(simulators, colors[1:]):
-            car = Rectangle((0, 0), self.car_length, car_height,
-                            edgecolor=color, facecolor='none', linewidth=2)
+            if if_gray:
+                car = Rectangle((0, 0), self.car_length, car_height, edgecolor='gray', facecolor='none', linewidth=2)
+            else:
+                car = Rectangle((0, 0), self.car_length, car_height, edgecolor=color, facecolor='none', linewidth=2)
             ax.add_patch(car)
             car_objects[sim] = car
 
@@ -4576,9 +5698,10 @@ class Visualizer:
             mpatches.Patch(edgecolor=self.color, facecolor='none', linewidth=2, label=self.simulator.controller_name)
         ]
         for sim, color in zip(simulators, colors[1:]):
-            car_legend_handles.append(
-                mpatches.Patch(edgecolor=color, facecolor='none', linewidth=2, label=sim.controller_name)
-            )
+            if if_gray:
+                car_legend_handles.append(mpatches.Patch(edgecolor='gray', facecolor='none', linewidth=2, label=sim.controller_name))
+            else:
+                car_legend_handles.append(mpatches.Patch(edgecolor=color, facecolor='none', linewidth=2, label=sim.controller_name))
 
         ax.legend(handles=custom_handles + car_legend_handles, loc='best')
 
@@ -4595,7 +5718,8 @@ class Visualizer:
             for sim, car in car_objects.items():
                 if sim is self:
                     continue
-                current_position = sim.get_trajectories()[0][:, 0][frame]
+                frame_ref = int(frame*self.dt/sim.dt)  # Adjust frame index for each simulator
+                current_position = sim.get_trajectories()[0][:, 0][frame_ref]
                 current_theta = float(sim.env.theta(current_position).full().flatten()[0])
                 y_base = float(sim.env.h(current_position - self.car_length / 2).full().flatten()[0])
                 car.set_xy((current_position - self.car_length / 2, y_base))
