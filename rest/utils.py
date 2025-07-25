@@ -4382,7 +4382,7 @@ class Visualizer:
         plt.tight_layout()
         plt.show()
 
-    def display_contrast_plots(self, title, *simulators: Simulator, if_gray:bool=False) -> None:
+    def display_contrast_plots(self, *simulators: Simulator, title=None, if_gray:bool=False) -> None:
 
         color_index = 0
 
