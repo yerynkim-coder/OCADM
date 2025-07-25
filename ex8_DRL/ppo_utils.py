@@ -427,12 +427,13 @@ class PPOController(BaseController):
             actions_squashed = torch.tanh(actions_unsquashed).detach().numpy()
 
         actions_squashed = actions_squashed.reshape(resolution, resolution) 
+        actions = self._action_reverse_tf(actions_squashed)
         
         plt.figure(figsize=(8, 6))
-        sns.heatmap(actions_squashed, xticklabels=False, yticklabels=False, cmap="coolwarm", cbar=True)
+        sns.heatmap(actions, xticklabels=False, yticklabels=False, cmap="coolwarm", cbar=True, cbar_kws={'label': 'Acceleration [m/s^2]'})
         plt.title("Policy Heatmap")
-        plt.xlabel("State X")
-        plt.ylabel("State Y")
+        plt.xlabel("Position [m]")
+        plt.ylabel("Velocity [m/s]")
         plt.show()
 
     def plot_training_curve(self):
@@ -470,7 +471,7 @@ class PPOController(BaseController):
         smoothed_value_loss = np.convolve(value_loss, np.ones(window_size)/window_size, mode='valid')
         axes[1].plot(steps, value_loss, color='green', label='Value Loss', linewidth=2)
         axes[1].plot(steps[:len(smoothed_value_loss)], smoothed_value_loss, color='lime', label='smoothed', linewidth=2)
-        axes[1].set_xlabel('Steps')
+        axes[1].set_xlabel('Epoch')
         axes[1].set_ylabel('Loss')
         axes[1].set_title('Value Loss Curve')
         axes[1].legend()
@@ -480,7 +481,7 @@ class PPOController(BaseController):
         smoothed_policy_loss = np.convolve(policy_loss, np.ones(window_size)/window_size, mode='valid')
         axes[2].plot(steps, policy_loss, color='orange', label='Policy Loss', linewidth=2)
         axes[2].plot(steps[:len(smoothed_policy_loss)], smoothed_policy_loss, color='gold', label='smoothed', linewidth=2)
-        axes[2].set_xlabel('Steps')
+        axes[2].set_xlabel('Epoch')
         axes[2].set_ylabel('Loss')
         axes[2].set_title('Policy Loss Curve')
         axes[2].legend()
