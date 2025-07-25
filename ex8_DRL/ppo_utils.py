@@ -140,7 +140,7 @@ class PPOController(BaseController):
         print(f"[✓] PPO model saved to: {path}")
     
     def load(self, path: str) -> None:
-        checkpoint = torch.load(path, map_location=torch.device('cpu'))
+        checkpoint = torch.load(path, map_location=torch.device('cpu'), weights_only=False)
 
         self.policy_net.load_state_dict(checkpoint['policy_net'])
         self.value_net.load_state_dict(checkpoint['value_net'])

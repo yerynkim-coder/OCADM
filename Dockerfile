@@ -45,7 +45,7 @@ COPY . /app
 
 # install python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
-RUN pip install --no-cache-dir python-csv jupyterlab cvxopt scipy pycddlib==2.1.0 pytope
+RUN pip install --no-cache-dir python-csv jupyterlab cvxopt scipy pycddlib==2.1.0 pytope matplotlib seaborn torch
 
 # expose the port for jupyterlab
 EXPOSE 8888
