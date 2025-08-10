@@ -1,4 +1,4 @@
-# use the official Python image from Docker Hub
+# use the official Python image from Docker Hub (slim in local, deepnote/python in deepnote)
 #FROM python:3.8-slim
 FROM deepnote/python:3.10
 
@@ -74,12 +74,12 @@ COPY . /app
 
 # install python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
-RUN pip install --no-cache-dir python-csv jupyterlab cvxopt scipy pycddlib==2.1.0 pytope
+RUN pip install --no-cache-dir python-csv jupyterlab cvxopt scipy pycddlib==2.1.0 pytope matplotlib seaborn torch
 
 # expose the port for jupyterlab
 EXPOSE 8888
 
-# entrypoint
+# entrypoint (bash in local, jupyter in Deepnote)
 #CMD ["bash"]
 CMD ["jupyter", "notebook", "--ip=0.0.0.0", "--no-browser", "--allow-root"]
 
