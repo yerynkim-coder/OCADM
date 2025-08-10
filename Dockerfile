@@ -1,8 +1,11 @@
 # use the official Python image from Docker Hub
-FROM python:3.10-slim
+#FROM python:3.8-slim
+FROM deepnote/python:3.10
 
 # install system dependencies
 RUN apt-get update && apt-get install -y \
+    bash \
+    curl \
     git \
     cmake \
     make \
@@ -31,6 +34,32 @@ RUN cd /acados && \
 RUN cd /acados/interfaces/acados_template && \
     pip install .
 
+# ---- Patch to remove future_fstrings encoding header ----
+RUN python - <<'PY'
+import re, importlib.util
+from pathlib import Path
+pat = re.compile(r'^\s*#\s*-\*-\s*coding:\s*future_fstrings\s*-\*-\s*$', re.I)
+def patch_tree(root: Path):
+    if not root.exists(): return 0
+    n=0
+    for p in root.rglob("*.py"):
+        try:
+            L = p.read_text(encoding="utf-8", errors="ignore").splitlines(keepends=True)
+        except Exception: continue
+        ch=False
+        for i in (0,1):
+            if i < len(L) and pat.match(L[i]):
+                L[i] = "# -*- coding: utf-8 -*-\n"; ch=True
+        if ch:
+            p.write_text("".join(L), encoding="utf-8"); n+=1
+    print("patched", n, "files under", root)
+spec = importlib.util.find_spec("acados_template")
+if spec and spec.origin:
+    patch_tree(Path(spec.origin).parent)
+patch_tree(Path("/acados"))
+PY
+# --------------------------------------------------
+
 # environment variables
 ENV ACADOS_SOURCE_DIR=/acados
 ENV ACADOS_INSTALL_DIR=/acados
@@ -45,10 +74,12 @@ COPY . /app
 
 # install python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
-RUN pip install --no-cache-dir python-csv jupyterlab cvxopt scipy pycddlib==2.1.0 pytope matplotlib seaborn torch
+RUN pip install --no-cache-dir python-csv jupyterlab cvxopt scipy pycddlib==2.1.0 pytope
 
 # expose the port for jupyterlab
 EXPOSE 8888
 
 # entrypoint
-CMD ["bash"]
+#CMD ["bash"]
+CMD ["jupyter", "notebook", "--ip=0.0.0.0", "--no-browser", "--allow-root"]
+
