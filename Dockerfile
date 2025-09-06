@@ -1,6 +1,6 @@
 # use the official Python image from Docker Hub (slim in local, deepnote/python in deepnote)
-#FROM python:3.8-slim
-FROM deepnote/python:3.10
+FROM python:3.10-slim
+# FROM deepnote/python:3.10
 
 # install system dependencies
 RUN apt-get update && apt-get install -y \
